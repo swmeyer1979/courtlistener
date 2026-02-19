@@ -1,6 +1,5 @@
 import os
 from pathlib import Path
-from typing import Dict, Iterator
 
 from juriscraper.pacer import DocketReport
 from tqdm import tqdm
@@ -14,7 +13,7 @@ report = DocketReport("cand")
 
 def _write_anon_item_to_disk(pacer_file: PacerHtmlFiles) -> None:
     # Get the text and anonymize it
-    with open(pacer_file.filepath.path, "r") as f:
+    with open(pacer_file.filepath.path) as f:
         text = f.read()
     report._parse_text(text)
     try:
@@ -30,7 +29,7 @@ def _write_anon_item_to_disk(pacer_file: PacerHtmlFiles) -> None:
     out.write_text(anon_text)
 
 
-def make_html(options: Dict[str, int]) -> None:
+def make_html(options: dict[str, int]) -> None:
     offset = options["offset"]
     pacer_files = PacerHtmlFiles.objects.filter(
         upload_type=UPLOAD_TYPE.DOCKET
@@ -72,5 +71,5 @@ class Command(VerboseCommand):
         )
 
     def handle(self, *args, **options):
-        super(Command, self).handle(*args, **options)
+        super().handle(*args, **options)
         make_html(options)

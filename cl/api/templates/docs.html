@@ -9,7 +9,7 @@
 <div class="hidden-xs col-sm-2 col-md-3"></div>
 <div class="col-xs-12 col-sm-8 col-md-6">
   <h1 class="text-center v-offset-below-3">CourtListener APIs, Webhooks, and Bulk Legal&nbsp;Data</h1>
-  <p>We currently have five major services available on CourtListener:
+  <p>We currently have six major services available on CourtListener:
   </p>
   <ol>
     <li>
@@ -18,7 +18,7 @@
     </li>
     <li>
       <p>If you are interested in obtaining large quantities of our data, we <a
-        href="{% url "bulk_data_index" %}">recommend using bulk data files</a>. These provide CSV files of our opinion, people, and financial disclosures databases.
+        href="{% url "bulk_data_index" %}">recommend using bulk data files</a>. These provide CSV files of our case law, people, and financial disclosures databases.
       </p>
     </li>
     <li>
@@ -27,6 +27,10 @@
     </li>
     <li>
       <p>If you want to subscribe to events on CourtListener, we recommend our <a href="{% url "webhooks_docs" %}">webhooks service</a>, which works as a bi-directional API &mdash; It can push data to you.
+      </p>
+    </li>
+    <li>
+      <p><em>Coming soon:</em> If you use AI assistants like Claude or ChatGPT, our <a href="{% url "mcp_help" %}">MCP server</a> will allow them to access CourtListener data directly.
       </p>
     </li>
     <li>
@@ -82,6 +86,16 @@
       <td class="align-middle">Complex</td>
     </tr>
     <tr>
+      <td><a href="{% url "mcp_help" %}"
+             class="btn btn-lg btn-primary btn-block">MCP Server</a>
+        <em class="small text-muted">Coming soon</em></td>
+      <td class="align-middle">Fast</td>
+      <td class="align-middle">Good</td>
+      <td class="align-middle">Natural<br>Language</td>
+      <td class="align-middle">Short</td>
+      <td class="align-middle">Easy</td>
+    </tr>
+    <tr>
       <td><a href="https://free.law/data-consulting/"
              class="btn btn-lg btn-success btn-block">Data Services</a></td>
       <td colspan="5" class="text-left">Engage with Free Law Project, the non-profit behind CourtListener and RECAP, for the most flexibility.
@@ -108,7 +122,7 @@
   <ol>
     <li>
       <p>When we import other data sources, we clean them up. For example, we <a href="https://free.law/2011/08/25/second-series-of-federal-reporter-from-1950-to-1993-now-on-courtlistener/">
-      manually corrected</a> more than ten thousand items from Public.Resource.Org, and more than 75,000 from <a href="https://case.law/">Harvard's Caselaw Access Project</a>.
+      manually corrected</a> more than ten thousand items from Public.Resource.Org, and we have cleaned up or fixed more than one-million items in <a href="https://case.law/">Harvard's Caselaw Access Project</a>.
       </p>
     </li>
     <li>
@@ -125,8 +139,7 @@
   </ol>
   <p>You can learn more about the data that we have on our coverage pages.</p>
   <p>
-    <a href="{% url "coverage" %}" class="btn btn-primary">Opinions and PACER Coverage</a>
-    <a href="{% url "coverage_fds" %}" class="btn btn-primary">Financial Disclosure Coverage</a>
+    <a href="{% url "coverage" %}" class="btn btn-primary btn-lg">Coverage Details</a>
   </p>
 
 

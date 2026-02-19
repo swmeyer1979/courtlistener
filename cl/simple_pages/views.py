@@ -2,20 +2,28 @@ import json
 import logging
 import re
 from datetime import timedelta
+from http import HTTPStatus
 from typing import Any
 
+from asgiref.sync import sync_to_async
 from django.conf import settings
 from django.contrib.auth.models import User
 from django.core.cache import cache
 from django.core.mail import EmailMessage
-from django.db.models import Count, QuerySet, Sum
+from django.db.models import (
+    Case,
+    Count,
+    IntegerField,
+    QuerySet,
+    Sum,
+    Value,
+    When,
+)
 from django.http import HttpRequest, HttpResponse, HttpResponseRedirect
 from django.template import loader
 from django.template.response import TemplateResponse
 from django.urls import reverse
 from django.utils.timezone import now
-from django.views.decorators.cache import cache_page
-from rest_framework.status import HTTP_429_TOO_MANY_REQUESTS
 
 from cl.audio.models import Audio
 from cl.disclosures.models import (
@@ -29,10 +37,9 @@ from cl.disclosures.models import (
     Reimbursement,
     SpouseIncome,
 )
-from cl.donate.utils import get_donation_totals_by_email
-from cl.lib.ratelimiter import ratelimiter_unsafe_3_per_m
+from cl.favorites.models import Prayer
+from cl.favorites.utils import get_lifetime_prayer_stats
 from cl.people_db.models import Person
-from cl.search.forms import SearchForm
 from cl.search.models import (
     SOURCES,
     Court,
@@ -40,6 +47,7 @@ from cl.search.models import (
     OpinionCluster,
     RECAPDocument,
 )
+from cl.search.selectors import get_available_documents_estimate_count
 from cl.simple_pages.coverage_utils import fetch_data, fetch_federal_data
 from cl.simple_pages.forms import ContactForm
 
@@ -51,29 +59,31 @@ async def about(request: HttpRequest) -> HttpResponse:
     return TemplateResponse(request, "about.html", {"private": False})
 
 
-def faq(request: HttpRequest) -> HttpResponse:
+async def faq(request: HttpRequest) -> HttpResponse:
     """Loads the FAQ page"""
     faq_cache_key = "faq-stats"
-    template_data = cache.get(faq_cache_key)
+    template_data = await cache.aget(faq_cache_key)
     if template_data is None:
         template_data = {
-            "scraped_court_count": Court.objects.filter(
+            "scraped_court_count": await Court.objects.filter(
                 in_use=True, has_opinion_scraper=True
-            ).count(),
-            "total_opinion_count": OpinionCluster.objects.all().count(),
-            "total_recap_count": RECAPDocument.objects.filter(
-                is_available=True
-            ).count(),
+            ).acount(),
+            "total_recap_count": await sync_to_async(
+                get_available_documents_estimate_count
+            )(),
             "total_oa_minutes": (
-                Audio.objects.aggregate(Sum("duration"))["duration__sum"] or 0
+                (await Audio.objects.aaggregate(Sum("duration")))[
+                    "duration__sum"
+                ]
+                or 0
             )
             / 60,
-            "total_judge_count": Person.objects.all().count(),
+            "total_judge_count": await Person.objects.all().acount(),
         }
         five_days = 60 * 60 * 24 * 5
-        cache.set(faq_cache_key, template_data, five_days)
+        await cache.aset(faq_cache_key, template_data, five_days)
 
-    return contact(
+    return await contact(
         request,
         template_path="faq.html",
         template_data=template_data,
@@ -85,45 +95,57 @@ async def help_home(request: HttpRequest) -> HttpResponse:
     return TemplateResponse(request, "help/index.html", {"private": False})
 
 
-def alert_help(request: HttpRequest) -> HttpResponse:
-    no_feeds = Court.federal_courts.all_pacer_courts().filter(
-        pacer_has_rss_feed=False,
+async def alert_help(request: HttpRequest) -> HttpResponse:
+    jurisdiction_ordering = Case(
+        When(jurisdiction="F", then=Value(0)),
+        When(jurisdiction="FD", then=Value(1)),
+        When(jurisdiction="FB", then=Value(2)),
+        default=Value(999),
+        output_field=IntegerField(),
+    )  # Sort apellate courts first, then district, then bankruptcy.
+
+    no_feeds = (
+        Court.federal_courts.all_pacer_courts()
+        .filter(
+            pacer_has_rss_feed=False,
+        )
+        .order_by(jurisdiction_ordering)
     )
     partial_feeds = (
         Court.federal_courts.all_pacer_courts()
         .filter(pacer_has_rss_feed=True)
         .exclude(pacer_rss_entry_types="all")
+        .order_by(jurisdiction_ordering)
     )
-    full_feeds = Court.federal_courts.all_pacer_courts().filter(
-        pacer_has_rss_feed=True, pacer_rss_entry_types="all"
+    full_feeds = (
+        Court.federal_courts.all_pacer_courts()
+        .filter(pacer_has_rss_feed=True, pacer_rss_entry_types="all")
+        .order_by(jurisdiction_ordering)
     )
     cache_key = "alert-help-stats"
-    data = cache.get(cache_key)
+    data = await cache.aget(cache_key)
     if data is None:
         data = {
-            "d_update_count": Docket.objects.filter(
+            "d_update_count": await Docket.objects.filter(
                 date_modified__gte=now() - timedelta(days=1)
-            ).count(),
-            "de_update_count": RECAPDocument.objects.filter(
+            ).acount(),
+            "de_update_count": await RECAPDocument.objects.filter(
                 date_modified__gte=now() - timedelta(days=1)
-            ).count(),
+            ).acount(),
         }
         one_day = 60 * 60 * 24
-        cache.set(cache_key, data, one_day)
+        await cache.aset(cache_key, data, one_day)
     context = {
         "no_feeds": no_feeds,
         "partial_feeds": partial_feeds,
         "full_feeds": full_feeds,
         "private": False,
+        "rt_alerts_sending_rate": int(
+            settings.REAL_TIME_ALERTS_SENDING_RATE / 60
+        ),
     }
     context.update(data)
     return TemplateResponse(request, "help/alert_help.html", context)
-
-
-async def donation_help(request: HttpRequest) -> HttpResponse:
-    return TemplateResponse(
-        request, "help/donation_help.html", {"private": False}
-    )
 
 
 async def delete_help(request: HttpRequest) -> HttpResponse:
@@ -136,6 +158,25 @@ async def markdown_help(request: HttpRequest) -> HttpResponse:
     return TemplateResponse(
         request, "help/markdown_help.html", {"private": False}
     )
+
+
+async def prayer_help(request: HttpRequest) -> HttpResponse:
+    stats = await get_lifetime_prayer_stats(Prayer.GRANTED)
+
+    context = {
+        "daily_quota": settings.ALLOWED_PRAYER_COUNT,
+        "private": False,
+        "granted_stats": stats,
+    }
+
+    return TemplateResponse(request, "help/prayer_help.html", context)
+
+
+async def relative_dates(request: HttpRequest) -> HttpResponse:
+    context = {
+        "private": False,
+    }
+    return TemplateResponse(request, "help/relative_dates_help.html", context)
 
 
 async def tag_notes_help(request: HttpRequest) -> HttpResponse:
@@ -156,21 +197,24 @@ async def broken_email_help(request: HttpRequest) -> HttpResponse:
     )
 
 
-def build_court_dicts(courts: QuerySet) -> list[dict[str, str]]:
+async def mcp_help(request: HttpRequest) -> HttpResponse:
+    return TemplateResponse(request, "help/mcp_help.html", {"private": False})
+
+
+async def build_court_dicts(courts: QuerySet) -> list[dict[str, str]]:
     """Takes the court objects, and manipulates them into a list of more useful
     dictionaries"""
     court_dicts = [{"pk": "all", "short_name": "All Courts"}]
     court_dicts.extend(
         [
             {"pk": court.pk, "short_name": court.full_name}
-            #'notes': court.notes}
-            for court in courts
+            async for court in courts
         ]
     )
     return court_dicts
 
 
-def get_coverage_data_fds() -> dict[str, int]:
+async def get_coverage_data_fds() -> dict[str, int]:
     """Get stats on the disclosure data
 
     Attempt the cache if possible.
@@ -178,7 +222,7 @@ def get_coverage_data_fds() -> dict[str, int]:
     :return: A dict mapping item types to their counts.
     """
     coverage_key = "coverage-data.fd3"
-    coverage_data = cache.get(coverage_key)
+    coverage_data = await cache.aget(coverage_key)
     if coverage_data is None:
         coverage_data = {
             "disclosures": FinancialDisclosure,
@@ -193,40 +237,32 @@ def get_coverage_data_fds() -> dict[str, int]:
         }
         # Populate the models
         for k, model in coverage_data.items():
-            coverage_data[k] = model.objects.all().count()
+            coverage_data[k] = await model.objects.all().acount()
 
         coverage_data["private"] = False
-        one_week = 60 * 60 * 24 * 7
-        cache.set(coverage_key, coverage_data, one_week)
+        one_week_minutes = 60 * 60 * 24 * 7
+        await cache.aset(coverage_key, coverage_data, one_week_minutes)
 
     return coverage_data
 
 
-def coverage_fds(request: HttpRequest) -> HttpResponse:
+async def coverage_fds(request: HttpRequest) -> HttpResponse:
     """The financial disclosure coverage page"""
-    coverage_data = get_coverage_data_fds()
+    coverage_data = await get_coverage_data_fds()
     return TemplateResponse(request, "help/coverage_fds.html", coverage_data)
 
 
-def get_coverage_data_o(request: HttpRequest) -> dict[str, Any]:
+async def get_coverage_data_o(request: HttpRequest) -> dict[str, Any]:
     """Get the opinion coverage data
 
     :param request: The user's request
     :return:
     """
     coverage_cache_key = "coverage-data-v3"
-    coverage_data = cache.get(coverage_cache_key)
+    coverage_data = await cache.aget(coverage_cache_key)
     if coverage_data is None:
         courts = Court.objects.filter(in_use=True)
-        courts_json = json.dumps(build_court_dicts(courts))
-
-        search_form = SearchForm(request.GET)
-        precedential_statuses = [
-            field
-            for field in search_form.fields.keys()
-            if field.startswith("stat_")
-        ]
-
+        courts_json = json.dumps(await build_court_dicts(courts))
         # Build up the sourcing stats.
         counts = OpinionCluster.objects.values("source").annotate(
             Count("source")
@@ -234,7 +270,7 @@ def get_coverage_data_o(request: HttpRequest) -> dict[str, Any]:
         count_pro = 0
         count_lawbox = 0
         count_scraper = 0
-        for d in counts:
+        async for d in counts:
             if SOURCES.PUBLIC_RESOURCE in d["source"]:
                 count_pro += d["source__count"]
             if SOURCES.COURT_WEBSITE in d["source"]:
@@ -245,20 +281,17 @@ def get_coverage_data_o(request: HttpRequest) -> dict[str, Any]:
         opinion_courts = Court.objects.filter(
             in_use=True, has_opinion_scraper=True
         )
-        oral_argument_courts = Court.objects.filter(
-            in_use=True, has_oral_argument_scraper=True
-        )
-        count_fds = FinancialDisclosure.objects.all().count()
-        count_investments = Investment.objects.all().count()
-        count_people = Person.objects.all().count()
+        count_fds = await FinancialDisclosure.objects.all().acount()
+        count_investments = await Investment.objects.all().acount()
+        count_people = await Person.objects.all().acount()
 
-        oa_duration = Audio.objects.aggregate(Sum("duration"))["duration__sum"]
+        oa_aggregate = await Audio.objects.aaggregate(Sum("duration"))
+        oa_duration = oa_aggregate["duration__sum"]
         if oa_duration:
             oa_duration /= 60  # Avoids a "unsupported operand type" error
 
         coverage_data = {
             "sorted_courts": courts_json,
-            "precedential_statuses": precedential_statuses,
             "oa_duration": oa_duration,
             "count_pro": count_pro,
             "count_lawbox": count_lawbox,
@@ -267,56 +300,85 @@ def get_coverage_data_o(request: HttpRequest) -> dict[str, Any]:
             "count_investments": count_investments,
             "count_people": count_people,
             "courts_with_opinion_scrapers": opinion_courts,
-            "courts_with_oral_argument_scrapers": oral_argument_courts,
             "private": False,
         }
         one_day = 60 * 60 * 24
-        cache.set(coverage_cache_key, coverage_data, one_day)
+        await cache.aset(coverage_cache_key, coverage_data, one_day)
     return coverage_data
 
 
-def coverage_graph(request: HttpRequest) -> HttpResponse:
-    coverage_data_o = get_coverage_data_o(request)
+async def coverage(request: HttpRequest) -> HttpResponse:
+    coverage_data_o = await get_coverage_data_o(request)
     return TemplateResponse(request, "help/coverage.html", coverage_data_o)
 
 
-def coverage_opinions(request: HttpRequest) -> HttpResponse:
+async def coverage_oa(request: HttpRequest) -> HttpResponse:
+    oral_argument_courts = Court.objects.filter(
+        in_use=True, has_oral_argument_scraper=True
+    )
+    return TemplateResponse(
+        request,
+        "help/coverage_oa.html",
+        {
+            "courts_with_oral_argument_scrapers": oral_argument_courts,  # -> can be safely removed once new design is launched
+            "courts_list": [
+                {
+                    "href": f"/?q=&court_{court.pk}=on&order_by=dateArgued+desc&type=oa",
+                    "label": court,
+                    "ref": "nofollow",
+                }
+                async for court in oral_argument_courts
+            ],
+            "private": False,
+        },
+    )
+
+
+async def coverage_opinions(request: HttpRequest) -> HttpResponse:
     """Generate Coverage Opinion Page
 
     :param request: A django request
     :return: The page requested
     """
-    coverage_data_op = cache.get("coverage_data_op")
+    coverage_data_op = await cache.aget("coverage_data_op")
     if coverage_data_op is None:
         coverage_data_op = {
             "private": False,
-            "federal": fetch_federal_data(),
+            "federal": await fetch_federal_data(),
             "sections": {
-                "state": fetch_data(Court.STATE_JURISDICTIONS),
-                "territory": fetch_data(Court.TERRITORY_JURISDICTIONS),
-                "international": fetch_data(
-                    Court.INTERNATIONAL, group_by_state=False
+                "state": await fetch_data(Court.STATE_JURISDICTIONS),
+                "territory": await fetch_data(Court.TERRITORY_JURISDICTIONS),
+                "international": await fetch_data(
+                    [Court.INTERNATIONAL], group_by_state=False
                 ),
-                "tribal": fetch_data(
+                "tribal": await fetch_data(
                     Court.TRIBAL_JURISDICTIONS, group_by_state=False
                 ),
-                "special": fetch_data(
+                "special": await fetch_data(
                     [Court.FEDERAL_SPECIAL], group_by_state=False
                 ),
-                "military": fetch_data(
+                "military": await fetch_data(
                     Court.MILITARY_JURISDICTIONS, group_by_state=False
                 ),
             },
         }
         one_day = 60 * 60 * 24
-        cache.set("coverage_data_op", coverage_data_op, one_day)
+        await cache.aset("coverage_data_op", coverage_data_op, one_day)
 
     return TemplateResponse(
         request, "help/coverage_opinions.html", coverage_data_op
     )
 
 
-def feeds(request: HttpRequest) -> HttpResponse:
+async def coverage_recap(request: HttpRequest) -> HttpResponse:
+    return TemplateResponse(
+        request,
+        "help/coverage_recap.html",
+        {"private": False},
+    )
+
+
+async def feeds(request: HttpRequest) -> HttpResponse:
     return TemplateResponse(
         request,
         "feeds.html",
@@ -329,7 +391,7 @@ def feeds(request: HttpRequest) -> HttpResponse:
     )
 
 
-def podcasts(request: HttpRequest) -> HttpResponse:
+async def podcasts(request: HttpRequest) -> HttpResponse:
     return TemplateResponse(
         request,
         "podcasts.html",
@@ -337,18 +399,13 @@ def podcasts(request: HttpRequest) -> HttpResponse:
             "oral_argument_courts": Court.objects.filter(
                 in_use=True, has_oral_argument_scraper=True
             ),
-            "count": Audio.objects.all().count(),
+            "count": await Audio.objects.all().acount(),
             "private": False,
         },
     )
 
 
-async def contribute(request: HttpRequest) -> HttpResponse:
-    return TemplateResponse(request, "contribute.html", {"private": False})
-
-
-@ratelimiter_unsafe_3_per_m
-def contact(
+async def contact(
     request: HttpRequest,
     template_path: str = "contact_form.html",
     template_data: dict[str, ContactForm | str | bool] | None = None,
@@ -376,31 +433,29 @@ def contact(
                 logger.info("Detected spam message. Not sending email.")
                 return HttpResponseRedirect(reverse("contact_thanks"))
 
-            donation_totals = get_donation_totals_by_email(cd["email"])
             default_from = settings.DEFAULT_FROM_EMAIL
-            EmailMessage(
-                subject="[CourtListener] Contact: "
-                "{phone_number}".format(**cd),
-                body="Subject: {phone_number}\n"
-                "From: {name} ({email})\n"
-                "Total donated: {total_donated}\n"
-                "Total last year: {total_last_year}\n\n\n"
-                "{message}\n\n"
-                "Browser: {browser}".format(
-                    browser=request.META.get("HTTP_USER_AGENT", "Unknown"),
-                    total_donated=donation_totals["total"],
-                    total_last_year=donation_totals["last_year"],
-                    **cd,
-                ),
-                to=["info@free.law"],
+            subject = form.email_subject()
+            body = form.render_email_body(
+                user_agent=request.headers.get("user-agent", "Unknown")
+            )
+
+            message = EmailMessage(
+                subject=subject,
+                body=body,
+                to=["support@freelawproject.atlassian.net"],
                 reply_to=[cd.get("email", default_from) or default_from],
-            ).send()
+            )
+            await sync_to_async(message.send)()
             return HttpResponseRedirect(reverse("contact_thanks"))
     else:
         # the form is loading for the first time
-        if isinstance(request.user, User):
-            initial["email"] = request.user.email
-            initial["name"] = request.user.get_full_name()
+        issue_type = request.GET.get("issue_type")
+        if issue_type and issue_type.lower() in ContactForm.VALID_ISSUE_TYPES:
+            initial["issue_type"] = issue_type.lower()
+        user = await request.auser()  # type: ignore[attr-defined]
+        if isinstance(user, User):
+            initial["email"] = user.email
+            initial["name"] = user.get_full_name()
             form = ContactForm(initial=initial)
         else:
             # for anonymous users, who lack full_names, and emails
@@ -426,14 +481,19 @@ async def advanced_search(request: HttpRequest) -> HttpResponse:
     )
 
 
+async def citegeist_help(request: HttpRequest) -> HttpResponse:
+    return TemplateResponse(request, "citegeist.html", {"private": False})
+
+
 async def old_terms(request: HttpRequest, v: str) -> HttpResponse:
     return TemplateResponse(
         request,
         f"terms/{v}.html",
         {
-            "title": "Archived Terms of Service and Policies, v%s – "
-            "CourtListener.com" % v,
+            "title": f"Archived Terms of Service and Policies, v{v} – "
+            "CourtListener.com",
             "private": True,
+            "is_archived": True,
         },
     )
 
@@ -449,17 +509,12 @@ async def latest_terms(request: HttpRequest) -> HttpResponse:
     )
 
 
-@cache_page(60 * 60 * 12, cache="db_cache")
-def robots(request: HttpRequest) -> HttpResponse:
-    """Generate the robots.txt file"""
-    response = HttpResponse(content_type="text/plain")
-    t = loader.get_template("robots.txt")
-    response.write(t.render({}))
-    return response
-
-
 async def validate_for_wot(request: HttpRequest) -> HttpResponse:
     return HttpResponse("bcb982d1e23b7091d5cf4e46826c8fc0")
+
+
+async def components(request: HttpRequest) -> HttpResponse:
+    return TemplateResponse(request, "components.html", {"private": True})
 
 
 async def ratelimited(
@@ -469,5 +524,5 @@ async def ratelimited(
         request,
         "429.html",
         {"private": True},
-        status=HTTP_429_TOO_MANY_REQUESTS,
+        status=HTTPStatus.TOO_MANY_REQUESTS,
     )

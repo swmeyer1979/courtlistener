@@ -1,174 +1,177 @@
-[tool.poetry]
-authors = ["Mike Lissner <mike@free.law>"]
+[project]
+name = "cl"
+version = "1"
+description = "A free and powerful system for awareness and research of the American judicial system."
+requires-python = ">=3.13,<3.14"
+readme = "README.md"
+authors = [
+  { name = "Mike Lissner", email = "mike@free.law" },
+]
+keywords = ["legal", "courts", "databases", "judiciary", "laws"]
 classifiers = [
   "Development Status :: 5 - Production/Stable",
   "Natural Language :: English",
   "Operating System :: OS Independent",
   "License :: OSI Approved :: GNU Affero General Public License v3",
   "Programming Language :: Python :: 3",
-  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.13",
   "Intended Audience :: Developers",
   "Intended Audience :: Legal Industry",
 ]
-description = "A free and powerful system for awareness and research of the American judicial system."
-documentation = "https://github.com/freelawproject/courtlistener/wiki"
-homepage = "https://www.courtlistener.com/"
-include = ["manage.py"]
-keywords = ["legal", "courts", "databases", "judiciary", "laws"] # Max: 5
-license = "AGPL-3.0" # Should be spdx ID: https://spdx.org/licenses/
-maintainers = ["Mike Lissner <mike@free.law>"]
-name = "cl"
-readme = "README.md"
-repository = "https://github.com/freelawproject/courtlistener"
-version = "0.14.24"
+urls.Home = "https://www.courtlistener.com/"
+urls.Repository = "https://github.com/freelawproject/courtlistener"
+urls.Documentation = "https://github.com/freelawproject/courtlistener/wiki"
+license = " AGPL-3.0-only"
+license-files = [ "LICENSE.txt" ]
 
-[tool.poetry.scripts]
-cl-manage = "manage:main"
+dependencies = [
+  "ada-url>=1.28.0",
+  "beautifulsoup4>=4.14.3",
+  "celery>=5.6.2",
+  "certifi>=2025.1.31",
+  "courts-db",
+  "disposable-email-domains",
+  "Django>=6.0, <6.1",
+  "django-cache-memoize",
+  "django-cors-headers>=4.9.0",
+  "django-csp>=4.0",
+  "django-extensions>=4.1",
+  "django-filter>=25.2",
+  "django-localflavor>=5.0",
+  "django-markdown-deux>=1.0.6",
+  "django-mathfilters",
+  "django-pghistory>=3.9.1",
+  "django-ratelimit>=4.1.0",
+  "django-storages>=1.14.6",
+  "djangorestframework>=3.16.1",
+  "djangorestframework-xml>=2.0.0",
+  "feedparser>=6.0.12",
+  "httplib2>=0.31.0",
+  "internetarchive>=5.7.1",
+  "ipaddress>=1.0.16",
+  "itypes>=1.1.0",
+  "kombu>=5.5.1",
+  "lxml>=6.0.2",
+  "markdown2>=2.5.4",
+  "natsort>=8.4.0",
+  "ndg-httpsclient>=0.5.1",
+  "networkx>=3.6.1",
+  "nose",
+  "pandas>=2.3.3",
+  "pillow",
+  "pycparser>=2.22",
+  "pyopenssl",
+  "pyparsing>=3.3.1",
+  "python-dateutil>=2.9.0",
+  "python-magic>=0.4.27",
+  "pytz",
+  "pyyaml>=6.0.3",
+  "redis>=7.1.0",
+  "requests>=2.32.5",
+  "simplejson>=3.20.2",
+  "timeout-decorator",
+  "unidecode",
+  "usaddress>=0.5.16",
+  "djangorestframework-filters==1.0.0.dev2",
+  "gunicorn>=23.0.0",
+  "django-hCaptcha>=0.2.0",
+  "reporters-db",
+  "django-waffle>=5.0.0",
+  "nameparser>=1.1.3",
+  "eyecite",
+  "scipy>=1.15.2",
+  "scikit-learn>=1.8.0",
+  "numpy>=2.4.0",
+  "datasketch>=1.8.0",
+  "PyStemmer>=3.0.0",
+  "factory-boy>=3.3.3",
+  "django-override-storage>=0.3.2",
+  "django-environ>=0.12.0",
+  "judge-pics>=2.0.5",
+  "django-admin-cursor-paginator>=0.1.7",
+  "sentry-sdk[celery,django]>=2.49.0",
+  "selenium>=4.30.0",
+  "ipython>=9.9.0",
+  "time-machine>=3.2.0",
+  "dateparser==1.2.2",
+  "types-dateparser>=1.2.2.20250809",
+  "uvicorn[standard]>=0.40.0",
+  "daphne>=4.2.1",
+  "httpx[http2]>=0.28.1",
+  "django-model-utils>=5.0.0",
+  "django-permissions-policy>=4.28.0",
+  "tiktoken>=0.9.0",
+  "hyperscan>=0.8.0",
+  "openai>=2.14.0",
+  "seal-rookery>=2.3.1",
+  "types-pytz>=2025.2.0.20251108",
+  "psycopg[binary,pool]>=3.3.2",
+  "boto3>=1.42.24",
+  "django-tailwind~=3.9.1",
+  "django-ses[events]>=4.6.0",
+  "django-cotton>=2.6.0",
+  "django-cursor-pagination>=0.3.0",
+  "django-elasticsearch-dsl>=8.0",
+  "juriscraper>=2.6.68",
+  "instructor>=1.14.1",
+  "django-s3-express-cache>=0.1.0",
+  "zohocrmsdk8-0==4.0.0",
+  "django-prometheus>=2.4.1",
+]
 
-[tool.poetry.dependencies]
-argparse = "*"
-asgiref = {git = "https://github.com/django/asgiref.git", rev = "d920c3c44f59ef037be3a09a41a5640014cfb1e2"}
-beautifulsoup4 = "==4.11.*"
-boto3 = "^1.28.37"
-celery = "^5.3.4"
-certifi = "^2023.7.22"
-courts-db = "^0.10.9"
-disposable-email-domains = "*"
-Django = "^4.2.7"
-django-cache-memoize = "==0.*"
-django-cors-headers = "^4.2.0"
-django-csp = "^3.7.0"
-django-extensions = "^3.2.3"
-django-filter = "^21.1"
-django-localflavor = "^4.0"
-django-markdown-deux = "^1.0.6"
-django-mathfilters = "*"
-django-pghistory = "^2.9.0"
-django-ratelimit = "^4.1.0"
-django-storages = "^1.13.2"
-djangorestframework = {git = "https://github.com/encode/django-rest-framework.git", rev = "cc3c89a11c7ee9cf7cfd732e0a329c318ace71b2"}
-djangorestframework-xml = "^2.0.0"
-drf-dynamic-fields = "*"
-feedparser = "^6.0.8"
-httplib2 = "^0.22.0"
-igraph = "^0.10.4"
-internetarchive = "^3.3.0"
-ipaddress = "^1.0.16"
-itypes = "^1.1.0"
-kombu = "^5.3.2"
-lxml = "==4.*"
-markdown2 = "==2.4.*"
-natsort = "^8.3.1"
-ndg-httpsclient = "^0.5.1"
-networkx = "^3.1"
-nose = "*"
-openapi-codec = "^1.3.1"
-pandas = "^1.5.0"
-pillow = "*"
-pycparser = "^2.21"
-pyopenssl = "*"
-pyparsing = "^3.1.0"
-python = ">=3.11, <3.12"
-python-dateutil = "^2.8.1"
-python-magic = "^0.4.21"
-pytz = "*"
-pyyaml = "^6.0"
-redis = "^3.5.3"
-requests = "^2.31.0"
-simplejson = "^3.18.3"
-stripe = "^5.2.0"
-timeout-decorator = "*"
-tldextract = "^3.4.0"
-unidecode = "*"
-usaddress = "^0.5.10"
-scorched = {git = "https://github.com/freelawproject/scorched.git", branch="main"}
-djangorestframework-filters = "1.0.0.dev2"
-gunicorn = "^21.2.0"
-django-hCaptcha = "^0.2.0"
-reporters-db = "^3.2.36"
-django-waffle = "^4.0.0"
-nameparser = "^1.1.1"
-eyecite = "^2.3.0"
-scipy = "^1.11.2"
-scikit-learn = "^1.2.1"
-numpy = "^1.25.2"
-datasketch = "^1.6.0"
-PyStemmer = "^2.0.1"
-factory-boy = "^3.2.1"
-django-elasticsearch-dsl = "^7.3"
-django-override-storage = "^0.3.2"
-django-ses = {extras = ["events"], version = "^3.5.0"}
-django-environ = "^0.11.2"
-judge-pics = "^2.0.1"
-django-admin-cursor-paginator = "^0.1.4"
-sentry-sdk = {extras = ["celery", "django"], version = "^1.34.0"}
-selenium = "^4.9.1"
-ipython = "^8.15.0"
-time-machine = "^2.9.0"
-dateparser = "1.1.8"
-types-dateparser = "^1.1.4.6"
-uvicorn = {extras = ["standard"], version = "^0.23.2"}
-daphne = "^4.0.0"
-psycopg = {extras = ["binary"], version = "^3.1.12"}
-juriscraper = "^2.5.66"
-httpx = {extras = ["http2"], version = "^0.24.1"}
-django-model-utils = "^4.3.1"
-inflection = "^0.5.1"  # necessary for DRF schema generation - remove after drf-spectacular
+[dependency-groups]
+dev = [
+  "pre-commit>=4.5.1",
+  "types-redis>=4.6.0.20241004",
+  "pytest>=9.0.2",
+  "pytest-django>=4.11.1",
+  "exrex>=0.12.0",
+  "tblib>=3.2.2",
+  "mypy>=1.15.0",
+  "types-python-dateutil>=2.9.0.20251115",
+  "types-requests>=2.32.4.20260107",
+  "django-stubs>=5.2.8",
+  "djangorestframework-stubs>=3.16.6",
+  "types-simplejson>=3.20.0.20250822",
+  "lxml-stubs>=0.5.1",
+  "django-debug-toolbar>=6.1.0",
+  "django-tailwind[reload]~=3.9.1",
+  "responses>=0.25.8",
+]
 
-
-[tool.poetry.group.dev.dependencies]
-pre-commit = "^3.3.3"
-types-redis = "^4.6.0.5"
-pylint = "^2.17.5"
-pytest = "^7.4.0"
-pytest-django = "^4.5.2"
-flake8 = "^6.1.0"
-exrex = "^0.11.0"
-tblib = "^2.0.0"
-flynt = "^1.0.1"
-mypy = "^1.5.1"
-types-python-dateutil = "^2.8.19.14"
-types-requests = "^2.31.0.2"
-django-stubs = "^4.2.3"
-djangorestframework-stubs = "^3.14.2"
-black = "^23.7.0"
-types-simplejson = "^3.19.0.2"
-lxml-stubs = "^0.4.0"
-django-debug-toolbar = "^4.2.0"
-
-[tool.black]
-include = '''
-(
-    cl         # Just include a few directories for now
-)*\.pyi?$
-'''
-exclude = '''
-(
-      \.eggs
-    | .*\.egg-info
-    | .*migrations.*
-    | \.mypy_cache
-    | __pycache__
-    | \.venv
-)
-'''
+[tool.ruff]
 line-length = 79
-
-[tool.isort]
-multi_line_output = 3
-include_trailing_comma = true
-force_grid_wrap = 0
-use_parentheses = true
-ensure_newline_before_comments = true
-line_length = 79
-skip_glob = "*/migrations/*.py"
-
-[tool.pylint.messages_control]
-disable = "C0330, C0326"
-
-[tool.pylint.format]
-max-line-length = "79"
-
-[build-system]
-build-backend = "poetry.masonry.api"
-requires = ["poetry>=0.12"]
+lint.extend-safe-fixes = [
+  # non-pep585-annotation
+  "UP006",
+]
+lint.select = [
+  # pycodestyle
+  "E",
+  # Pyflakes errors
+  "F",
+  # isort
+  "I",
+  # pyupgrade
+  "UP",
+  # Pyflakes warnings
+  "W",
+]
+lint.ignore = [
+  # flake8-bugbear opinionated rules
+  "B9",
+  # line-too-long
+  "E501",
+  # suppressible-exception
+  "SIM105",
+  # if-else-block-instead-of-if-exp
+  "SIM108",
+  # To fix:
+  "E722",
+  "E731",
+  "F403",
+  "F811",
+  "F821",
+  "F841",
+  "UP008",
+]

@@ -47,7 +47,7 @@ class Command(VerboseCommand):
         )
 
     def handle(self, *args, **options):
-        super(Command, self).handle(*args, **options)
+        super().handle(*args, **options)
         self.options = options
         time_now = datetime.now()
         recipients = get_welcome_recipients(time_now)
@@ -84,6 +84,6 @@ class Command(VerboseCommand):
             logger.info(f"Sent {len(messages)} daily welcome emails.")
         else:
             sys.stdout.write(
-                "Simulation mode. Imagine that we just sent %s "
-                "welcome emails!\n" % len(messages)
+                f"Simulation mode. Imagine that we just sent {len(messages)} "
+                "welcome emails!\n"
             )

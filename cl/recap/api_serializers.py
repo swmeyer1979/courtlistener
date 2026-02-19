@@ -1,8 +1,8 @@
-from django.contrib.auth.models import User
 from juriscraper.lib.exceptions import PacerLoginException
 from rest_framework import serializers
 from rest_framework.exceptions import ValidationError
 
+from cl.corpus_importer.utils import is_appellate_court
 from cl.lib.pacer_session import get_or_cache_pacer_cookies
 from cl.recap.models import (
     REQUEST_TYPE,
@@ -12,6 +12,7 @@ from cl.recap.models import (
     PacerFetchQueue,
     ProcessingQueue,
 )
+from cl.recap.utils import get_court_id_from_fetch_queue
 from cl.search.models import Court, Docket, RECAPDocument
 
 
@@ -72,6 +73,7 @@ class ProcessingQueueSerializer(serializers.ModelSerializer):
         if attrs["upload_type"] in [
             UPLOAD_TYPE.DOCKET,
             UPLOAD_TYPE.APPELLATE_DOCKET,
+            UPLOAD_TYPE.ACMS_DOCKET_JSON,
             UPLOAD_TYPE.CLAIMS_REGISTER,
         ]:
             # Dockets shouldn't have these fields completed.
@@ -94,48 +96,42 @@ class ProcessingQueueSerializer(serializers.ModelSerializer):
             UPLOAD_TYPE.CASE_QUERY_PAGE,
             UPLOAD_TYPE.CASE_QUERY_RESULT_PAGE,
         ]:
-            # These are district court dockets. Is the court valid?
-            district_court_ids = (
-                Court.federal_courts.district_pacer_courts().values_list(
-                    "pk", flat=True
-                )
+            # These are district or bankruptcy court dockets. Is the court valid?
+            court_ids = (
+                Court.federal_courts.district_or_bankruptcy_pacer_courts()
             )
-            if attrs["court"].pk not in district_court_ids:
+            if not court_ids.filter(pk=attrs["court"].pk).exists():
                 raise ValidationError(
-                    "%s is not a district or bankruptcy court ID. Did you "
-                    "mean to use the upload_type for appellate dockets?"
-                    % attrs["court"]
+                    "{} is not a district or bankruptcy court ID. Did you "
+                    "mean to use the upload_type for appellate dockets?".format(
+                        attrs["court"]
+                    )
                 )
 
         if attrs["upload_type"] == UPLOAD_TYPE.CLAIMS_REGISTER:
             # Only allowed on bankruptcy courts
-            district_court_ids = (
-                Court.federal_courts.bankruptcy_pacer_courts().values_list(
-                    "pk", flat=True
-                )
+            bankruptcy_court_ids = (
+                Court.federal_courts.bankruptcy_pacer_courts()
             )
-            if attrs["court"].pk not in district_court_ids:
+            if not bankruptcy_court_ids.filter(pk=attrs["court"].pk).exists():
                 raise ValidationError(
-                    "%s is not a bankruptcy court ID. Only bankruptcy cases "
-                    "should have claims registry pages." % attrs["court"]
+                    "{} is not a bankruptcy court ID. Only bankruptcy cases "
+                    "should have claims registry pages.".format(attrs["court"])
                 )
 
         if attrs["upload_type"] in [
             UPLOAD_TYPE.APPELLATE_ATTACHMENT_PAGE,
             UPLOAD_TYPE.APPELLATE_DOCKET,
+            UPLOAD_TYPE.ACMS_ATTACHMENT_PAGE,
+            UPLOAD_TYPE.ACMS_DOCKET_JSON,
             UPLOAD_TYPE.APPELLATE_CASE_QUERY_PAGE,
             UPLOAD_TYPE.APPELLATE_CASE_QUERY_RESULT_PAGE,
         ]:
             # Appellate court dockets. Is the court valid?
-            appellate_court_ids = (
-                Court.federal_courts.appellate_pacer_courts().values_list(
-                    "pk", flat=True
-                )
-            )
-            if attrs["court"].pk not in appellate_court_ids:
+            if not is_appellate_court(attrs["court"].pk):
                 raise ValidationError(
-                    "%s is not an appellate court ID. Did you mean to use the "
-                    "upload_type for district dockets?" % attrs["court"]
+                    "{} is not an appellate court ID. Did you mean to use the "
+                    "upload_type for district dockets?".format(attrs["court"])
                 )
 
         if attrs["upload_type"] == UPLOAD_TYPE.PDF:
@@ -161,9 +157,11 @@ class ProcessingQueueSerializer(serializers.ModelSerializer):
                     "uploads."
                 )
 
-            if "-" in attrs.get("pacer_case_id"):
+            dashes = attrs.get("pacer_case_id").count("-")
+            if dashes == 1:
                 raise ValidationError(
-                    "PACER case ID can not contains dashes -"
+                    "PACER case ID can not contain a single (-); "
+                    "that looks like a docket number."
                 )
 
         return attrs
@@ -201,11 +199,8 @@ class EmailProcessingQueueSerializer(serializers.ModelSerializer):
         mail = attrs["mail"]
         receipt = attrs["receipt"]
 
-        all_court_ids = Court.federal_courts.all_pacer_courts().values_list(
-            "pk", flat=True
-        )
-
-        if court_id not in all_court_ids:
+        all_court_ids = Court.federal_courts.all_pacer_courts()
+        if not all_court_ids.filter(pk=court_id).exists():
             raise ValidationError(
                 f"{attrs['court'].pk} is not a PACER court ID."
             )
@@ -271,14 +266,32 @@ class PacerFetchQueueSerializer(serializers.ModelSerializer):
         )
 
     def validate(self, attrs):
-        # Is it a good court value?
-        district_court_ids = (
-            Court.federal_courts.district_pacer_courts().values_list(
-                "pk", flat=True
-            )
-        )
-        if attrs.get("court") and attrs["court"].pk not in district_court_ids:
-            raise ValidationError(f"Invalid court id: {attrs['court'].pk}")
+        # Validates the input attributes, ensuring the request has all required
+        # elements.
+        match attrs["request_type"]:
+            case REQUEST_TYPE.DOCKET:
+                # Validation for docket requests.  Requires at least one of
+                # docket ID, docket number/court pair, or PACER case ID.
+                if not any(
+                    [
+                        attrs.get("docket"),
+                        attrs.get("docket_number"),
+                        attrs.get("pacer_case_id"),
+                    ]
+                ):
+                    raise ValidationError(
+                        "For docket requests, please provide one of the "
+                        "following: a docket ID ('docket'), a docket number "
+                        "('docket_number') and court pair, or a PACER case ID "
+                        "('pacer_case_id') and court pair."
+                    )
+            case REQUEST_TYPE.PDF | REQUEST_TYPE.ATTACHMENT_PAGE:
+                # Attachment page and PDF validation
+                if not attrs.get("recap_document"):
+                    raise ValidationError(
+                        "recap_document is a required field for attachment page "
+                        "and PDF fetches."
+                    )
 
         # Docket validations
         if attrs.get("pacer_case_id") and not attrs.get("court"):
@@ -288,8 +301,13 @@ class PacerFetchQueueSerializer(serializers.ModelSerializer):
                 "without 'court' parameter."
             )
 
-        if attrs.get("pacer_case_id") and "-" in attrs.get("pacer_case_id"):
-            raise ValidationError("PACER case ID can not contains dashes -")
+        if attrs.get("pacer_case_id"):
+            dashes = attrs.get("pacer_case_id").count("-")
+            if dashes == 1:
+                raise ValidationError(
+                    "PACER case ID can not contain a single (-); "
+                    "that looks like a docket number."
+                )
 
         if attrs.get("docket_number") and not attrs.get("court"):
             # If a docket_number is included, is a court also?
@@ -297,6 +315,29 @@ class PacerFetchQueueSerializer(serializers.ModelSerializer):
                 "Cannot use 'docket_number' parameter "
                 "without 'court' parameter."
             )
+
+        if (
+            attrs.get("pacer_case_id")
+            and not attrs.get("docket_number")
+            and is_appellate_court(attrs.get("court").pk)
+        ):
+            # The user is trying to purchase an appellate docket using only the
+            # PACER case ID, which is not supported.
+            raise ValidationError(
+                "Purchases of appellate dockets using a PACER case ID are not "
+                "currently supported. Please use the docket number instead."
+            )
+
+        court_id = get_court_id_from_fetch_queue(attrs)
+        if (
+            attrs.get("de_number_end") or attrs.get("de_number_start")
+        ) and is_appellate_court(court_id):
+            raise ValidationError(
+                "Docket entry filtering by number is not supported for "
+                "appellate courts. Use date range filtering with "
+                "'de_date_start' and 'de_date_end' instead."
+            )
+
         if attrs.get("show_terminated_parties") and not attrs.get(
             "show_parties_and_counsel"
         ):
@@ -307,25 +348,25 @@ class PacerFetchQueueSerializer(serializers.ModelSerializer):
                 "generally."
             )
 
-        # Attachment page and PDF validation
-        if attrs["request_type"] in [
-            REQUEST_TYPE.PDF,
-            REQUEST_TYPE.ATTACHMENT_PAGE,
-        ]:
-            if not attrs.get("recap_document"):
-                raise ValidationError(
-                    "recap_document is a required field for attachment page "
-                    "and PDF fetches."
+        # Is it a good court value?
+        valid_court_ids = Court.federal_courts.all_pacer_courts()
+        if not valid_court_ids.filter(pk=court_id).exists():
+            if attrs.get("court"):
+                error_message = (f"Invalid court id: {court_id}",)
+            else:
+                error_message = (
+                    f"Purchases from court {court_id} are not supported"
                 )
+            raise ValidationError(error_message)
 
         # PDF validations
         if attrs["request_type"] == REQUEST_TYPE.PDF:
             rd = attrs["recap_document"]
             if rd.is_available:
                 raise ValidationError(
-                    "Cannot fetch a PDF for recap_document %s. That document "
+                    f"Cannot fetch a PDF for recap_document {rd.pk}. That document "
                     "is already marked as available in our database "
-                    "(is_available = True)." % rd.pk
+                    "(is_available = True)."
                 )
 
         # Do the PACER credentials work?
@@ -348,6 +389,7 @@ class PacerDocIdLookUpSerializer(serializers.HyperlinkedModelSerializer):
         fields = (
             "pacer_doc_id",
             "filepath_local",
+            "acms_document_guid",
             "id",
         )
 

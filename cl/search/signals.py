@@ -1,11 +1,17 @@
+import logging
+
 from django.conf import settings
+from django.core.cache import cache
 from django.db.models.signals import post_save
 from django.dispatch import receiver
 
 from cl.audio.models import Audio
+from cl.citations.models import UnmatchedCitation
 from cl.citations.tasks import (
     find_citations_and_parantheticals_for_recap_documents,
 )
+from cl.favorites.utils import send_prayer_emails
+from cl.lib.courts import get_cache_key_for_court_list
 from cl.lib.es_signal_processor import ESSignalProcessor
 from cl.people_db.models import (
     ABARating,
@@ -15,10 +21,15 @@ from cl.people_db.models import (
     Position,
     School,
 )
+from cl.search.docket_number_cleaner import (
+    clean_docket_number_raw_and_update_redis_cache,
+)
 from cl.search.documents import (
     AudioDocument,
     DocketDocument,
     ESRECAPDocument,
+    OpinionClusterDocument,
+    OpinionDocument,
     ParentheticalGroupDocument,
     PersonDocument,
     PositionDocument,
@@ -26,6 +37,7 @@ from cl.search.documents import (
 from cl.search.models import (
     BankruptcyInformation,
     Citation,
+    Court,
     Docket,
     DocketEntry,
     Opinion,
@@ -35,7 +47,9 @@ from cl.search.models import (
     ParentheticalGroup,
     RECAPDocument,
 )
+from cl.settings import DEVELOPMENT, TESTING
 
+logger = logging.getLogger(__name__)
 # This field mapping is used to define which fields should be updated in the
 # Elasticsearch index document when they change in the DB. The outer keys
 # represent the actions that will trigger signals:
@@ -80,10 +94,7 @@ pa_field_mapping = {
                 "docket_id": ["docket_id"],
                 "judges": ["judge"],
                 "nature_of_suit": ["suitNature"],
-                "get_precedential_status_display": [
-                    "status"
-                ],  # On fields where
-                # indexed values needs to be the display() value, use get_{field_name}_display as key.
+                "precedential_status": ["status"],
             },
         },
         Parenthetical: {
@@ -158,7 +169,7 @@ oa_field_mapping = {
                 "judges": ["judge"],
                 "sha1": ["sha1"],
                 "source": ["source"],
-                "stt_google_response": ["prepare"],
+                "stt_transcript": ["prepare"],
                 "docket_id": ["prepare"],
             },
         },
@@ -173,8 +184,10 @@ p_field_mapping = {
     "save": {
         Person: {
             "self": {
-                "name_full": ["name"],
-                "name_full_reverse": ["name_reverse"],
+                "name_first": ["name", "name_reverse"],
+                "name_middle": ["name", "name_reverse"],
+                "name_last": ["name", "name_reverse"],
+                "name_suffix": ["name", "name_reverse"],
                 "religion": ["religion"],
                 "gender": ["gender"],
                 "dob_city": ["dob_city"],
@@ -210,21 +223,32 @@ p_field_mapping = {
     },
 }
 
-
 position_field_mapping = {
     "save": {
         Person: {
             "appointer__person": {
-                "name_full_reverse": ["appointer"],
+                "name_first": ["appointer"],
+                "name_middle": ["appointer"],
+                "name_last": ["appointer"],
+                "name_suffix": ["appointer"],
             },
             "predecessor": {
-                "name_full_reverse": ["predecessor"],
+                "name_first": ["predecessor"],
+                "name_middle": ["predecessor"],
+                "name_last": ["predecessor"],
+                "name_suffix": ["predecessor"],
             },
             "supervisor": {
-                "name_full_reverse": ["supervisor"],
+                "name_first": ["supervisor"],
+                "name_middle": ["supervisor"],
+                "name_last": ["supervisor"],
+                "name_suffix": ["supervisor"],
             },
             "person": {
-                "name_full": ["name"],
+                "name_first": ["name"],
+                "name_middle": ["name"],
+                "name_last": ["name"],
+                "name_suffix": ["name"],
                 "religion": ["religion"],
                 "gender": ["gender"],
                 "dob_city": ["dob_city"],
@@ -280,7 +304,7 @@ docket_field_mapping = {
     "save": {
         Docket: {
             "self": {
-                "case_name": ["caseName"],
+                "case_name": ["caseName", "party"],
                 "case_name_short": ["caseName"],
                 "case_name_full": ["case_name_full", "caseName"],
                 "docket_number": ["docketNumber"],
@@ -296,14 +320,22 @@ docket_field_mapping = {
                 "assigned_to_str": ["assignedTo"],
                 "referred_to_str": ["referredTo"],
                 "slug": ["docket_slug", "docket_absolute_url"],
+                "pacer_case_id": ["pacer_case_id"],
+                "source": [""],  # Not indexed field.
             },
         },
         Person: {
             "assigned_to": {
-                "name_full": ["assignedTo"],
+                "name_first": ["assignedTo"],
+                "name_middle": ["assignedTo"],
+                "name_last": ["assignedTo"],
+                "get_name_suffix_display": ["assignedTo"],
             },
             "referred_to": {
-                "name_full": ["referredTo"],
+                "name_first": ["referredTo"],
+                "name_middle": ["referredTo"],
+                "name_last": ["referredTo"],
+                "get_name_suffix_display": ["referredTo"],
             },
         },
     },
@@ -327,11 +359,11 @@ recap_document_field_mapping = {
         RECAPDocument: {
             "self": {
                 "description": ["short_description"],
-                "document_type": ["document_type"],
+                "document_type": ["document_type", "absolute_url"],
                 "document_number": ["document_number", "absolute_url"],
                 "pacer_doc_id": ["pacer_doc_id"],
                 "plain_text": ["plain_text"],
-                "attachment_number": ["attachment_number"],
+                "attachment_number": ["attachment_number", "absolute_url"],
                 "is_available": ["is_available"],
                 "page_count": ["page_count"],
                 "filepath_local": ["filepath_local"],
@@ -361,14 +393,21 @@ recap_document_field_mapping = {
                 "referred_to_id": ["referred_to_id", "referredTo"],
                 "assigned_to_str": ["assignedTo"],
                 "referred_to_str": ["referredTo"],
+                "pacer_case_id": ["pacer_case_id"],
             }
         },
         Person: {
             "assigned_to": {
-                "name_full": ["assignedTo"],
+                "name_first": ["assignedTo"],
+                "name_middle": ["assignedTo"],
+                "name_last": ["assignedTo"],
+                "get_name_suffix_display": ["assignedTo"],
             },
             "referred_to": {
-                "name_full": ["referredTo"],
+                "name_first": ["referredTo"],
+                "name_middle": ["referredTo"],
+                "name_last": ["referredTo"],
+                "get_name_suffix_display": ["referredTo"],
             },
         },
     },
@@ -378,10 +417,130 @@ recap_document_field_mapping = {
     "reverse-delete": {},
 }
 
+o_field_mapping = {
+    "save": {
+        Docket: {
+            "docket": {
+                "docket_number": ["docketNumber"],
+                "date_argued": ["dateArgued"],
+                "date_reargued": ["dateReargued"],
+                "date_reargument_denied": ["dateReargumentDenied"],
+            }
+        },
+        OpinionCluster: {
+            "sub_opinions": {
+                "case_name": ["caseName"],
+                "case_name_full": ["caseName", "caseNameFull"],
+                "case_name_short": ["caseName"],
+                "date_filed": ["dateFiled"],
+                "judges": ["judge"],
+                "attorneys": ["attorney"],
+                "nature_of_suit": ["suitNature"],
+                "precedential_status": ["status"],
+                "procedural_history": ["procedural_history"],
+                "posture": ["posture"],
+                "syllabus": ["syllabus"],
+                "scdb_id": ["scdb_id"],
+                "citation_count": ["citeCount"],
+                "slug": ["absolute_url"],
+            }
+        },
+        Opinion: {
+            "self": {
+                "author_id": ["author_id"],
+                "type": ["type", "type_text"],
+                "per_curiam": ["per_curiam"],
+                "download_url": ["download_url"],
+                "local_path": ["local_path"],
+                "html_columbia": ["text"],
+                "html_lawbox": ["text"],
+                "xml_harvard": ["text"],
+                "html_anon_2020": ["text"],
+                "html": ["text"],
+                "plain_text": ["text"],
+                "html_with_citations": ["text"],
+                "sha1": ["sha1"],
+                "ordering_key": ["ordering_key"],
+            },
+        },
+    },
+    "delete": {Opinion: {}},
+    "m2m": {
+        Opinion.joined_by.through: {
+            "opinion": {
+                "joined_by_ids": "joined_by_ids",
+            },
+        },
+    },
+    "reverse": {
+        OpinionsCited: {"cited_opinions": {"all": ["cites"]}},
+    },  # For handling OpinionsCited.save() in add_manual_citations command
+    "reverse-delete": {},
+}
+
+o_cluster_field_mapping = {
+    "save": {
+        Docket: {
+            "docket": {
+                "court_id": ["court_exact"],
+                "docket_number": ["docketNumber"],
+                "date_argued": ["dateArgued"],
+                "date_reargued": ["dateReargued"],
+                "date_reargument_denied": ["dateReargumentDenied"],
+            }
+        },
+        OpinionCluster: {
+            "self": {
+                "docket_id": ["prepare"],
+                "case_name": ["caseName"],
+                "case_name_short": ["caseName"],
+                "case_name_full": ["caseNameFull", "caseName"],
+                "date_filed": ["dateFiled"],
+                "judges": ["judge"],
+                "attorneys": ["attorney"],
+                "nature_of_suit": ["suitNature"],
+                "precedential_status": ["status"],
+                "procedural_history": ["procedural_history"],
+                "posture": ["posture"],
+                "syllabus": ["syllabus"],
+                "scdb_id": ["scdb_id"],
+                "citation_count": ["citeCount"],
+                "slug": ["absolute_url"],
+                "source": ["source"],
+            },
+        },
+    },
+    "delete": {OpinionCluster: {}},
+    "m2m": {
+        OpinionCluster.panel.through: {
+            "opinioncluster": {
+                "panel_ids": "panel_ids",
+            },
+        },
+        OpinionCluster.non_participating_judges.through: {
+            "opinioncluster": {
+                "non_participating_judge_ids": "non_participating_judge_ids",
+            },
+        },
+    },
+    "reverse": {
+        Opinion: {"sub_opinions": {"cluster_id": ["sibling_ids"]}},
+        Citation: {
+            "citations": {"all": ["citation", "neutralCite", "lexisCite"]}
+        },
+    },
+    "reverse-delete": {
+        Opinion: {"cluster": {"all": ["sibling_ids"]}},
+        Citation: {
+            "cluster": {"all": ["citation", "neutralCite", "lexisCite"]}
+        },
+    },
+}
+
 
 # Instantiate a new ESSignalProcessor() for each Model/Document that needs to
 # be tracked. The arguments are: main model, ES document mapping, and field mapping dict.
-_pa_signal_processor = ESSignalProcessor(
+pa_signal_processor = ESSignalProcessor(
     ParentheticalGroup,
     ParentheticalGroupDocument,
     pa_field_mapping,
@@ -410,6 +569,14 @@ if not settings.ELASTICSEARCH_DOCKETS_SIGNALS_DISABLED:
     _docket_signal_processor = ESSignalProcessor(
         Docket, DocketDocument, docket_field_mapping
     )
+if settings.ELASTICSEARCH_OPINIONS_SIGNALS_ENABLED:
+    _o_signal_processor = ESSignalProcessor(
+        Opinion, OpinionDocument, o_field_mapping
+    )
+if settings.ELASTICSEARCH_CLUSTERS_SIGNALS_ENABLED:
+    _o_cluster_signal_processor = ESSignalProcessor(
+        OpinionCluster, OpinionClusterDocument, o_cluster_field_mapping
+    )
 
 
 @receiver(
@@ -430,7 +597,7 @@ def handle_recap_doc_change(
     # When we get updated text for a doc, we want to parse it for citations.
     if update_fields is not None and "plain_text" in update_fields:
         # Even though the task itself filters for qualifying ocr_status,
-        # we don't want to clog the TQ with unncessary items.
+        # we don't want to clog the TQ with unnecessary items.
         if instance.ocr_status in (
             RECAPDocument.OCR_COMPLETE,
             RECAPDocument.OCR_UNNECESSARY,
@@ -438,3 +605,78 @@ def handle_recap_doc_change(
             find_citations_and_parantheticals_for_recap_documents.apply_async(
                 args=([instance.pk],)
             )
+
+    if (
+        instance.es_rd_field_tracker.has_changed("is_available")
+        and instance.is_available
+    ):
+        send_prayer_emails(instance)
+
+
+@receiver(
+    post_save,
+    sender=Citation,
+    dispatch_uid="handle_citation_save_uid",
+)
+def update_unmatched_citation(
+    sender, instance: Citation, created: bool, **kwargs
+):
+    """Updates UnmatchedCitation.status to MATCHED, if found"""
+    if not created:
+        return
+    UnmatchedCitation.objects.filter(
+        volume=instance.volume,
+        reporter=instance.reporter,
+        page=instance.page,
+    ).update(status=UnmatchedCitation.FOUND)
+
+
+@receiver(
+    post_save,
+    sender=Court,
+    dispatch_uid="handle_court_changes_uid",
+)
+def update_court_cache(sender, instance: Court, created: bool, **kwargs):
+    """
+    Invalidates the cached court list to ensure data consistency when a Court
+    instance is created or updated.
+    """
+    cache.delete(get_cache_key_for_court_list())
+
+
+@receiver(
+    post_save,
+    sender=Court,
+    dispatch_uid="handle_new_court_needs_courthouse",
+)
+def update_court_cache(sender, instance: Court, created: bool, **kwargs):
+    """
+    A new courthouse should be created alongside a new court. Send a warning
+    to Sentry for someone to look at it
+    """
+    if TESTING or DEVELOPMENT:
+        return
+
+    if created:
+        logger.error("Create a courthouse for new court '%s'", instance.id)
+
+
+@receiver(
+    post_save,
+    sender=Docket,
+    dispatch_uid="handle_docket_number_raw_cleaning",
+)
+def handle_docket_number_raw_cleaning(
+    sender, instance: Docket, created=False, update_fields=None, **kwargs
+):
+    if not settings.DOCKET_NUMBER_CLEANING_ENABLED:
+        # Only perform cleaning if enabled
+        return
+
+    # Only clean if the docket was was non-recap source and newly created or docket_number_raw has changed
+    changed = bool(
+        update_fields and not created and "docket_number_raw" in update_fields
+    )
+    non_recap_sources = instance.source != Docket.RECAP
+    if (created or changed) and non_recap_sources:
+        clean_docket_number_raw_and_update_redis_cache(instance)

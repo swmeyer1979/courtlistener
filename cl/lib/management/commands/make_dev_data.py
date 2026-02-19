@@ -3,20 +3,27 @@ from django.core.management.base import CommandParser
 from cl.alerts.factories import AlertFactory, DocketAlertWithParentsFactory
 from cl.api.factories import WebhookEventWithParentsFactory
 from cl.audio.factories import AudioWithParentsFactory
+from cl.disclosures.factories import PersonWithDisclosuresFactory
+from cl.favorites.factories import PrayerFactory
 from cl.lib.command_utils import VerboseCommand, logger
 from cl.people_db.factories import PersonFactory, PersonWithChildrenFactory
 from cl.recap.factories import FjcIntegratedDatabaseFactory
 from cl.search.factories import (
     CitationWithParentsFactory,
     CourtFactory,
+    DocketEntryFactory,
     DocketEntryForDocketFactory,
     DocketEntryReuseParentsFactory,
-    DocketEntryWithParentsFactory,
     DocketFactory,
     DocketWithChildrenFactory,
     OpinionClusterWithParentsFactory,
     OpinionWithParentsFactory,
     ParentheticalWithParentsFactory,
+    RECAPDocumentFactory,
+)
+from cl.search.state.texas.factories import (
+    TexasDocketEntryFactory,
+    TexasDocumentFactory,
 )
 from cl.users.factories import UserFactory
 
@@ -26,14 +33,17 @@ FACTORIES = {
     101: DocketFactory,
     102: OpinionClusterWithParentsFactory,
     103: OpinionWithParentsFactory,
-    104: DocketEntryWithParentsFactory,
+    104: DocketEntryFactory,
     105: ParentheticalWithParentsFactory,
     106: FjcIntegratedDatabaseFactory,
     107: DocketEntryForDocketFactory,
     108: DocketEntryReuseParentsFactory,
+    109: RECAPDocumentFactory,
+    110: PrayerFactory,
     # People DB app
     200: PersonFactory,
     201: PersonWithChildrenFactory,
+    202: PersonWithDisclosuresFactory,
     # Users
     300: UserFactory,
     # Citations
@@ -45,8 +55,11 @@ FACTORIES = {
     600: AudioWithParentsFactory,
     # API
     700: WebhookEventWithParentsFactory,
+    # Texas
+    800: TexasDocketEntryFactory,
+    801: TexasDocumentFactory,
 }
-factories_str = "\n".join([f"{k}: {v}" for k, v in FACTORIES.items()])
+factories_str = "\n".join(f"{k}: {v}" for k, v in FACTORIES.items())
 
 
 class Command(VerboseCommand):
@@ -57,15 +70,15 @@ class Command(VerboseCommand):
             "--count",
             type=int,
             default=10,
-            help=f"How many items to create",
+            help="How many items to create",
         )
         parser.add_argument(
             "--make-objects",
             type=int,
             nargs="+",
             required=False,
-            help=f"Which type of objects do you want. Select by number from "
-            f"(multiple numbers allowed, separated by spaces): "
+            help="Which type of objects do you want. Select by number from "
+            "(multiple numbers allowed, separated by spaces): "
             f"\n{factories_str}",
         )
         parser.add_argument(
@@ -78,11 +91,11 @@ class Command(VerboseCommand):
             "--parent-id",
             type=int,
             required=False,
-            help=f"The parent of the object(s) being made",
+            help="The parent of the object(s) being made",
         )
 
     def handle(self, *args, **options) -> None:
-        super(Command, self).handle(*args, **options)
+        super().handle(*args, **options)
 
         if options["list_objects"]:
             for number, obj in FACTORIES.items():
@@ -92,7 +105,7 @@ class Command(VerboseCommand):
         count = options["count"]
         logger.info(
             f"Creating dummy data. Making at least {count} "
-            f"objects of each type."
+            "objects of each type."
         )
         parent_id = options["parent_id"] if options["parent_id"] else None
 
@@ -113,6 +126,10 @@ class Command(VerboseCommand):
                 (
                     "docket alerts and their parent objects",
                     DocketAlertWithParentsFactory,
+                ),
+                (
+                    "audio and their parent objects",
+                    AudioWithParentsFactory,
                 ),
             ):
                 logger.info(f"Making {count} {note}")

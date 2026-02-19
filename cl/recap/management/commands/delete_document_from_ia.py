@@ -1,32 +1,5 @@
-from urllib import parse
-
-import requests
-from django.conf import settings
-from requests import Response
-
 from cl.lib.command_utils import VerboseCommand
-
-
-def delete_from_ia(url: str) -> Response:
-    """Delete an item from Internet Archive by URL
-
-    :param url: The URL of the item, for example,
-    https://archive.org/download/gov.uscourts.nyed.299029/gov.uscourts.nyed.299029.30.0.pdf
-    :return: The requests.Response of the request to IA.
-    """
-    # Get the path and drop the /download/ part of it to just get the bucket
-    # and the path
-    path = parse.urlparse(url).path
-    bucket_path = path.split("/", 2)[2]
-    storage_domain = "http://s3.us.archive.org"
-    return requests.delete(
-        f"{storage_domain}/{bucket_path}",
-        headers={
-            "Authorization": f"LOW {settings.IA_ACCESS_KEY}:{settings.IA_SECRET_KEY}",
-            "x-archive-cascade-delete": "1",
-        },
-        timeout=60,
-    )
+from cl.search.utils import delete_from_ia
 
 
 class Command(VerboseCommand):
@@ -44,7 +17,7 @@ class Command(VerboseCommand):
         )
 
     def handle(self, *args, **options):
-        super(Command, self).handle(*args, **options)
+        super().handle(*args, **options)
         r = delete_from_ia(options["ia_download_url"])
         if r.ok:
             print("Item deleted successfully")

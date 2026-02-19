@@ -1,5 +1,4 @@
 import datetime
-from typing import Optional, Union
 
 import requests
 from asgiref.sync import async_to_sync
@@ -30,7 +29,7 @@ from cl.lib.command_utils import logger
 from cl.lib.crypto import sha1
 from cl.lib.microservice_utils import microservice
 from cl.lib.models import THUMBNAIL_STATUSES
-from cl.lib.redis_utils import create_redis_semaphore, make_redis_interface
+from cl.lib.redis_utils import create_redis_semaphore, get_redis_interface
 
 
 def make_disclosure_key(data_id: str) -> str:
@@ -76,7 +75,7 @@ def make_financial_disclosure_thumbnail_from_pdf(self, pk: int) -> None:
 def extract_content(
     pdf_bytes: bytes,
     disclosure_key: str,
-) -> dict[str, Union[str, int]]:
+) -> dict[str, str | int]:
     """Extract the content of the PDF.
 
     Attempt extraction using multiple methods if necessary.
@@ -132,7 +131,7 @@ class ChristmasError(Exception):
         self.message = message
 
 
-def get_date(text: str, year: int) -> Optional[datetime.date]:
+def get_date(text: str, year: int) -> datetime.date | None:
     """Extract date from date strings if possible
 
     Because we know year we can verify that the date is ... close.
@@ -225,9 +224,11 @@ def save_disclosure(extracted_data: dict, disclosure) -> None:
                 redacted=any(v["is_redacted"] for v in debt.values()),
                 creditor_name=debt["Creditor"]["text"],
                 description=debt["Description"]["text"],
-                value_code=debt["Value Code"]["text"]
-                if debt["Value Code"]["text"] != "None"
-                else "",
+                value_code=(
+                    debt["Value Code"]["text"]
+                    if debt["Value Code"]["text"] != "None"
+                    else ""
+                ),
             )
             for debt in extracted_data["sections"]["Liabilities"]["rows"]
         ]
@@ -314,7 +315,7 @@ def save_and_upload_disclosure(
     disclosure_key: str,
     response: Response,
     data: dict,
-) -> Optional[FinancialDisclosure]:
+) -> FinancialDisclosure | None:
     """Save disclosure PDF to S3 and generate a FinancialDisclosure object.
 
     :param redis_db: The redis db storing our disclosure keys
@@ -328,14 +329,16 @@ def save_and_upload_disclosure(
     if len(disclosure) > 0:
         return disclosure[0]
 
-    page_count = async_to_sync(microservice)(
-        service="page-count",
-        file_type="pdf",
-        file=response.content,
-    ).text
+    page_count = int(
+        async_to_sync(microservice)(
+            service="page-count",
+            file_type="pdf",
+            file=response.content,
+        ).text
+    )
     if not page_count:
         logger.error(
-            msg=f"Page count failed",
+            msg="Page count failed",
             extra={"disclosure_id": disclosure_key, "url": data["url"]},
         )
 
@@ -370,13 +373,13 @@ def save_and_upload_disclosure(
     interval_start=10,
     ignore_result=True,
 )
-def import_disclosure(self, data: dict[str, Union[str, int, list]]) -> None:
+def import_disclosure(self, data: dict[str, str | int | list]) -> None:
     """Import disclosures into Courtlistener
 
     :param data: The disclosure information to process
     :return: None
     """
-    redis_db = make_redis_interface("CACHE")
+    redis_db = get_redis_interface("CACHE")
     disclosure_key = make_disclosure_key(data["id"])
     newly_enqueued = create_redis_semaphore(
         redis_db,
@@ -439,7 +442,7 @@ def import_disclosure(self, data: dict[str, Union[str, int, list]]) -> None:
         )
     except ValidationError:
         logger.exception(
-            f"Validation Error up saving disclosure",
+            "Validation Error up saving disclosure",
             extra={"disclosure_id": data["id"]},
         )
 

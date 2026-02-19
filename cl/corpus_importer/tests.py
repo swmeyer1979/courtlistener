@@ -1,103 +1,198 @@
 import json
-import os
-import time
-from datetime import date, datetime, timezone
-from pathlib import Path
-from queue import Queue
-from random import randint
-from unittest.mock import patch
+from datetime import date, datetime, timedelta
+from unittest import mock
+from unittest.mock import call, patch
 
 import eyecite
+import httpx
 import pytest
-from asgiref.sync import async_to_sync
+import requests
+import responses
+import time_machine
+from bs4 import BeautifulSoup
+from celery.exceptions import Retry
 from django.conf import settings
+from django.core.exceptions import ObjectDoesNotExist
 from django.core.files.base import ContentFile
-from django.utils.timezone import make_aware
+from django.core.management import call_command
+from django.db.models.signals import post_save
+from django.test import SimpleTestCase, override_settings
+from django.utils import timezone
+from django.utils.timezone import now
+from eyecite.tokenizers import HyperscanTokenizer
 from factory import RelatedFactory
 from juriscraper.lib.string_utils import harmonize, titlecase
+from juriscraper.state.texas import (
+    TexasCaseParty,
+)
+from openai import RateLimitError
+from pydantic import ValidationError
 
+from cl.alerts.factories import DocketAlertFactory
+from cl.alerts.models import DocketAlert
+from cl.audio.factories import AudioFactory
 from cl.corpus_importer.court_regexes import match_court_string
 from cl.corpus_importer.factories import (
     CaseBodyFactory,
     CaseLawCourtFactory,
     CaseLawFactory,
     CitationFactory,
-    RssDocketDataFactory,
-    RssDocketEntryDataFactory,
 )
+from cl.corpus_importer.import_columbia.columbia_utils import fix_xml_tags
 from cl.corpus_importer.import_columbia.parse_opinions import (
     get_state_court_object,
 )
+from cl.corpus_importer.llm_models import CaseNameExtractionResponse
 from cl.corpus_importer.management.commands.clean_up_mis_matched_dockets import (
     find_and_fix_mis_matched_dockets,
 )
+from cl.corpus_importer.management.commands.columbia_merge import (
+    process_cluster,
+)
 from cl.corpus_importer.management.commands.harvard_merge import (
-    ClusterSourceException,
-    DocketSourceException,
     combine_non_overlapping_data,
     fetch_non_harvard_data,
-    merge_case_names,
     merge_cluster_dates,
-    merge_docket_numbers,
-    merge_judges,
     merge_opinion_clusters,
-    merge_strings,
     update_cluster_source,
     update_docket_source,
 )
 from cl.corpus_importer.management.commands.harvard_opinions import (
     clean_body_content,
-    compare_documents,
     parse_harvard_opinions,
     validate_dt,
-    winnow_case_name,
+)
+from cl.corpus_importer.management.commands.make_aws_manifest_files import (
+    get_monthly_record_ids_by_type,
 )
 from cl.corpus_importer.management.commands.normalize_judges_opinions import (
     normalize_authors_in_opinions,
     normalize_panel_in_opinioncluster,
 )
-from cl.corpus_importer.management.commands.troller_bk import (
-    download_files_concurrently,
-    log_added_items_to_redis,
-    merge_rss_data,
+from cl.corpus_importer.management.commands.probe_iquery_pages_daemon import (
+    get_latest_pacer_case_id_for_courts,
 )
-from cl.corpus_importer.tasks import generate_ia_json
-from cl.corpus_importer.utils import get_start_of_quarter
+from cl.corpus_importer.management.commands.update_casenames_wl_dataset import (
+    check_case_names_match,
+    parse_citations,
+)
+from cl.corpus_importer.signals import (
+    handle_update_latest_case_id_and_schedule_iquery_sweep,
+    update_latest_case_id_and_schedule_iquery_sweep,
+)
+from cl.corpus_importer.tasks import (
+    classify_case_name_by_llm,
+    download_texas_document_pdf,
+    generate_ia_json,
+    get_and_save_free_document_report,
+    merge_texas_docket_entry,
+    merge_texas_document,
+    merge_texas_documents,
+    merge_texas_parties,
+    normalize_texas_parties,
+    probe_or_scrape_iquery_pages,
+)
+from cl.corpus_importer.utils import (
+    ClusterSourceException,
+    DocketSourceException,
+    compare_documents,
+    compute_binary_probe_jitter,
+    compute_blocked_court_wait,
+    compute_next_binary_probe,
+    create_docket_entry_sequence_numbers,
+    get_start_of_quarter,
+    merge_case_names,
+    merge_docket_numbers,
+    merge_judges,
+    merge_strings,
+    winnow_case_name,
+)
+from cl.favorites.models import PrayerAvailability
 from cl.lib.pacer import process_docket_data
-from cl.lib.redis_utils import make_redis_interface
-from cl.lib.timezone_helpers import localize_date_and_time
-from cl.people_db.factories import PersonWithChildrenFactory, PositionFactory
+from cl.lib.redis_utils import get_redis_interface
+from cl.people_db.factories import (
+    ABARatingFactory,
+    EducationFactory,
+    PersonFactory,
+    PersonWithChildrenFactory,
+    PoliticalAffiliationFactory,
+    PositionFactory,
+    SchoolFactory,
+)
 from cl.people_db.lookup_utils import (
     extract_judge_last_name,
     find_all_judges,
     find_just_name,
 )
-from cl.people_db.models import Attorney, AttorneyOrganization, Party
-from cl.recap.models import UPLOAD_TYPE
-from cl.recap_rss.models import RssItemCache
+from cl.people_db.models import (
+    Attorney,
+    AttorneyOrganization,
+    Party,
+    PartyType,
+    Position,
+    Role,
+)
+from cl.recap.management.commands.nightly_pacer_updates import (
+    get_docket_ids_docket_alerts,
+    get_docket_ids_missing_info,
+    get_docket_ids_week_ago_no_case_name,
+    get_recap_documents_pray_and_pay,
+)
+from cl.recap.models import UPLOAD_TYPE, PacerHtmlFiles
+from cl.recap.tests.tests import mock_bucket_open
+from cl.scrapers.models import PACERFreeDocumentRow
+from cl.scrapers.tasks import update_docket_info_iquery
 from cl.search.factories import (
     CourtFactory,
-    DocketEntryWithParentsFactory,
+    DocketEntryFactory,
     DocketFactory,
     OpinionClusterFactory,
-    OpinionClusterFactoryMultipleOpinions,
-    OpinionClusterFactoryWithChildrenAndParents,
+    OpinionClusterWithChildrenAndParentsFactory,
+    OpinionClusterWithMultipleOpinionsFactory,
     OpinionClusterWithParentsFactory,
     OpinionWithChildrenFactory,
+    OpinionWithParentsFactory,
     RECAPDocumentFactory,
 )
 from cl.search.models import (
+    SEARCH_TYPES,
     SOURCES,
-    BankruptcyInformation,
     Citation,
-    Court,
     Docket,
     Opinion,
     OpinionCluster,
     RECAPDocument,
 )
+from cl.search.state.texas.factories import (
+    TexasCaseDocumentDictFactory,
+    TexasDocketEntryDictFactory,
+    TexasDocketEntryFactory,
+    TexasDocumentFactory,
+)
+from cl.search.state.texas.models import TexasDocketEntry, TexasDocument
 from cl.settings import MEDIA_ROOT
-from cl.tests.cases import SimpleTestCase, TestCase
+from cl.tests.cases import TestCase
+from cl.tests.fakes import FakeCaseQueryReport, FakeFreeOpinionReport
+from cl.tests.utils import MockResponse
+from cl.users.factories import UserProfileWithParentsFactory
+
+HYPERSCAN_TOKENIZER = HyperscanTokenizer(cache_dir=".hyperscan")
+
+
+class UtilsTest(SimpleTestCase):
+    def test_create_docket_entry_sequence_numbers(self):
+        """Do we generate sequence numbers correctly?"""
+        entry_1 = {"date": date.fromisoformat("2025-01-02")}
+        entry_2 = {"date": date.fromisoformat("2025-01-02")}
+        entry_3 = {"date": date.fromisoformat("2025-01-03")}
+
+        output = create_docket_entry_sequence_numbers(
+            [entry_1, entry_3, entry_2]
+        )
+        assert len(output) == 3
+        assert output[0] == "2025-01-02.001"
+        assert output[1] == "2025-01-03.001"
+        assert output[2] == "2025-01-02.002"
 
 
 class JudgeExtractionTest(SimpleTestCase):
@@ -335,8 +430,8 @@ class CourtMatchingTest(SimpleTestCase):
             self.assertEqual(
                 got,
                 d["answer"],
-                msg="\nDid not get court we expected: '%s'.\n"
-                "               Instead we got: '%s'" % (d["answer"], got),
+                msg="\nDid not get court we expected: '{}'.\n"
+                "               Instead we got: '{}'".format(d["answer"], got),
             )
 
     def test_get_fed_court_object_from_string(self) -> None:
@@ -377,6 +472,9 @@ class CourtMatchingTest(SimpleTestCase):
             self.assertEqual(test["a"], got)
 
 
+@override_settings(
+    EGRESS_PROXY_HOSTS=["http://proxy_1:9090", "http://proxy_2:9090"]
+)
 @pytest.mark.django_db
 class PacerDocketParserTest(TestCase):
     """Can we parse RECAP dockets successfully?"""
@@ -471,6 +569,30 @@ class PacerDocketParserTest(TestCase):
         self.assertEqual(godfrey_llp.city, "Seattle")
         self.assertEqual(godfrey_llp.state, "WA")
 
+    @patch("cl.corpus_importer.tasks.get_or_cache_pacer_cookies")
+    def test_get_and_save_free_document_report(self, mock_cookies) -> None:
+        """Test the retrieval and storage of free document report data."""
+
+        with patch(
+            "cl.corpus_importer.tasks.FreeOpinionReport",
+            new=FakeFreeOpinionReport,
+        ):
+            get_and_save_free_document_report(
+                "cand", now().date(), now().date()
+            )
+
+        row = PACERFreeDocumentRow.objects.all()
+        self.assertEqual(row.count(), 1)
+        self.assertEqual(row[0].court_id, "cand")
+        self.assertEqual(row[0].docket_number, "5:18-ap-07075")
+        self.assertTrue(row[0].description)
+        self.assertTrue(row[0].date_filed)
+        self.assertTrue(row[0].document_number)
+        self.assertTrue(row[0].nature_of_suit)
+        self.assertTrue(row[0].pacer_case_id)
+        self.assertTrue(row[0].pacer_doc_id)
+        self.assertTrue(row[0].pacer_seq_no)
+
 
 class GetQuarterTest(SimpleTestCase):
     """Can we properly figure out when the quarter that we're currently in
@@ -517,12 +639,7 @@ class IAUploaderTest(TestCase):
             expected_num_attorneys,
             actual_num_attorneys,
             msg="Got wrong number of attorneys when making IA JSON. "
-            "Got %s, expected %s: \n%s"
-            % (
-                actual_num_attorneys,
-                expected_num_attorneys,
-                first_party_attorneys,
-            ),
+            f"Got {actual_num_attorneys}, expected {expected_num_attorneys}: \n{first_party_attorneys}",
         )
 
         first_attorney = first_party_attorneys[0]
@@ -533,7 +650,7 @@ class IAUploaderTest(TestCase):
             actual_num_roles,
             expected_num_roles,
             msg="Got wrong number of roles on attorneys when making IA JSON. "
-            "Got %s, expected %s" % (actual_num_roles, expected_num_roles),
+            f"Got {actual_num_roles}, expected {expected_num_roles}",
         )
 
     def test_num_queries_ok(self) -> None:
@@ -561,6 +678,7 @@ class HarvardTests(TestCase):
         Each one can be used or turned off.  See the teardown for more.
         :return:
         """
+        super().setUp()
         self.make_filepath_patch = patch(
             "cl.corpus_importer.management.commands.harvard_opinions.filepath_list"
         )
@@ -593,8 +711,8 @@ class HarvardTests(TestCase):
         self.make_filepath_patch.stop()
         self.read_json_patch.stop()
         self.find_court_patch.stop()
-        Docket.objects.all().delete()
-        Court.objects.all().delete()
+        self.get_fix_list_patch.stop()
+        super().tearDown()
 
     def _get_cite(self, case_law) -> Citation:
         """Fetch first citation added to case
@@ -602,7 +720,9 @@ class HarvardTests(TestCase):
         :param case_law: Case object
         :return: First citation found
         """
-        cites = eyecite.get_citations(case_law["citations"][0]["cite"])
+        cites = eyecite.get_citations(
+            case_law["citations"][0]["cite"], tokenizer=HYPERSCAN_TOKENIZER
+        )
         cite = Citation.objects.get(
             volume=cites[0].groups["volume"],
             reporter=cites[0].groups["reporter"],
@@ -1003,7 +1123,7 @@ class CorpusImporterManagementCommmandsTests(TestCase):
 
         # Create opinion cluster with opinion and docket
         cluster = (
-            OpinionClusterFactoryWithChildrenAndParents(
+            OpinionClusterWithChildrenAndParentsFactory(
                 docket=DocketFactory(
                     court=self.court,
                     case_name="Foo v. Bar",
@@ -1062,1275 +1182,6 @@ class CorpusImporterManagementCommmandsTests(TestCase):
         self.assertEqual(len(cluster.panel.all()), 2)
 
 
-def mock_download_file(item_path, order):
-    time.sleep(randint(1, 10) / 100)
-    return b"", item_path, order
-
-
-class TrollerBKTests(TestCase):
-    @classmethod
-    def setUpTestData(cls) -> None:
-        # District factories
-        cls.court = CourtFactory(id="canb", jurisdiction="FB")
-        cls.court_neb = CourtFactory(id="nebraskab", jurisdiction="FD")
-        cls.court_pamd = CourtFactory(id="pamd", jurisdiction="FD")
-        cls.docket_d_before_2018 = DocketFactory(
-            case_name="Young v. State",
-            docket_number="3:17-CV-01477",
-            court=cls.court,
-            source=Docket.HARVARD,
-            pacer_case_id="1234",
-        )
-
-        cls.docket_d_after_2018 = DocketFactory(
-            case_name="Dragon v. State",
-            docket_number="3:15-CV-01455",
-            court=cls.court,
-            source=Docket.HARVARD,
-            pacer_case_id="5431",
-        )
-
-        cls.de_d_before_2018 = DocketEntryWithParentsFactory(
-            docket__court=cls.court,
-            docket__case_name="Young Entry v. Dragon",
-            docket__docket_number="3:87-CV-01400",
-            docket__source=Docket.HARVARD,
-            docket__pacer_case_id="9038",
-            entry_number=1,
-            date_filed=make_aware(
-                datetime(year=2018, month=1, day=4), timezone.utc
-            ),
-        )
-
-        # Appellate factories
-        cls.court_appellate = CourtFactory(id="ca1", jurisdiction="F")
-        cls.docket_a_before_2018 = DocketFactory(
-            case_name="Young v. State",
-            docket_number="12-2532",
-            court=cls.court_appellate,
-            source=Docket.HARVARD,
-            pacer_case_id=None,
-        )
-        cls.docket_a_after_2018 = DocketFactory(
-            case_name="Dragon v. State",
-            docket_number="15-1232",
-            court=cls.court_appellate,
-            source=Docket.HARVARD,
-            pacer_case_id=None,
-        )
-        cls.de_a_before_2018 = DocketEntryWithParentsFactory(
-            docket__court=cls.court_appellate,
-            docket__case_name="Young Entry v. Dragon",
-            docket__docket_number="12-3242",
-            docket__source=Docket.HARVARD,
-            docket__pacer_case_id=None,
-            entry_number=1,
-            date_filed=make_aware(
-                datetime(year=2018, month=1, day=4), timezone.utc
-            ),
-        )
-        cls.docket_a_2018_case_id = DocketFactory(
-            case_name="Young v. State",
-            docket_number="12-5674",
-            court=cls.court_appellate,
-            source=Docket.RECAP,
-            pacer_case_id="12524",
-        )
-
-    def setUp(self) -> None:
-        self.r = make_redis_interface("STATS")
-        self.r.flushdb()
-
-    def test_merge_district_rss_before_2018(self):
-        """1 Test merge district RSS file before 2018-4-20 into an existing
-        docket
-
-        Before 2018-4-20
-        District
-        Docket exists
-        No docket entries
-
-        Merge docket entries, avoid updating metadata.
-        """
-        d_rss_data_before_2018 = RssDocketDataFactory(
-            court_id=self.court.pk,
-            case_name="Young v. Dragon",
-            docket_number="3:17-CV-01473",
-            pacer_case_id="1234",
-            docket_entries=[
-                RssDocketEntryDataFactory(
-                    date_filed=make_aware(
-                        datetime(year=2017, month=1, day=4), timezone.utc
-                    )
-                )
-            ],
-        )
-
-        build_date = d_rss_data_before_2018["docket_entries"][0]["date_filed"]
-        self.assertEqual(
-            len(self.docket_d_before_2018.docket_entries.all()), 0
-        )
-        rds_created, d_created = async_to_sync(merge_rss_data)(
-            [d_rss_data_before_2018], self.court.pk, build_date
-        )
-        self.assertEqual(len(rds_created), 1)
-        self.assertEqual(d_created, 0)
-        self.docket_d_before_2018.refresh_from_db()
-        self.assertEqual(self.docket_d_before_2018.case_name, "Young v. State")
-        self.assertEqual(
-            self.docket_d_before_2018.docket_number, "3:17-CV-01477"
-        )
-        self.assertEqual(
-            len(self.docket_d_before_2018.docket_entries.all()), 1
-        )
-        self.assertEqual(
-            self.docket_d_before_2018.source, Docket.HARVARD_AND_RECAP
-        )
-
-    def test_avoid_merging_district_rss_after_2018(self):
-        """2 Test avoid merging district RSS file after 2018-4-20
-
-        After 2018-4-20
-        District
-        Docket exists
-        No docket entries
-
-        Don't merge docket entries, avoid updating metadata.
-        """
-        d_rss_data_after_2018 = RssDocketDataFactory(
-            court_id=self.court.pk,
-            case_name="Dragon 1 v. State",
-            docket_number="3:15-CV-01456",
-            pacer_case_id="5431",
-            docket_entries=[
-                RssDocketEntryDataFactory(
-                    date_filed=make_aware(
-                        datetime(year=2018, month=4, day=21), timezone.utc
-                    )
-                )
-            ],
-        )
-
-        build_date = d_rss_data_after_2018["docket_entries"][0]["date_filed"]
-        self.assertEqual(len(self.docket_d_after_2018.docket_entries.all()), 0)
-        rds_created, d_created = async_to_sync(merge_rss_data)(
-            [d_rss_data_after_2018], self.court.pk, build_date
-        )
-        self.assertEqual(len(rds_created), 0)
-        self.assertEqual(d_created, 0)
-        self.docket_d_after_2018.refresh_from_db()
-        self.assertEqual(self.docket_d_after_2018.case_name, "Dragon v. State")
-        self.assertEqual(
-            self.docket_d_after_2018.docket_number, "3:15-CV-01455"
-        )
-        self.assertEqual(len(self.docket_d_after_2018.docket_entries.all()), 0)
-        self.assertEqual(self.docket_d_after_2018.source, Docket.HARVARD)
-
-    def test_merge_district_courts_rss_exceptions_after_2018(self):
-        """Test merging district RSS exceptions after 2018-4-20
-
-        After 2018-4-20
-        District ["miwb", "nceb", "pamd", "cit"]
-        Docket doesn't exists
-        No docket entries
-
-        Create docket, merge docket entries.
-        """
-        d_rss_data_after_2018 = RssDocketDataFactory(
-            court_id=self.court_pamd.pk,
-            case_name="Dragon 1 v. State",
-            docket_number="3:15-CV-01456",
-            pacer_case_id="54312",
-            docket_entries=[
-                RssDocketEntryDataFactory(
-                    date_filed=make_aware(
-                        datetime(year=2018, month=4, day=21), timezone.utc
-                    )
-                )
-            ],
-        )
-
-        build_date = d_rss_data_after_2018["docket_entries"][0]["date_filed"]
-        self.assertEqual(len(self.docket_d_after_2018.docket_entries.all()), 0)
-        rds_created, d_created = async_to_sync(merge_rss_data)(
-            [d_rss_data_after_2018], self.court_pamd.pk, build_date
-        )
-        self.assertEqual(len(rds_created), 1)
-        self.assertEqual(d_created, 1)
-
-        docket = Docket.objects.get(pacer_case_id="54312")
-        self.assertEqual(docket.case_name, "Dragon 1 v. State")
-        self.assertEqual(docket.docket_number, "3:15-CV-01456")
-
-    def test_merging_district_docket_with_entries_before_2018(self):
-        """3 Test merge district RSS file before 2018-4-20 into a
-        docket with entries.
-
-        Before 2018-4-20
-        District
-        Docket exists
-        Docket entries
-
-        Only merge entry if it doesn't exist, avoid updating metadata.
-        """
-        d_rss_data_before_2018 = RssDocketDataFactory(
-            court_id=self.court.pk,
-            case_name="Young v. Dragon",
-            docket_number="3:17-CV-01473",
-            pacer_case_id="9038",
-            docket_entries=[
-                RssDocketEntryDataFactory(
-                    document_number="2",
-                    date_filed=make_aware(
-                        datetime(year=2017, month=1, day=4), timezone.utc
-                    ),
-                )
-            ],
-        )
-
-        build_date = d_rss_data_before_2018["docket_entries"][0]["date_filed"]
-        self.assertEqual(
-            len(self.de_d_before_2018.docket.docket_entries.all()), 1
-        )
-        rds_created, d_created = async_to_sync(merge_rss_data)(
-            [d_rss_data_before_2018], self.court.pk, build_date
-        )
-        self.assertEqual(len(rds_created), 1)
-        self.assertEqual(d_created, 0)
-        self.de_d_before_2018.refresh_from_db()
-        self.assertEqual(
-            self.de_d_before_2018.docket.case_name, "Young Entry v. Dragon"
-        )
-        self.assertEqual(
-            self.de_d_before_2018.docket.docket_number, "3:87-CV-01400"
-        )
-        self.assertEqual(
-            len(self.de_d_before_2018.docket.docket_entries.all()), 2
-        )
-        self.assertEqual(
-            self.de_d_before_2018.docket.source, Docket.HARVARD_AND_RECAP
-        )
-
-    def test_avoid_merging_updating_docket_item_without_docket_entries(
-        self,
-    ):
-        """Test avoid merging or updating the docket when the RSS item doesn't
-        contain entries.
-
-        Docket exists
-        Docket entries
-
-        Avoid updating metadata.
-        """
-        d_rss_data_before_2018 = RssDocketDataFactory(
-            court_id=self.court.pk,
-            case_name="Young v. Dragon",
-            docket_number="3:17-CV-01473",
-            pacer_case_id="9038",
-            docket_entries=[],
-        )
-
-        build_date = make_aware(
-            datetime(year=2017, month=1, day=4), timezone.utc
-        )
-        self.assertEqual(
-            len(self.de_d_before_2018.docket.docket_entries.all()), 1
-        )
-        rds_created, d_created = async_to_sync(merge_rss_data)(
-            [d_rss_data_before_2018], self.court.pk, build_date
-        )
-        self.assertEqual(len(rds_created), 0)
-        self.assertEqual(d_created, 0)
-        self.assertEqual(self.de_d_before_2018.docket.source, Docket.HARVARD)
-
-    def test_add_new_district_rss_before_2018(self):
-        """4 Test adds a district RSS file before 2018-4-20, new docket.
-
-        Before: 2018-4-20
-        District
-        Docket doesn't exist
-        No docket entries
-
-        Create docket, merge docket entries.
-        """
-        d_rss_data_before_2018 = RssDocketDataFactory(
-            court_id=self.court.pk,
-            case_name="Youngs v. Dragon",
-            docket_number="3:20-CV-01473",
-            pacer_case_id="43562",
-            docket_entries=[
-                RssDocketEntryDataFactory(
-                    date_filed=make_aware(
-                        datetime(year=2017, month=1, day=4), timezone.utc
-                    )
-                )
-            ],
-        )
-
-        build_date = d_rss_data_before_2018["docket_entries"][0]["date_filed"]
-        dockets = Docket.objects.filter(pacer_case_id="43562")
-        self.assertEqual(dockets.count(), 0)
-        rds_created, d_created = async_to_sync(merge_rss_data)(
-            [d_rss_data_before_2018], self.court.pk, build_date
-        )
-        self.assertEqual(len(rds_created), 1)
-        self.assertEqual(d_created, 1)
-        self.assertEqual(dockets[0].case_name, "Youngs v. Dragon")
-        self.assertEqual(dockets[0].docket_number, "3:20-CV-01473")
-        self.assertEqual(len(dockets[0].docket_entries.all()), 1)
-        self.assertEqual(dockets[0].source, Docket.RECAP)
-
-    def test_avoid_merging_rss_docket_with_entries_district_after_2018(self):
-        """5 Test avoid merging district RSS file after 2018-4-20 into a
-        docket with entries.
-
-        After 2018-4-20
-        District
-        Docket exists
-        Docket entries
-
-        Don't merge docket entries, avoid updating metadata.
-        """
-        d_rss_data_after_2018 = RssDocketDataFactory(
-            court_id=self.court.pk,
-            case_name="Young v. Dragons 2",
-            docket_number="3:57-CV-01453",
-            pacer_case_id="9038",
-            docket_entries=[
-                RssDocketEntryDataFactory(
-                    document_number="2",
-                    date_filed=make_aware(
-                        datetime(year=2019, month=1, day=4), timezone.utc
-                    ),
-                )
-            ],
-        )
-
-        build_date = d_rss_data_after_2018["docket_entries"][0]["date_filed"]
-        self.assertEqual(
-            len(self.de_d_before_2018.docket.docket_entries.all()), 1
-        )
-        rds_created, d_created = async_to_sync(merge_rss_data)(
-            [d_rss_data_after_2018], self.court.pk, build_date
-        )
-        self.assertEqual(len(rds_created), 0)
-        self.assertEqual(d_created, 0)
-        self.de_d_before_2018.refresh_from_db()
-        self.assertEqual(
-            self.de_d_before_2018.docket.case_name, "Young Entry v. Dragon"
-        )
-        self.assertEqual(
-            self.de_d_before_2018.docket.docket_number, "3:87-CV-01400"
-        )
-        self.assertEqual(
-            len(self.de_d_before_2018.docket.docket_entries.all()), 1
-        )
-        self.assertEqual(self.de_d_before_2018.docket.source, Docket.HARVARD)
-
-    def test_avoid_adding_new_district_rss_after_2018(self):
-        """6 Test avoid adding district RSS file after 2018-4-20.
-
-        After 2018-4-20
-        District
-        Docket doesn't exist
-        No docket entries
-
-        Do not create docket, do not merge docket entries.
-        """
-        d_rss_data_after_2018 = RssDocketDataFactory(
-            court_id=self.court.pk,
-            case_name="Youngs v. Dragon",
-            docket_number="3:20-CV-01473",
-            pacer_case_id="53432",
-            docket_entries=[
-                RssDocketEntryDataFactory(
-                    date_filed=make_aware(
-                        datetime(year=2019, month=1, day=4), timezone.utc
-                    )
-                )
-            ],
-        )
-
-        build_date = d_rss_data_after_2018["docket_entries"][0]["date_filed"]
-        rds_created, d_created = async_to_sync(merge_rss_data)(
-            [d_rss_data_after_2018], self.court.pk, build_date
-        )
-        self.assertEqual(len(rds_created), 0)
-        self.assertEqual(d_created, 0)
-
-    # Appellate
-    def test_merge_appellate_rss_before_2018(self):
-        """7 Test merge an appellate RSS file before 2018-4-20
-
-        Before 2018-4-20
-        Appellate
-        Docket exists
-        No docket entries
-
-        Merge docket entries, avoid updating metadata.
-        """
-        a_rss_data_before_2018 = RssDocketDataFactory(
-            court_id=self.court_appellate.pk,
-            case_name="Young v. Dragon",
-            docket_number="12-2532",
-            pacer_case_id=None,
-            docket_entries=[
-                RssDocketEntryDataFactory(
-                    date_filed=make_aware(
-                        datetime(year=2017, month=1, day=4), timezone.utc
-                    )
-                )
-            ],
-        )
-
-        build_date = a_rss_data_before_2018["docket_entries"][0]["date_filed"]
-        self.assertEqual(
-            len(self.docket_a_before_2018.docket_entries.all()), 0
-        )
-        rds_created, d_created = async_to_sync(merge_rss_data)(
-            [a_rss_data_before_2018], self.court_appellate.pk, build_date
-        )
-        self.assertEqual(len(rds_created), 1)
-        self.assertEqual(d_created, 0)
-        self.docket_a_before_2018.refresh_from_db()
-        self.assertEqual(self.docket_a_before_2018.case_name, "Young v. State")
-        self.assertEqual(self.docket_a_before_2018.docket_number, "12-2532")
-        self.assertEqual(
-            len(self.docket_a_before_2018.docket_entries.all()), 1
-        )
-        self.assertEqual(
-            self.docket_a_before_2018.source, Docket.HARVARD_AND_RECAP
-        )
-
-    def test_merging_appellate_rss_after_2018(self):
-        """8 Test appellate RSS file after 2018-4-20
-
-        After 2018-4-20
-        Appellate
-        Docket exists
-        No docket entries
-
-        Merge docket entries, avoid updating metadata.
-        """
-        a_rss_data_after_2018 = RssDocketDataFactory(
-            court_id=self.court_appellate.pk,
-            case_name="Dragon 1 v. State",
-            docket_number="15-1232",
-            pacer_case_id=None,
-            docket_entries=[
-                RssDocketEntryDataFactory(
-                    date_filed=make_aware(
-                        datetime(year=2018, month=4, day=21), timezone.utc
-                    )
-                )
-            ],
-        )
-
-        build_date = a_rss_data_after_2018["docket_entries"][0]["date_filed"]
-        self.assertEqual(len(self.docket_a_after_2018.docket_entries.all()), 0)
-        rds_created, d_created = async_to_sync(merge_rss_data)(
-            [a_rss_data_after_2018], self.court_appellate.pk, build_date
-        )
-        self.assertEqual(len(rds_created), 1)
-        self.assertEqual(d_created, 0)
-        self.docket_a_after_2018.refresh_from_db()
-        self.assertEqual(self.docket_a_after_2018.case_name, "Dragon v. State")
-        self.assertEqual(self.docket_a_after_2018.docket_number, "15-1232")
-        self.assertEqual(len(self.docket_a_after_2018.docket_entries.all()), 1)
-        self.assertEqual(
-            self.docket_a_after_2018.source, Docket.HARVARD_AND_RECAP
-        )
-
-    def test_avoid_merging_existing_appellate_entry_before_2018(self):
-        """9 Test avoid merging appellate RSS file before 2018-4-20, docket
-        with entries.
-
-        Before 2018-4-20
-        Appellate
-        Docket exists
-        Docket entries
-
-        Don't merge docket entries, avoid updating metadata.
-        """
-        a_rss_data_before_2018 = RssDocketDataFactory(
-            court_id=self.court_appellate.pk,
-            case_name="Young v. Dragon",
-            docket_number="12-3242",
-            pacer_case_id=None,
-            docket_entries=[
-                RssDocketEntryDataFactory(
-                    document_number="2",
-                    date_filed=make_aware(
-                        datetime(year=2017, month=1, day=4), timezone.utc
-                    ),
-                )
-            ],
-        )
-
-        build_date = a_rss_data_before_2018["docket_entries"][0]["date_filed"]
-        self.assertEqual(
-            len(self.de_a_before_2018.docket.docket_entries.all()), 1
-        )
-        rds_created, d_created = async_to_sync(merge_rss_data)(
-            [a_rss_data_before_2018], self.court_appellate.pk, build_date
-        )
-        self.assertEqual(len(rds_created), 1)
-        self.assertEqual(d_created, 0)
-        self.de_a_before_2018.refresh_from_db()
-        self.assertEqual(
-            self.de_a_before_2018.docket.case_name, "Young Entry v. Dragon"
-        )
-        self.assertEqual(self.de_a_before_2018.docket.docket_number, "12-3242")
-        self.assertEqual(
-            len(self.de_a_before_2018.docket.docket_entries.all()), 2
-        )
-        self.assertEqual(
-            self.de_a_before_2018.docket.source, Docket.HARVARD_AND_RECAP
-        )
-
-    def test_merge_new_appellate_rss_before_2018(self):
-        """10 Merge a new appellate RSS file before 2018-4-20
-
-        Before: 2018-4-20
-        Appellate
-        Docket doesn't exist
-        No docket entries
-
-        Create docket, merge docket entries.
-        """
-        a_rss_data_before_2018 = RssDocketDataFactory(
-            court_id=self.court_appellate.pk,
-            case_name="Youngs v. Dragon",
-            docket_number="23-4233",
-            pacer_case_id=None,
-            docket_entries=[
-                RssDocketEntryDataFactory(
-                    date_filed=make_aware(
-                        datetime(year=2017, month=1, day=4), timezone.utc
-                    )
-                )
-            ],
-        )
-
-        build_date = a_rss_data_before_2018["docket_entries"][0]["date_filed"]
-        dockets = Docket.objects.filter(docket_number="23-4233")
-        self.assertEqual(dockets.count(), 0)
-        rds_created, d_created = async_to_sync(merge_rss_data)(
-            [a_rss_data_before_2018], self.court_appellate.pk, build_date
-        )
-        self.assertEqual(len(rds_created), 1)
-        self.assertEqual(d_created, 1)
-        self.assertEqual(dockets[0].case_name, "Youngs v. Dragon")
-        self.assertEqual(dockets[0].docket_number, "23-4233")
-        self.assertEqual(len(dockets[0].docket_entries.all()), 1)
-        self.assertEqual(dockets[0].source, Docket.RECAP)
-
-    def test_avoid_merging_existing_appellate_entry_after_2018(self):
-        """11 Test avoid merging appellate RSS file after 2018-4-20, docket with
-        entries.
-
-        After: 2018-4-20
-        Appellate
-        Docket exists
-        Docket entry exist
-
-        Don't merge the existing entry, avoid updating metadata.
-        """
-        a_rss_data_before_2018 = RssDocketDataFactory(
-            court_id=self.court_appellate.pk,
-            case_name="Young v. Dragon",
-            docket_number="12-3242",
-            pacer_case_id=None,
-            docket_entries=[
-                RssDocketEntryDataFactory(
-                    document_number="1",
-                    date_filed=make_aware(
-                        datetime(year=2019, month=1, day=4), timezone.utc
-                    ),
-                )
-            ],
-        )
-
-        build_date = a_rss_data_before_2018["docket_entries"][0]["date_filed"]
-        self.assertEqual(
-            len(self.de_a_before_2018.docket.docket_entries.all()), 1
-        )
-        rds_created, d_created = async_to_sync(merge_rss_data)(
-            [a_rss_data_before_2018], self.court_appellate.pk, build_date
-        )
-        self.assertEqual(len(rds_created), 0)
-        self.assertEqual(d_created, 0)
-
-    def test_merging_appellate_docket_with_entries_after_2018(self):
-        """Test merge appellate RSS file after 2018-4-20, docket with
-        entries.
-
-        After: 2018-4-20
-        Appellate
-        Docket exists
-        Docket entries
-
-        Only merge entry if it doesn't exist, avoid updating metadata.
-        """
-        a_rss_data_before_2018 = RssDocketDataFactory(
-            court_id=self.court_appellate.pk,
-            case_name="Young v. Dragon",
-            docket_number="12-3242",
-            pacer_case_id=None,
-            docket_entries=[
-                RssDocketEntryDataFactory(
-                    document_number="2",
-                    date_filed=make_aware(
-                        datetime(year=2019, month=1, day=4), timezone.utc
-                    ),
-                )
-            ],
-        )
-
-        build_date = a_rss_data_before_2018["docket_entries"][0]["date_filed"]
-        self.assertEqual(
-            len(self.de_a_before_2018.docket.docket_entries.all()), 1
-        )
-        rds_created, d_created = async_to_sync(merge_rss_data)(
-            [a_rss_data_before_2018], self.court_appellate.pk, build_date
-        )
-        self.assertEqual(len(rds_created), 1)
-        self.assertEqual(d_created, 0)
-        self.de_a_before_2018.refresh_from_db()
-        self.assertEqual(
-            self.de_a_before_2018.docket.case_name, "Young Entry v. Dragon"
-        )
-        self.assertEqual(self.de_a_before_2018.docket.docket_number, "12-3242")
-        self.assertEqual(
-            len(self.de_a_before_2018.docket.docket_entries.all()), 2
-        )
-        self.assertEqual(
-            self.de_a_before_2018.docket.source, Docket.HARVARD_AND_RECAP
-        )
-
-    def test_merge_new_appellate_rss_after_2018(self):
-        """12 Merge a new appellate RSS file after 2018-4-20
-
-        After: 2018-4-20
-        Appellate
-        Docket doesn't exist
-        No docket entries
-
-        Create docket, merge docket entries, .
-        """
-
-        d_rss_data_after_2018 = RssDocketDataFactory(
-            court_id=self.court_appellate.pk,
-            case_name="Youngs v. Dragon",
-            docket_number="45-3232",
-            pacer_case_id=None,
-            docket_entries=[
-                RssDocketEntryDataFactory(
-                    date_filed=make_aware(
-                        datetime(year=2019, month=1, day=4), timezone.utc
-                    )
-                )
-            ],
-        )
-
-        build_date = d_rss_data_after_2018["docket_entries"][0]["date_filed"]
-        dockets = Docket.objects.filter(docket_number="45-3232")
-        self.assertEqual(dockets.count(), 0)
-        rds_created, d_created = async_to_sync(merge_rss_data)(
-            [d_rss_data_after_2018], self.court_appellate.pk, build_date
-        )
-        self.assertEqual(len(rds_created), 1)
-        self.assertEqual(d_created, 1)
-        self.assertEqual(dockets.count(), 1)
-        self.assertEqual(dockets[0].case_name, "Youngs v. Dragon")
-        self.assertEqual(dockets[0].docket_number, "45-3232")
-        self.assertEqual(len(dockets[0].docket_entries.all()), 1)
-        self.assertEqual(dockets[0].source, Docket.RECAP)
-
-    def test_merging_appellate_docket_with_entries_case_id(self):
-        """Test merge an appellate RSS file into a docket with pacer_case_id
-        Find docket by docket_number_core, avoid duplicating.
-        Merge docket entries, avoid updating metadata.
-        """
-        a_rss_data_before_2018 = RssDocketDataFactory(
-            court_id=self.court_appellate.pk,
-            case_name="Young v. Dragon",
-            docket_number="12-5674",
-            pacer_case_id=None,
-            docket_entries=[
-                RssDocketEntryDataFactory(
-                    document_number="2",
-                    date_filed=make_aware(
-                        datetime(year=2019, month=1, day=4), timezone.utc
-                    ),
-                )
-            ],
-        )
-
-        build_date = a_rss_data_before_2018["docket_entries"][0]["date_filed"]
-        self.assertEqual(
-            len(self.docket_a_2018_case_id.docket_entries.all()), 0
-        )
-        rds_created, d_created = async_to_sync(merge_rss_data)(
-            [a_rss_data_before_2018], self.court_appellate.pk, build_date
-        )
-        self.assertEqual(len(rds_created), 1)
-        self.assertEqual(d_created, 0)
-        self.docket_a_2018_case_id.refresh_from_db()
-        self.assertEqual(
-            self.docket_a_2018_case_id.case_name, "Young v. State"
-        )
-        self.assertEqual(self.docket_a_2018_case_id.docket_number, "12-5674")
-        self.assertEqual(self.docket_a_2018_case_id.pacer_case_id, "12524")
-        self.assertEqual(
-            len(self.docket_a_2018_case_id.docket_entries.all()), 1
-        )
-        self.assertEqual(self.docket_a_2018_case_id.source, Docket.RECAP)
-
-    def test_log_added_items_to_redis(self):
-        """Can we log dockets and rds added to redis, adding the previous
-        value?
-        """
-        last_values = log_added_items_to_redis(100, 100, 50)
-        self.assertEqual(last_values["total_dockets"], 100)
-        self.assertEqual(last_values["total_rds"], 100)
-        self.assertEqual(last_values["last_line"], 50)
-
-        last_values = log_added_items_to_redis(50, 80, 100)
-        self.assertEqual(last_values["total_dockets"], 150)
-        self.assertEqual(last_values["total_rds"], 180)
-        self.assertEqual(last_values["last_line"], 100)
-
-        self.r.flushdb()
-
-    def test_merge_mapped_court_rss_before_2018(self):
-        """Merge a court mapped RSS file before 2018-4-20
-
-        before: 2018-4-20
-        District neb -> nebraskab
-        Docket doesn't exist
-        No docket entries
-
-        Create docket, merge docket entries, verify is assigned to nebraskab.
-        """
-
-        d_rss_data_before_2018 = RssDocketDataFactory(
-            court_id="neb",
-            case_name="Youngs v. Dragon",
-            docket_number="3:20-CV-01473",
-            pacer_case_id="43565",
-            docket_entries=[
-                RssDocketEntryDataFactory(
-                    date_filed=make_aware(
-                        datetime(year=2017, month=1, day=4), timezone.utc
-                    )
-                )
-            ],
-        )
-
-        build_date = d_rss_data_before_2018["docket_entries"][0]["date_filed"]
-        dockets = Docket.objects.filter(docket_number="3:20-CV-01473")
-        self.assertEqual(dockets.count(), 0)
-        rds_created, d_created = async_to_sync(merge_rss_data)(
-            [d_rss_data_before_2018], "neb", build_date
-        )
-        self.assertEqual(len(rds_created), 1)
-        self.assertEqual(d_created, 1)
-        self.assertEqual(dockets.count(), 1)
-        self.assertEqual(dockets[0].case_name, "Youngs v. Dragon")
-        self.assertEqual(dockets[0].docket_number, "3:20-CV-01473")
-        self.assertEqual(len(dockets[0].docket_entries.all()), 1)
-        self.assertEqual(dockets[0].source, Docket.RECAP)
-        self.assertEqual(dockets[0].court.pk, "nebraskab")
-
-    def test_avoid_merging_district_mapped_court_rss_after_2018(self):
-        """Avoid merging a new district RSS file with mapped court
-        after 2018-4-20.
-
-        After: 2018-4-20
-        District neb -> nebraskab
-        Docket doesn't exist
-        No docket entries
-
-        Don't merge.
-        """
-
-        d_rss_data_after_2018 = RssDocketDataFactory(
-            court_id="neb",
-            case_name="Youngs v. Dragon",
-            docket_number="3:20-CV-01473",
-            pacer_case_id="43565",
-            docket_entries=[
-                RssDocketEntryDataFactory(
-                    date_filed=make_aware(
-                        datetime(year=2019, month=1, day=4), timezone.utc
-                    )
-                )
-            ],
-        )
-        build_date = d_rss_data_after_2018["docket_entries"][0]["date_filed"]
-        rds_created, d_created = async_to_sync(merge_rss_data)(
-            [d_rss_data_after_2018], "neb", build_date
-        )
-        self.assertEqual(len(rds_created), 0)
-        self.assertEqual(d_created, 0)
-
-    def test_avoid_updating_docket_entry_metadata(self):
-        """Test merge appellate RSS file after 2018-4-20, docket with
-        entries.
-
-        After: 2018-4-20
-        Appellate
-        Docket exists
-        Docket entries
-
-        Only merge entry if it doesn't exist, avoid updating metadata.
-        """
-
-        de_a_unnumbered = DocketEntryWithParentsFactory(
-            docket__court=self.court_appellate,
-            docket__case_name="Young Entry v. Dragon",
-            docket__docket_number="12-3245",
-            docket__source=Docket.HARVARD,
-            docket__pacer_case_id=None,
-            entry_number=None,
-            description="Original docket entry description",
-            date_filed=make_aware(
-                datetime(year=2018, month=1, day=5), timezone.utc
-            ),
-        )
-        RECAPDocumentFactory(
-            docket_entry=de_a_unnumbered, description="Opinion Issued"
-        )
-
-        a_rss_data_unnumbered = RssDocketDataFactory(
-            court_id=self.court_appellate.pk,
-            case_name="Young v. Dragon",
-            docket_number="12-3245",
-            pacer_case_id=None,
-            docket_entries=[
-                RssDocketEntryDataFactory(
-                    document_number=None,
-                    description="New docket entry description",
-                    short_description="Opinion Issued",
-                    date_filed=make_aware(
-                        datetime(year=2018, month=1, day=5), timezone.utc
-                    ),
-                )
-            ],
-        )
-        build_date = a_rss_data_unnumbered["docket_entries"][0]["date_filed"]
-        self.assertEqual(len(de_a_unnumbered.docket.docket_entries.all()), 1)
-        rds_created, d_created = async_to_sync(merge_rss_data)(
-            [a_rss_data_unnumbered], self.court_appellate.pk, build_date
-        )
-        self.assertEqual(len(rds_created), 0)
-        self.assertEqual(d_created, 0)
-        de_a_unnumbered.refresh_from_db()
-        self.assertEqual(
-            de_a_unnumbered.docket.case_name, "Young Entry v. Dragon"
-        )
-        self.assertEqual(de_a_unnumbered.docket.docket_number, "12-3245")
-        self.assertEqual(
-            de_a_unnumbered.description, "Original docket entry description"
-        )
-        self.assertEqual(len(de_a_unnumbered.docket.docket_entries.all()), 1)
-        self.assertEqual(
-            de_a_unnumbered.date_filed,
-            datetime(year=2018, month=1, day=4).date(),
-        )
-        self.assertEqual(de_a_unnumbered.docket.source, Docket.HARVARD)
-
-    @patch("cl.corpus_importer.management.commands.troller_bk.logger")
-    def test_avoid_cached_items(self, mock_logger):
-        """Can we skip a whole file when a cached item is hit?"""
-
-        a_rss_data_0 = RssDocketDataFactory(
-            court_id=self.court_appellate.pk,
-            docket_number="12-3247",
-            pacer_case_id=None,
-            docket_entries=[
-                RssDocketEntryDataFactory(
-                    document_number=1,
-                    date_filed=make_aware(
-                        datetime(year=2018, month=1, day=5), timezone.utc
-                    ),
-                ),
-            ],
-        )
-
-        a_rss_data_1 = RssDocketDataFactory(
-            court_id=self.court_appellate.pk,
-            docket_number="12-3245",
-            pacer_case_id=None,
-            docket_entries=[
-                RssDocketEntryDataFactory(
-                    document_number=1,
-                    date_filed=make_aware(
-                        datetime(year=2018, month=1, day=5), timezone.utc
-                    ),
-                )
-            ],
-        )
-        a_rss_data_2 = RssDocketDataFactory(
-            court_id=self.court_appellate.pk,
-            docket_number="12-3246",
-            pacer_case_id=None,
-            docket_entries=[
-                RssDocketEntryDataFactory(
-                    document_number=1,
-                    date_filed=make_aware(
-                        datetime(year=2018, month=1, day=5), timezone.utc
-                    ),
-                )
-            ],
-        )
-
-        list_rss_data_1 = [a_rss_data_1, a_rss_data_2]
-        list_rss_data_2 = [a_rss_data_0, a_rss_data_1]
-
-        cached_items = RssItemCache.objects.all()
-        self.assertEqual(cached_items.count(), 0)
-        build_date = a_rss_data_0["docket_entries"][0]["date_filed"]
-        rds_created, d_created = async_to_sync(merge_rss_data)(
-            list_rss_data_1, self.court_appellate.pk, build_date
-        )
-        self.assertEqual(len(rds_created), 2)
-        self.assertEqual(d_created, 2)
-        self.assertEqual(cached_items.count(), 2)
-
-        # Remove recap_sequence_number from the dict to simulate the same item
-        del a_rss_data_1["docket_entries"][0]["recap_sequence_number"]
-        rds_created, d_created = async_to_sync(merge_rss_data)(
-            list_rss_data_2, self.court_appellate.pk, build_date
-        )
-
-        # The file is aborted when a cached item is hit
-        self.assertEqual(len(rds_created), 1)
-        self.assertEqual(d_created, 1)
-        self.assertEqual(cached_items.count(), 3)
-        mock_logger.info.assert_called_with(
-            f"Finished adding {self.court_appellate.pk} feed. Added {len(rds_created)} RDs."
-        )
-
-    @patch(
-        "cl.corpus_importer.management.commands.troller_bk.download_file",
-        side_effect=mock_download_file,
-    )
-    def test_download_files_concurrently(self, mock_download):
-        """Test the download_files_concurrently method to verify proper
-        fetching of the next paths to download from a file. Concurrently
-        download these paths and add them to a queue in the original chronological order.
-        """
-        test_dir = (
-            Path(settings.INSTALL_ROOT)
-            / "cl"
-            / "corpus_importer"
-            / "test_assets"
-        )
-        import_filename = "import.csv"
-        import_path = os.path.join(test_dir, import_filename)
-
-        files_queue = Queue()
-        threads = []
-        files_downloaded_offset = 0
-
-        with open(import_path, "rb") as f:
-            files_downloaded_offset = download_files_concurrently(
-                files_queue, f.name, files_downloaded_offset, threads
-            )
-            self.assertEqual(len(threads), 1)
-            self.assertEqual(files_downloaded_offset, 3)
-            files_downloaded_offset = download_files_concurrently(
-                files_queue, f.name, files_downloaded_offset, threads
-            )
-
-        for thread in threads:
-            thread.join()
-
-        self.assertEqual(len(threads), 2)
-        self.assertEqual(files_downloaded_offset, 6)
-        self.assertEqual(files_queue.qsize(), 6)
-
-        # Verifies original chronological order.
-        binary, item_path, order = files_queue.get()
-        self.assertEqual(order, 0)
-        self.assertEqual(item_path.split("|")[1], "1575330086")
-        files_queue.task_done()
-
-        binary, item_path, order = files_queue.get()
-        self.assertEqual(order, 1)
-        self.assertEqual(item_path.split("|")[1], "1575333374")
-        files_queue.task_done()
-
-        binary, item_path, order = files_queue.get()
-        self.assertEqual(order, 2)
-        self.assertEqual(item_path.split("|")[1], "1575336978")
-        files_queue.task_done()
-
-        binary, item_path, order = files_queue.get()
-        self.assertEqual(order, 0)
-        self.assertEqual(item_path.split("|")[1], "1575340576")
-        files_queue.task_done()
-
-        binary, item_path, order = files_queue.get()
-        self.assertEqual(order, 1)
-        self.assertEqual(item_path.split("|")[1], "1575344176")
-        files_queue.task_done()
-
-        binary, item_path, order = files_queue.get()
-        self.assertEqual(order, 2)
-        self.assertEqual(item_path.split("|")[1], "1575380176")
-        files_queue.task_done()
-
-        self.assertEqual(files_queue.qsize(), 0)
-
-    def test_add_objects_in_bulk(self):
-        """Can we properly add related RSS feed objects in bulk?"""
-
-        a_rss_data_0 = RssDocketDataFactory(
-            court_id=self.court_appellate.pk,
-            docket_number="15-3247",
-            pacer_case_id=None,
-            docket_entries=[
-                RssDocketEntryDataFactory(
-                    document_number=1,
-                    date_filed=make_aware(
-                        datetime(year=2018, month=1, day=5), timezone.utc
-                    ),
-                ),
-            ],
-        )
-
-        a_rss_data_1 = RssDocketDataFactory(
-            court_id=self.court_appellate.pk,
-            docket_number="15-3245",
-            pacer_case_id=None,
-            docket_entries=[
-                RssDocketEntryDataFactory(
-                    document_number=1,
-                    date_filed=make_aware(
-                        datetime(year=2018, month=1, day=5), timezone.utc
-                    ),
-                )
-            ],
-        )
-        a_rss_data_2 = RssDocketDataFactory(
-            court_id=self.court_appellate.pk,
-            docket_number="15-3247",
-            pacer_case_id=None,
-            docket_entries=[
-                RssDocketEntryDataFactory(
-                    document_number=2,
-                    date_filed=make_aware(
-                        datetime(year=2018, month=1, day=5), timezone.utc
-                    ),
-                )
-            ],
-        )
-
-        a_rss_data_3 = RssDocketDataFactory(
-            court_id=self.court_appellate.pk,
-            docket_number="12-2532",
-            pacer_case_id=None,
-            docket_entries=[
-                RssDocketEntryDataFactory(
-                    document_number=5,
-                    date_filed=make_aware(
-                        datetime(year=2018, month=1, day=5), timezone.utc
-                    ),
-                )
-            ],
-        )
-
-        list_rss_data = [
-            a_rss_data_0,
-            a_rss_data_1,
-            a_rss_data_2,
-            a_rss_data_3,
-        ]
-        cached_items = RssItemCache.objects.all()
-        self.assertEqual(cached_items.count(), 0)
-
-        build_date = a_rss_data_0["docket_entries"][0]["date_filed"]
-        rds_created, d_created = async_to_sync(merge_rss_data)(
-            list_rss_data, self.court_appellate.pk, build_date
-        )
-
-        date_filed, time_filed = localize_date_and_time(
-            self.court_appellate.pk, build_date
-        )
-
-        # Only two dockets created: 15-3247 and 15-3245, 12-2532 already exists
-        self.assertEqual(d_created, 2)
-        self.assertEqual(len(rds_created), 4)
-
-        # Compare docket entries and rds created for each docket.
-        des_to_compare = [("15-3245", 1), ("15-3247", 2), ("12-2532", 1)]
-        for d_number, de_count in des_to_compare:
-            docket = Docket.objects.get(docket_number=d_number)
-            self.assertEqual(len(docket.docket_entries.all()), de_count)
-
-            # For every docket entry there is one recap document created.
-            docket_entries = docket.docket_entries.all()
-            for de in docket_entries:
-                self.assertEqual(len(de.recap_documents.all()), 1)
-                self.assertEqual(de.time_filed, time_filed)
-                self.assertEqual(de.date_filed, date_filed)
-                self.assertNotEqual(de.recap_sequence_number, "")
-
-            # docket_number_core generated for every docket
-            self.assertNotEqual(docket.docket_number_core, "")
-            # Slug is generated for every docket
-            self.assertNotEqual(docket.slug, "")
-
-            # Verify RECAP source is added to existing and new dockets.
-            if d_number == "12-2532":
-                self.assertEqual(docket.source, Docket.HARVARD_AND_RECAP)
-            else:
-                self.assertEqual(docket.source, Docket.RECAP)
-                # Confirm date_last_filing is added to each new docket.
-                self.assertEqual(docket.date_last_filing, date_filed)
-
-        # BankruptcyInformation is added only on new dockets.
-        bankr_objs_created = BankruptcyInformation.objects.all()
-        self.assertEqual(len(bankr_objs_created), 3)
-
-        # Compare bankruptcy data is linked correctly to the parent docket.
-        bankr_d_1 = BankruptcyInformation.objects.get(
-            docket__docket_number=a_rss_data_0["docket_number"]
-        )
-        self.assertEqual(bankr_d_1.chapter, str(a_rss_data_0["chapter"]))
-        self.assertEqual(
-            bankr_d_1.trustee_str, str(a_rss_data_0["trustee_str"])
-        )
-
-        bankr_d_2 = BankruptcyInformation.objects.get(
-            docket__docket_number=a_rss_data_1["docket_number"]
-        )
-        self.assertEqual(bankr_d_2.chapter, str(a_rss_data_1["chapter"]))
-        self.assertEqual(
-            bankr_d_2.trustee_str, str(a_rss_data_1["trustee_str"])
-        )
-
-        bankr_d_3 = BankruptcyInformation.objects.get(
-            docket__docket_number=a_rss_data_3["docket_number"]
-        )
-        self.assertEqual(bankr_d_3.chapter, str(a_rss_data_3["chapter"]))
-        self.assertEqual(
-            bankr_d_3.trustee_str, str(a_rss_data_3["trustee_str"])
-        )
-
-    def test_avoid_adding_district_dockets_no_pacer_case_id_in_bulk(self):
-        """Can we avoid adding district/bankr dockets that don't have a
-        pacer_case_id?"""
-
-        a_rss_data_0 = RssDocketDataFactory(
-            court_id=self.court_neb.pk,
-            docket_number="15-3247",
-            pacer_case_id=None,
-            docket_entries=[
-                RssDocketEntryDataFactory(
-                    document_number=1,
-                    date_filed=make_aware(
-                        datetime(year=2018, month=1, day=5), timezone.utc
-                    ),
-                ),
-            ],
-        )
-
-        a_rss_data_1 = RssDocketDataFactory(
-            court_id=self.court_neb.pk,
-            docket_number="15-3245",
-            pacer_case_id="12345",
-            docket_entries=[
-                RssDocketEntryDataFactory(
-                    document_number=1,
-                    date_filed=make_aware(
-                        datetime(year=2018, month=1, day=5), timezone.utc
-                    ),
-                )
-            ],
-        )
-
-        list_rss_data = [
-            a_rss_data_0,
-            a_rss_data_1,
-        ]
-
-        build_date = a_rss_data_0["docket_entries"][0]["date_filed"]
-        rds_created, d_created = async_to_sync(merge_rss_data)(
-            list_rss_data, self.court_neb.pk, build_date
-        )
-
-        # Only one docket created: 15-3245, since 15-3247 don't have pacer_case_id
-        self.assertEqual(d_created, 1)
-        self.assertEqual(len(rds_created), 1)
-
-        # Compare docket entries and rds created for each docket.
-        des_to_compare = [("15-3245", 1)]
-        for d_number, de_count in des_to_compare:
-            docket = Docket.objects.get(docket_number=d_number)
-            self.assertEqual(len(docket.docket_entries.all()), de_count)
-            # For every docket entry there is one recap document created.
-            docket_entries = docket.docket_entries.all()
-            for de in docket_entries:
-                self.assertEqual(len(de.recap_documents.all()), 1)
-                self.assertNotEqual(de.recap_sequence_number, "")
-
-            # docket_number_core generated for every docket
-            self.assertNotEqual(docket.docket_number_core, "")
-            # Slug is generated for every docket
-            self.assertNotEqual(docket.slug, "")
-            self.assertEqual(docket.source, Docket.RECAP)
-
-        # BankruptcyInformation is added only on new dockets.
-        bankr_objs_created = BankruptcyInformation.objects.all()
-        self.assertEqual(len(bankr_objs_created), 1)
-
-    def test_avoid_adding_existing_entries_by_description(self):
-        """Can we avoid adding district/bankr dockets that don't have a
-        pacer_case_id?"""
-
-        de = DocketEntryWithParentsFactory(
-            docket__court=self.court,
-            docket__case_name="Young Entry v. Dragon",
-            docket__docket_number="3:87-CV-01409",
-            docket__source=Docket.HARVARD,
-            docket__pacer_case_id="90385",
-            entry_number=None,
-            date_filed=make_aware(
-                datetime(year=2018, month=1, day=5), timezone.utc
-            ),
-        )
-        RECAPDocumentFactory(docket_entry=de, description="Opinion Issued")
-        a_rss_data_0 = RssDocketDataFactory(
-            court_id=self.court,
-            docket_number="3:87-CV-01409",
-            pacer_case_id="90385",
-            docket_entries=[
-                RssDocketEntryDataFactory(
-                    document_number=None,
-                    short_description="Opinion Issued",
-                    date_filed=make_aware(
-                        datetime(year=2018, month=1, day=5), timezone.utc
-                    ),
-                ),
-            ],
-        )
-        list_rss_data = [
-            a_rss_data_0,
-        ]
-        build_date = a_rss_data_0["docket_entries"][0]["date_filed"]
-        rds_created, d_created = async_to_sync(merge_rss_data)(
-            list_rss_data, self.court.pk, build_date
-        )
-
-        # No docket entry should be created
-        self.assertEqual(d_created, 0)
-        self.assertEqual(len(rds_created), 0)
-
-
 @patch(
     "cl.corpus_importer.management.commands.clean_up_mis_matched_dockets.download_file",
     side_effect=lambda a: {
@@ -2349,7 +1200,7 @@ class CleanUpMisMatchedDockets(TestCase):
         cls.court = CourtFactory(id="canb", jurisdiction="FB")
         # Opinion cluster with mis matched docket.
         cls.cluster = (
-            OpinionClusterFactoryWithChildrenAndParents(
+            OpinionClusterWithChildrenAndParentsFactory(
                 docket=DocketFactory(
                     court=cls.court,
                     source=Docket.HARVARD,
@@ -2367,7 +1218,7 @@ class CleanUpMisMatchedDockets(TestCase):
 
         # Opinion cluster with correct docket
         cluster_2 = (
-            OpinionClusterFactoryWithChildrenAndParents(
+            OpinionClusterWithChildrenAndParentsFactory(
                 docket=DocketFactory(
                     court=cls.court,
                     source=Docket.HARVARD,
@@ -2453,7 +1304,7 @@ class HarvardMergerTests(TestCase):
             (<cross_reference><span class="citation no-link">137 S.E. 791</span></cross_reference>), and cit.; <em>Kuck</em> v. <em>State,</em> <cross_reference><span class="citation" data-id="5582722"><a href="/opinion/5732248/kuck-v-state/">149 Ga. 191</a></span></cross_reference>
             (<cross_reference><span class="citation no-link">99 S.E. 622</span></cross_reference>). I concur in the reversal for this additional reason.</p>"""
 
-        cluster = OpinionClusterFactoryMultipleOpinions(
+        cluster = OpinionClusterWithMultipleOpinionsFactory(
             source=SOURCES.COLUMBIA_ARCHIVE,
             docket=DocketFactory(source=Docket.COLUMBIA),
             sub_opinions__data=[
@@ -2514,7 +1365,7 @@ class HarvardMergerTests(TestCase):
         }
         self.read_json_func.return_value = case_data
 
-        cluster = OpinionClusterFactoryMultipleOpinions(
+        cluster = OpinionClusterWithMultipleOpinionsFactory(
             docket=DocketFactory(),
             attorneys="B. B. Giles, Lindley W. Gamp, and John A. Boyhin",
         )
@@ -2531,7 +1382,7 @@ class HarvardMergerTests(TestCase):
         )
 
         # Test that we can ignore matching fields
-        cluster = OpinionClusterFactoryMultipleOpinions(
+        cluster = OpinionClusterWithMultipleOpinionsFactory(
             docket=DocketFactory(),
             attorneys="B. B. Giles, for plaintiff in error., Lindley W. Gamp, solicitor, John A. Boyhin, solicitor-general,. Durwood T. Bye, contra.",
         )
@@ -2542,7 +1393,11 @@ class HarvardMergerTests(TestCase):
         """Can we choose the correct docket number"""
         docket = DocketFactory(docket_number="17-3000")
         cluster = OpinionClusterWithParentsFactory(id=4, docket=docket)
-        merge_docket_numbers(cluster, "Master Docket No. 17-3000L")
+        updated_docket_number = merge_docket_numbers(
+            cluster, "Master Docket No. 17-3000L"
+        )
+        docket.docket_number = updated_docket_number
+        docket.save()
         docket.refresh_from_db()
         self.assertEqual(docket.docket_number, "Master Docket 17-3000L")
 
@@ -2624,9 +1479,10 @@ class HarvardMergerTests(TestCase):
         self.assertEqual([1, 4, 5], list(sorted(cluster_ids)))
 
     def test_add_opinions_without_authors_in_cl(self):
-        """Can we add opinion and update authors"""
+        """Can we add opinions and update empty author_str fields via
+        the Harvard merger?"""
 
-        cluster = OpinionClusterFactoryMultipleOpinions(
+        cluster = OpinionClusterWithMultipleOpinionsFactory(
             source=SOURCES.COLUMBIA_ARCHIVE,
             docket=DocketFactory(source=Docket.COLUMBIA),
             sub_opinions__data=[
@@ -2648,13 +1504,13 @@ class HarvardMergerTests(TestCase):
         }
         self.read_json_func.return_value = case_data
 
-        author_query = Opinion.objects.filter(
-            cluster_id=cluster.id
-        ).values_list("author_str", flat=True)
-
-        authors = list(author_query)
-
-        self.assertEqual(authors, ["", ""])
+        # Before merge: both opinions should have empty authors
+        opinions = Opinion.objects.filter(cluster_id=cluster.id).order_by(
+            "author_str"
+        )
+        self.assertEqual(
+            list(opinions.values_list("author_str", flat=True)), ["", ""]
+        )
 
         cluster_ids = OpinionCluster.objects.filter(
             docket__source__in=[
@@ -2663,36 +1519,28 @@ class HarvardMergerTests(TestCase):
             filepath_json_harvard__isnull=False,
         ).values_list("id", flat=True)
 
-        for id in cluster_ids:
-            merge_opinion_clusters(cluster_id=id)
+        for cluster_id in cluster_ids:
+            merge_opinion_clusters(cluster_id=cluster_id)
 
         cluster.refresh_from_db()
 
-        author_query = Opinion.objects.filter(
-            cluster_id=cluster.id
-        ).values_list("author_str", flat=True)
-
-        authors = list(author_query)
-
+        # After merge: authors should be populated from Harvard data
+        opinions = Opinion.objects.filter(cluster_id=cluster.id).order_by(
+            "author_str"
+        )
+        self.assertEqual(opinions.count(), 2)
         self.assertEqual(
-            Opinion.objects.filter(cluster_id=cluster.id).count(),
-            2,
-            msg="Oops",
+            list(opinions.values_list("author_str", flat=True)),
+            ["Broyles", "Gardner"],
         )
-
-        self.assertNotEqual(
-            Opinion.objects.filter(cluster_id=cluster.id)[0].xml_harvard, ""
-        )
-
+        self.assertNotEqual(opinions[0].xml_harvard, "")
         self.assertEqual(cluster.docket.source, Docket.HARVARD_AND_COLUMBIA)
-
-        self.assertEqual(authors, ["Broyles", "Gardner"])
 
     def test_add_opinions_with_authors_in_cl(self):
         """Can we update an opinion and leave author_str alone if already
         assigned"""
 
-        cluster = OpinionClusterFactoryMultipleOpinions(
+        cluster = OpinionClusterWithMultipleOpinionsFactory(
             source=SOURCES.COLUMBIA_ARCHIVE,
             docket=DocketFactory(source=Docket.COLUMBIA),
             sub_opinions__data=[
@@ -2861,7 +1709,12 @@ class HarvardMergerTests(TestCase):
                 case_name_full=item[1].get("cl_case_name_full"),
             )
 
-            data_to_update = merge_case_names(cluster, item[0])
+            data_to_update = merge_case_names(
+                cluster,
+                item[0],
+                case_name_key="name_abbreviation",
+                case_name_full_key="name",
+            )
 
             self.assertEqual(
                 data_to_update.get("case_name", ""),
@@ -2907,7 +1760,11 @@ class HarvardMergerTests(TestCase):
         self.assertEqual(docket_1.source, Docket.HARVARD_AND_RECAP)
 
         with self.assertRaises(DocketSourceException):
-            docket_2 = DocketFactory(source=Docket.COLUMBIA_AND_RECAP)
+            # Raise DocketSourceException if the initial source already contains
+            # Harvard.
+            docket_2 = DocketFactory(
+                source=Docket.RECAP_AND_SCRAPER_AND_HARVARD
+            )
             cluster_2 = OpinionClusterWithParentsFactory(docket=docket_2)
             update_docket_source(cluster_2)
             docket_2.refresh_from_db()
@@ -2960,7 +1817,7 @@ class HarvardMergerTests(TestCase):
 
         test_pairs = [
             (
-                # Test if we are tripped up by mulitple judge names in tag
+                # Test if we are tripped up by multiple judge names in tag
                 "ARNOLD, Circuit Judge, with whom BRIGHT, Senior Circuit Judge, and McMILLIAN and MAGILL, Circuit Judges, join,:",
                 "Arnold",
             ),
@@ -3039,7 +1896,7 @@ class HarvardMergerTests(TestCase):
 
         test_pairs = [
             (
-                # Test if we are tripped up by mulitple judge names in tag
+                # Test if we are tripped up by multiple judge names in tag
                 "ARNOLD, Circuit Judge, with whom BRIGHT, Senior Circuit Judge, and McMILLIAN and MAGILL, Circuit Judges, join,:",
                 ["ARNOLD", "BRIGHT", "MAGILL", "McMILLIAN"],
             ),
@@ -3111,7 +1968,7 @@ class HarvardMergerTests(TestCase):
         all_data = fetch_non_harvard_data(case_data)
 
         self.assertEqual(
-            all_data.get("syllabus"), "<p> This is a syllabus " "example.</p>"
+            all_data.get("syllabus"), "<p> This is a syllabus example.</p>"
         )
         self.assertEqual(all_data.get("judges"), "Broyles, Gardner, MacIntyre")
         self.assertEqual(
@@ -3119,4 +1976,2780 @@ class HarvardMergerTests(TestCase):
             "B. B. Giles, for plaintiff in error., Lindley W. Gamp, "
             "solicitor, John A. Boyhin, solicitor-general,. Durwood T. Bye, "
             "contra.",
+        )
+
+
+class ColumbiaMergerTests(TestCase):
+    def setUp(self):
+        """Setup columbia merger tests"""
+        self.read_xml_to_soup_patch = patch(
+            "cl.corpus_importer.management.commands.columbia_merge.read_xml_to_soup"
+        )
+        self.read_xml_to_soup_func = self.read_xml_to_soup_patch.start()
+
+    def tearDown(self) -> None:
+        """Tear down patches and remove added objects"""
+        Docket.objects.all().delete()
+        self.read_xml_to_soup_patch.stop()
+
+    def test_merger(self):
+        """Can we identify opinions correctly even when they are slightly
+        different"""
+
+        # Xml content with bad tags </footnote_body></block_quote> instead of
+        # </block_quote></footnote_body> and unpublished opinion
+        case_xml = """<opinion unpublished=true>
+<reporter_caption>
+<center>
+MENDOZA v. STATE,
+<citation>61 S.W.3d 498</citation>
+(Tex.App.-San Antonio [4th Dist.] 2001)
+</center>
+</reporter_caption>
+<caption>
+<center>PIOQUINTO MENDOZA, III, Appellant, v. THE STATE OF TEXAS, Appellee.</center>
+</caption>
+<docket>
+<center>No. 04-00-00521-CR.</center>
+</docket>
+<court>
+<center>Court of Appeals of Texas, Fourth District, San Antonio.</center>
+</court>
+<date>
+<center>Delivered and Filed: July 25, 2001.</center>
+<center>Rehearing Overruled August 21, 2001.</center>
+<center>Discretionary Review Granted February 13, 2002.</center>
+</date>
+<posture>
+Appeal from the 49th Judicial District Court, Webb County, Texas, Trial Court No. 99-CRN3-0088-DI, Honorable Manuel Flores, Judge Presiding
+<footnote_reference>[fn1]</footnote_reference>
+.
+<footnote_body>
+<footnote_number>[fn1]</footnote_number>
+Judge Flores presided over the pre-trial hearings. The Honorable Peter Michael Curry, Visiting Judge, presided over the trial on the merits.
+</footnote_body>
+<page_number>Page 499</page_number>
+</posture>
+<opinion_text>
+[EDITORS' NOTE: THIS PAGE CONTAINS HEADNOTES. HEADNOTES ARE NOT AN OFFICIAL PRODUCT OF THE COURT, THEREFORE THEY ARE NOT DISPLAYED.]
+<page_number>Page 500</page_number>
+</opinion_text>
+<attorneys> Fernando Sanchez, Law Offices of Fernando Sanchez, Laredo, for appellant. Oscar J. Hale, Assistant District Attorney, Laredo, for appellee. </attorneys>
+<panel> Sitting: TOM RICKHOFF, ALMA L. LOPEZ, and SARAH B. DUNCAN, Justices. </panel>
+<opinion_byline> Opinion by ALMA L. LOPEZ, Justice. </opinion_byline>
+<opinion_text>
+Lorem ipsum dolor sit amet, consectetur adipiscing elit. Nullam quis elit sed dui interdum feugiat.
+<footnote_body>
+<footnote_number>[fn1]</footnote_number>
+<block_quote>Footnote sample
+</footnote_body></block_quote>
+</opinion_text>
+</opinion>
+        """
+
+        fixed_case_xml = fix_xml_tags(case_xml)
+
+        self.read_xml_to_soup_func.return_value = BeautifulSoup(
+            fixed_case_xml, "lxml"
+        )
+
+        # Factory create cluster, data from cluster id: 1589121
+        cluster = OpinionClusterWithMultipleOpinionsFactory(
+            case_name="Mendoza v. State",
+            case_name_full="Pioquinto MENDOZA, III, Appellant, v. the STATE of Texas, "
+            "Appellee",
+            date_filed=date(2002, 2, 13),
+            attorneys="Fernando Sanchez, Law Offices of Fernando Sanchez, Laredo, "
+            "for appellant., Oscar J. Hale, Assistant District Attorney, Laredo, "
+            "for appellee.",
+            other_dates="Rehearing Overruled Aug. 21, 2001., Discretionary Review "
+            "Granted Feb. 13, 2002.",
+            posture="",
+            judges="Alma, Duncan, Lopez, Rickhoff, Sarah, Tom",
+            source=SOURCES.LAWBOX_M_HARVARD,
+            docket=DocketFactory(source=Docket.HARVARD),
+            sub_opinions__data=[
+                {
+                    "type": "010combined",
+                    "xml_harvard": "<p>Lorem ipsum dolor sit amet, consectetur "
+                    "adipiscing elit. Nullam quis elit sed dui "
+                    "interdum feugiat.</p>",
+                    "html_columbia": "",
+                    "author_str": "Lopez",
+                },
+            ],
+        )
+
+        # cluster posture is empty
+        self.assertEqual(cluster.posture, "")
+
+        # html_columbia is empty
+        self.assertEqual(cluster.sub_opinions.all().first().html_columbia, "")
+
+        # Merge cluster
+        process_cluster(cluster.id, "/columbia/fake_filepath.xml")
+
+        # Reload the object
+        cluster.refresh_from_db()
+
+        # Check if merged metadata is updated correctly
+        self.assertEqual(
+            cluster.posture,
+            "Appeal from the 49th Judicial District Court, Webb County, Texas, "
+            "Trial Court No. 99-CRN3-0088-DI, Honorable Manuel Flores, "
+            "Judge Presiding [fn1] . [fn1] Judge Flores presided over the pre-trial "
+            "hearings. The Honorable Peter Michael Curry, Visiting Judge, presided "
+            "over the trial on the merits. Page 499",
+        )
+        # check if we saved opinion content in html_columbia field
+        self.assertEqual(
+            cluster.sub_opinions.all().first().html_columbia,
+            """<p>[EDITORS' NOTE: THIS PAGE CONTAINS HEADNOTES. HEADNOTES ARE NOT AN OFFICIAL PRODUCT OF THE COURT, THEREFORE THEY ARE NOT DISPLAYED.]
+ <span class="star-pagination">*Page 500</span> </p>
+<p>Lorem ipsum dolor sit amet, consectetur adipiscing elit. Nullam quis elit sed dui interdum feugiat.
+<footnote_body>
+<sup id="op0-fn1"><a href="#op0-ref-fn1">1</a></sup>
+<blockquote>Footnote sample
+</blockquote></footnote_body></p>""",
+        )
+
+        # Ensure the cluster is not merged again if it has already been merged
+        # and the COLUMBIA source was assigned.
+        with patch(
+            "cl.corpus_importer.management.commands.columbia_merge.logger"
+        ) as mock_logger:
+            # Merge cluster
+            process_cluster(cluster.id, "/columbia/fake_filepath.xml")
+            mock_logger.info.assert_called_with(
+                f"Cluster id: {cluster.id} already merged"
+            )
+
+
+class TexasMergerTest(TestCase):
+    def setUp(self):
+        """Set up texas merger tests"""
+        self.download_task_patch = patch(
+            "cl.corpus_importer.tasks.download_texas_document_pdf.si"
+        )
+        self.download_task_mock = self.download_task_patch.start()
+        self.extract_pdf_document_patch = patch(
+            "cl.recap.tasks.extract_pdf_document.s"
+        )
+        self.extract_pdf_document_mock = (
+            self.extract_pdf_document_patch.start()
+        )
+        self.download_pdf_patch = patch(
+            "cl.corpus_importer.tasks.download_pdf_in_stream"
+        )
+        self.download_pdf_mock = self.download_pdf_patch.start()
+
+    @classmethod
+    def setUpTestData(cls):
+        """Create test data for Texas merger tests"""
+        cls.texas_sc = CourtFactory.create(id="texas_sc")
+        cls.texas_cca = CourtFactory.create(id="texas_cca")
+        cls.texas_coa1 = CourtFactory.create(id="texas_coa1")
+        cls.docket_number_coa1 = "01-25-00011-CV"
+        cls.docket_coa1 = DocketFactory.create(
+            court=cls.texas_coa1, docket_number=cls.docket_number_coa1
+        )
+        cls.docket_coa1_entry = TexasDocketEntryFactory.create(
+            docket=cls.docket_coa1,
+        )
+
+    def tearDown(self):
+        """Tear down patches"""
+        self.download_task_patch.stop()
+        self.extract_pdf_document_patch.stop()
+        self.download_pdf_patch.stop()
+
+    def test_merge_texas_document_new_document(self):
+        """Can we correctly add a new attachment to an existing docket entry?"""
+        docket_entry = self.docket_coa1_entry
+
+        input_document = TexasCaseDocumentDictFactory()
+
+        # Run the function
+        result = merge_texas_document(docket_entry, input_document)
+
+        # Assertions
+        assert result == (True, True, result[2])
+        try:
+            created_document = TexasDocument.objects.get(pk=result[2])
+        except ObjectDoesNotExist:
+            created_document = None
+        assert created_document is not None
+        assert created_document.docket_entry_id == docket_entry.id
+        assert created_document.description == input_document["description"]
+        assert str(created_document.media_id) == input_document["media_id"]
+        assert (
+            str(created_document.media_version_id)
+            == input_document["media_version_id"]
+        )
+        assert str(created_document.url) == input_document["document_url"]
+
+        self.download_task_mock.assert_called_once_with(created_document.pk)
+
+    def test_merge_texas_document_existing_document_no_update(self):
+        """Can we correctly handle an existing document with no update needed?"""
+        docket_entry = self.docket_coa1_entry
+        input_document = TexasCaseDocumentDictFactory()
+
+        # Create an existing and up to date attachment
+        current_document = TexasDocumentFactory.create(
+            docket_entry=docket_entry,
+            description=input_document["description"],
+            media_id=input_document["media_id"],
+            media_version_id=input_document["media_version_id"],
+            url=input_document["document_url"],
+        )
+        current_document.filepath_local = "a"
+        current_document.save()
+
+        # Run the function
+        result = merge_texas_document(docket_entry, input_document)
+
+        # Assertions
+        assert result == (False, True, current_document.pk)
+        result_document = TexasDocument.objects.get(pk=result[2])
+        assert result_document is not None
+        assert result_document.docket_entry_id == docket_entry.id
+        assert result_document.description == input_document["description"]
+        assert str(result_document.media_id) == input_document["media_id"]
+        assert (
+            str(result_document.media_version_id)
+            == input_document["media_version_id"]
+        )
+        assert str(result_document.url) == input_document["document_url"]
+
+        self.download_task_mock.assert_not_called()
+
+    def test_merge_texas_document_existing_document_update(self):
+        """Can we correctly update an existing document with new version?"""
+        docket_entry = self.docket_coa1_entry
+        input_document = TexasCaseDocumentDictFactory()
+        old_document = TexasCaseDocumentDictFactory(
+            media_id=input_document["media_id"],
+        )
+
+        # Create an attachment
+        current_document = TexasDocumentFactory.create(
+            docket_entry=docket_entry,
+            description=old_document["description"],
+            media_id=old_document["media_id"],
+            media_version_id=old_document["media_version_id"],
+            url=old_document["document_url"],
+        )
+
+        # Run the function
+        result = merge_texas_document(docket_entry, input_document)
+
+        # Assertions
+        assert result == (True, True, current_document.pk)
+        result_document = TexasDocument.objects.get(pk=result[2])
+        assert result_document is not None
+        assert result_document.docket_entry_id == docket_entry.id
+        assert result_document.description == input_document["description"]
+        assert str(result_document.media_id) == input_document["media_id"]
+        assert (
+            str(result_document.media_version_id)
+            == input_document["media_version_id"]
+        )
+        assert str(result_document.url) == input_document["document_url"]
+
+        self.download_task_mock.assert_called_once_with(current_document.pk)
+
+    @responses.activate
+    def test_merge_texas_document_plaintext_extraction(self):
+        """
+        Ensure plaintext extraction is triggered by `merge_texas_document`.
+        """
+        # Stop the mocks just for this test
+        self.download_task_patch.stop()
+        self.extract_pdf_document_patch.stop()
+        self.download_pdf_patch.stop()
+
+        input_document = TexasCaseDocumentDictFactory()
+
+        # Slight optimization for the failure case where the merger fails to
+        # request a PDF
+        def get_test_pdf(
+            request: requests.Request,
+        ) -> tuple[int, dict[str, str], bytes]:
+            with mock_bucket_open("ocr_pdf_test.pdf", "rb") as f:
+                return 200, {"Content-Type": "application/pdf"}, f.read()
+
+        response = responses.add_callback(
+            responses.GET,
+            input_document["document_url"],
+            callback=get_test_pdf,
+        )
+
+        docket_entry = self.docket_coa1_entry
+        (_, _, pk) = merge_texas_document(docket_entry, input_document)
+        docket_entry.refresh_from_db()
+        document = TexasDocument.objects.get(pk=pk)
+
+        self.assertEqual(response.call_count, 1)
+        self.assertEqual(document.url, input_document["document_url"])
+        self.assertTrue(document.filepath_local)
+        self.assertIn("UNITED", document.plain_text)
+
+    def test_merge_texas_documents(self):
+        """Can we correctly handle multiple documents?"""
+        docket_entry = self.docket_coa1_entry
+        existing_document = TexasCaseDocumentDictFactory()
+        current_attachment = TexasDocumentFactory.create(
+            docket_entry=docket_entry,
+            description=existing_document["description"],
+            media_id=existing_document["media_id"],
+            media_version_id=existing_document["media_version_id"],
+            url=existing_document["document_url"],
+        )
+        current_attachment.filepath_local = "a"
+        current_attachment.save()
+        input_documents = [
+            TexasCaseDocumentDictFactory(),
+            existing_document,
+        ]
+
+        result = merge_texas_documents(docket_entry, input_documents)
+
+        assert len(result) == 2
+        assert result[0] == (True, True, result[0][2])
+        assert result[1] == (False, True, current_attachment.pk)
+
+    def test_merge_texas_docket_entry_new_entry(self):
+        """Can we correctly handle a docket entry?"""
+        docket_entry = TexasDocketEntryDictFactory(
+            attachments=[TexasCaseDocumentDictFactory()],
+            date=date.fromisoformat("2025-01-02"),
+            type="Brief",
+        )
+
+        output = merge_texas_docket_entry(
+            self.docket_coa1, "2025-01-02.000", True, docket_entry
+        )
+
+        assert output == (True, True, output[2])
+        created_docket_entry = TexasDocketEntry.objects.get(pk=output[2])
+        assert created_docket_entry.docket_id == self.docket_coa1.id
+        assert created_docket_entry.entry_type == docket_entry["type"]
+        assert created_docket_entry.description == docket_entry["description"]
+        assert created_docket_entry.date_filed == docket_entry["date"]
+        n_attachments = TexasDocument.objects.filter(
+            docket_entry_id=created_docket_entry.id
+        ).count()
+        assert n_attachments == 1
+        assert self.extract_pdf_document_mock.call_count == 1
+
+    def test_merge_texas_docket_entry_no_update(self):
+        """Can we correctly handle a docket entry update noop?"""
+        js_docket_entry = TexasDocketEntryDictFactory()
+
+        (_, _, pk) = merge_texas_docket_entry(
+            self.docket_coa1, "2025-01-02.000", True, js_docket_entry
+        )
+        documents = TexasDocument.objects.filter(docket_entry_id=pk)
+        for document in documents:
+            document.filepath_local = "a"
+            document.save()
+        # Reset call count
+        self.extract_pdf_document_mock.reset_mock()
+
+        # noop
+        output = merge_texas_docket_entry(
+            self.docket_coa1, "2025-01-02.000", True, js_docket_entry
+        )
+
+        assert output == (False, True, output[2])
+        assert output[2] == pk
+        created_docket_entry = TexasDocketEntry.objects.get(pk=output[2])
+        assert created_docket_entry.docket_id == self.docket_coa1.id
+        assert created_docket_entry.entry_type == js_docket_entry["type"]
+        assert (
+            created_docket_entry.description == js_docket_entry["description"]
+        )
+        assert created_docket_entry.date_filed == js_docket_entry["date"]
+        n_attachments = TexasDocument.objects.filter(
+            docket_entry_id=created_docket_entry.id
+        ).count()
+        assert n_attachments == len(js_docket_entry["attachments"])
+        assert self.extract_pdf_document_mock.call_count == 0
+
+    def test_merge_texas_docket_entry_add_document(self):
+        """Can we correctly add a new document to an existing docket entry?"""
+        js_docket_entry = TexasDocketEntryDictFactory()
+        initial_n_attachments = len(js_docket_entry["attachments"])
+
+        (_, _, pk) = merge_texas_docket_entry(
+            self.docket_coa1, "2025-01-02.000", True, js_docket_entry
+        )
+        documents = TexasDocument.objects.filter(docket_entry_id=pk)
+        for document in documents:
+            document.filepath_local = "a"
+            document.save()
+        # Reset call count
+        self.extract_pdf_document_mock.reset_mock()
+
+        js_docket_entry["attachments"].append(TexasCaseDocumentDictFactory())
+        output = merge_texas_docket_entry(
+            self.docket_coa1, "2025-01-02.000", True, js_docket_entry
+        )
+
+        assert output == (True, True, output[2])
+        assert output[2] == pk
+        created_docket_entry = TexasDocketEntry.objects.get(pk=output[2])
+        assert created_docket_entry.docket_id == self.docket_coa1.id
+        assert created_docket_entry.entry_type == js_docket_entry["type"]
+        assert (
+            created_docket_entry.description == js_docket_entry["description"]
+        )
+        assert created_docket_entry.date_filed == js_docket_entry["date"]
+        n_attachments = TexasDocument.objects.filter(
+            docket_entry_id=created_docket_entry.id
+        ).count()
+        assert n_attachments == initial_n_attachments + 1
+        assert self.extract_pdf_document_mock.call_count == 1
+
+    def test_merge_texas_docket_entry_multiple_matches_with_sequence(self):
+        """When multiple entries match by date/type/brief, use the one with matching sequence number."""
+        # Create two entries with same date, type, and appellate_brief
+        existing_entry_1 = TexasDocketEntryFactory.create(
+            docket=self.docket_coa1,
+            date_filed=date.fromisoformat("2025-01-02"),
+            entry_type="Brief",
+            appellate_brief=True,
+            sequence_number="2025-01-02.000",
+            description="First entry",
+        )
+        existing_entry_2 = TexasDocketEntryFactory.create(
+            docket=self.docket_coa1,
+            date_filed=date.fromisoformat("2025-01-02"),
+            entry_type="Brief",
+            appellate_brief=True,
+            sequence_number="2025-01-02.001",
+            description="Second entry",
+        )
+
+        js_docket_entry = TexasDocketEntryDictFactory(
+            attachments=[],
+            description="Updated description",
+            date=date.fromisoformat("2025-01-02"),
+            type="Brief",
+        )
+
+        # Should match the second entry by sequence number
+        output = merge_texas_docket_entry(
+            self.docket_coa1, "2025-01-02.001", True, js_docket_entry
+        )
+
+        assert output == (False, True, existing_entry_2.pk)
+        updated_entry = TexasDocketEntry.objects.get(pk=output[2])
+        assert updated_entry.description == "Updated description"
+        assert updated_entry.sequence_number == "2025-01-02.001"
+        # Ensure the first entry was not modified
+        existing_entry_1.refresh_from_db()
+        assert existing_entry_1.description == "First entry"
+
+    def test_merge_texas_docket_entry_single_match_updates_entry(self):
+        """When exactly one entry matches by date/type/brief, update it even
+        with different sequence number."""
+        existing_entry = TexasDocketEntryFactory.create(
+            docket=self.docket_coa1,
+            date_filed=date.fromisoformat("2025-01-04"),
+            entry_type="Brief",
+            appellate_brief=True,
+            sequence_number="2025-01-04.000",
+            description="Original description",
+        )
+
+        js_docket_entry = TexasDocketEntryDictFactory(
+            attachments=[],
+            description="Updated description",
+            date=date.fromisoformat("2025-01-04"),
+            type="Brief",
+        )
+
+        # Should update existing entry and change its sequence number
+        output = merge_texas_docket_entry(
+            self.docket_coa1, "2025-01-04.001", True, js_docket_entry
+        )
+
+        assert output == (False, True, existing_entry.pk)
+        updated_entry = TexasDocketEntry.objects.get(pk=output[2])
+        assert updated_entry.description == "Updated description"
+        assert updated_entry.sequence_number == "2025-01-04.001"
+
+    def test_merge_texas_docket_entry_multiple_matches_without_sequence(self):
+        """When multiple entries match by date/type/brief but none match sequence, create a new entry."""
+        # Create two entries with same date, type, and appellate_brief
+        existing_entry_1 = TexasDocketEntryFactory.create(
+            docket=self.docket_coa1,
+            date_filed=date.fromisoformat("2025-01-03"),
+            entry_type="Brief",
+            appellate_brief=True,
+            sequence_number="2025-01-03.000",
+            description="First entry",
+        )
+        existing_entry_2 = TexasDocketEntryFactory.create(
+            docket=self.docket_coa1,
+            date_filed=date.fromisoformat("2025-01-03"),
+            entry_type="Brief",
+            appellate_brief=True,
+            sequence_number="2025-01-03.001",
+            description="Second entry",
+        )
+
+        js_docket_entry = TexasDocketEntryDictFactory(
+            attachments=[],
+            description="New third entry",
+            date=date.fromisoformat("2025-01-03"),
+            type="Brief",
+        )
+
+        # Should create a new entry since no sequence number matches
+        output = merge_texas_docket_entry(
+            self.docket_coa1, "2025-01-03.002", True, js_docket_entry
+        )
+
+        assert output[0] is True  # created
+        assert output[1] is True  # success
+        assert output[2] not in (existing_entry_1.pk, existing_entry_2.pk)
+        new_entry = TexasDocketEntry.objects.get(pk=output[2])
+        assert new_entry.description == "New third entry"
+        assert new_entry.sequence_number == "2025-01-03.002"
+        # Ensure existing entries were not modified
+        existing_entry_1.refresh_from_db()
+        existing_entry_2.refresh_from_db()
+        assert existing_entry_1.description == "First entry"
+        assert existing_entry_2.description == "Second entry"
+
+    def test_merge_single_party_with_attorney(self):
+        """Can we merge a single party with an attorney?"""
+        parties: list[TexasCaseParty] = [
+            TexasCaseParty(
+                name="Test Party",
+                type="Appellant",
+                representatives=["Test Attorney"],
+            )
+        ]
+        merge_texas_parties(self.docket_coa1, parties)
+
+        # Check party was created
+        assert Party.objects.filter(name="Test Party").exists()
+        party = Party.objects.get(name="Test Party")
+
+        # Check party type was associated with docket
+        assert PartyType.objects.filter(
+            docket=self.docket_coa1, party=party, name="Appellant"
+        ).exists()
+
+        # Check attorney was created
+        assert Attorney.objects.filter(name="Test Attorney").exists()
+
+        # Check role was created linking party, attorney, and docket
+        assert Role.objects.filter(
+            docket=self.docket_coa1,
+            party=party,
+            attorney__name="Test Attorney",
+        ).exists()
+
+    def test_merge_multiple_parties(self):
+        """Can we merge multiple parties?"""
+        parties: list[TexasCaseParty] = [
+            TexasCaseParty(
+                name="Appellant Party",
+                type="Appellant",
+                representatives=["Appellant Attorney"],
+            ),
+            TexasCaseParty(
+                name="Appellee Party",
+                type="Appellee",
+                representatives=[
+                    "Appellee Attorney One",
+                    "Appellee Attorney Two",
+                ],
+            ),
+        ]
+        merge_texas_parties(self.docket_coa1, parties)
+
+        # Check both parties were created
+        assert Party.objects.filter(name="Appellant Party").exists()
+        assert Party.objects.filter(name="Appellee Party").exists()
+
+        # Check all attorneys were created
+        assert Attorney.objects.filter(name="Appellant Attorney").exists()
+        assert Attorney.objects.filter(name="Appellee Attorney One").exists()
+        assert Attorney.objects.filter(name="Appellee Attorney Two").exists()
+
+        # Check correct number of roles
+        assert Role.objects.filter(docket=self.docket_coa1).count() == 3
+
+    def test_merge_party_without_representatives(self):
+        """Can we merge a party that has no representatives?"""
+        parties: list[TexasCaseParty] = [
+            TexasCaseParty(
+                name="Pro Se Party",
+                type="Appellant",
+                representatives=[],
+            )
+        ]
+        merge_texas_parties(self.docket_coa1, parties)
+
+        # Check party was created
+        assert Party.objects.filter(name="Pro Se Party").exists()
+
+        # Check party type exists
+        party = Party.objects.get(name="Pro Se Party")
+        assert PartyType.objects.filter(
+            docket=self.docket_coa1, party=party, name="Appellant"
+        ).exists()
+
+        # No attorneys should be created for this party
+        assert (
+            Role.objects.filter(docket=self.docket_coa1, party=party).count()
+            == 0
+        )
+
+    def test_merge_empty_parties_preserves_existing(self):
+        """Does merging empty parties preserve existing party data?"""
+        # First add some parties
+        initial_parties: list[TexasCaseParty] = [
+            TexasCaseParty(
+                name="Existing Party",
+                type="Appellant",
+                representatives=["Existing Attorney"],
+            )
+        ]
+        merge_texas_parties(self.docket_coa1, initial_parties)
+        initial_party_count = self.docket_coa1.parties.count()
+
+        # Now merge empty list
+        merge_texas_parties(self.docket_coa1, [])
+
+        # Existing parties should be preserved
+        assert self.docket_coa1.parties.count() == initial_party_count
+
+    def test_normalize_single_party_no_representatives(self):
+        """Can we normalize a party without representatives?"""
+        parties: list[TexasCaseParty] = [
+            TexasCaseParty(
+                name="John Doe",
+                type="Appellant",
+                representatives=[],
+            )
+        ]
+        result = normalize_texas_parties(parties)
+        assert len(result) == 1
+        assert result[0]["name"] == "John Doe"
+        assert result[0]["type"] == "Appellant"
+        assert result[0]["date_terminated"] is None
+        assert result[0]["extra_info"] == ""
+        assert result[0]["attorneys"] == []
+
+    def test_normalize_single_party_with_representatives(self):
+        """Can we normalize a party with multiple representatives?"""
+        parties: list[TexasCaseParty] = [
+            TexasCaseParty(
+                name="Jane Smith",
+                type="Appellee",
+                representatives=[
+                    "Attorney One",
+                    "Attorney Two",
+                    "Attorney Three",
+                ],
+            )
+        ]
+        result = normalize_texas_parties(parties)
+        assert len(result) == 1
+        assert result[0]["name"] == "Jane Smith"
+        assert result[0]["type"] == "Appellee"
+        assert len(result[0]["attorneys"]) == 3
+
+        # First attorney should be lead
+        assert result[0]["attorneys"][0]["name"] == "Attorney One"
+        assert result[0]["attorneys"][0]["contact"] == "Attorney One"
+        assert result[0]["attorneys"][0]["roles"] == ["LEAD_ATTORNEY"]
+
+        # Subsequent attorneys should have UNKNOWN role
+        assert result[0]["attorneys"][1]["name"] == "Attorney Two"
+        assert result[0]["attorneys"][1]["roles"] == ["UNKNOWN"]
+        assert result[0]["attorneys"][2]["name"] == "Attorney Three"
+        assert result[0]["attorneys"][2]["roles"] == ["UNKNOWN"]
+
+    def test_normalize_multiple_parties(self):
+        """Can we normalize multiple parties?"""
+        parties: list[TexasCaseParty] = [
+            TexasCaseParty(
+                name="Petitioner Corp",
+                type="Petitioner",
+                representatives=["Lead Counsel"],
+            ),
+            TexasCaseParty(
+                name="Respondent LLC",
+                type="Respondent",
+                representatives=["Defense Attorney", "Co-Counsel"],
+            ),
+        ]
+        result = normalize_texas_parties(parties)
+        assert len(result) == 2
+
+        assert result[0]["name"] == "Petitioner Corp"
+        assert result[0]["type"] == "Petitioner"
+        assert len(result[0]["attorneys"]) == 1
+        assert result[0]["attorneys"][0]["roles"] == ["LEAD_ATTORNEY"]
+
+        assert result[1]["name"] == "Respondent LLC"
+        assert result[1]["type"] == "Respondent"
+        assert len(result[1]["attorneys"]) == 2
+
+    def test_normalize_empty_parties_list(self):
+        """Can we handle an empty parties list?"""
+        result = normalize_texas_parties([])
+        assert result == []
+
+    @mock.patch("cl.corpus_importer.tasks.doc_page_count_service")
+    @responses.activate
+    def test_download_texas_document_pdf_success(self, pcs_mock):
+        """Can we successfully download a PDF for a TexasDocument?"""
+        self.download_pdf_patch.stop()
+        texas_document = TexasDocumentFactory.create()
+
+        def get_test_pdf(
+            request: requests.Request,
+        ) -> tuple[int, dict[str, str], bytes]:
+            with mock_bucket_open("ocr_pdf_test.pdf", "rb") as f:
+                return 200, {"Content-Type": "application/pdf"}, f.read()
+
+        pdf_response = responses.add_callback(
+            responses.GET,
+            texas_document.url,
+            callback=get_test_pdf,
+        )
+
+        pcs_mock.return_value = httpx.Response(200, text="1")
+
+        result = download_texas_document_pdf(texas_document.pk)
+
+        assert result is not None
+        texas_document.refresh_from_db()
+        assert texas_document.filepath_local is not None
+        assert texas_document.page_count == 1
+        assert pdf_response.call_count == 1
+        assert pcs_mock.call_count == 1
+
+    def test_download_texas_document_pdf_document_not_found(self):
+        """Do we handle a missing TexasDocument gracefully?"""
+        non_existent_pk = 99999
+
+        result = download_texas_document_pdf(non_existent_pk)
+
+        assert result is None
+        self.download_pdf_mock.assert_not_called()
+
+    def test_download_texas_document_pdf_download_failure(self):
+        """Do we handle a failed PDF download gracefully?"""
+        texas_document = TexasDocumentFactory.create(
+            url="https://example.com/sample.pdf",
+        )
+
+        # Mock failed PDF download
+        self.download_pdf_mock.return_value.__enter__.return_value = None
+
+        result = download_texas_document_pdf(texas_document.pk)
+
+        assert result is None
+        self.download_pdf_mock.assert_called_once_with(
+            "https://example.com/sample.pdf", texas_document.pk, "texas_"
+        )
+        texas_document.refresh_from_db()
+        assert not texas_document.filepath_local
+
+
+@patch("cl.corpus_importer.tasks.get_or_cache_pacer_cookies")
+@override_settings(
+    IQUERY_CASE_PROBE_DAEMON_ENABLED=True,
+    IQUERY_SWEEP_UPLOADS_SIGNAL_ENABLED=True,
+    EGRESS_PROXY_HOSTS=["http://proxy_1:9090", "http://proxy_2:9090"],
+)
+class ScrapeIqueryPagesTest(TestCase):
+    """Tests related to probe_iquery_pages_daemon command."""
+
+    @classmethod
+    def setUpTestData(cls):
+        super().setUpTestData()
+        cls.court_canb = CourtFactory(id="canb", jurisdiction="FB")
+        cls.court_cand = CourtFactory(id="cand", jurisdiction="FB")
+        cls.court_txed = CourtFactory(id="txed", jurisdiction="FB")
+        cls.court_nysd = CourtFactory(id="nysd", jurisdiction="FB")
+        cls.court_gamb = CourtFactory(id="gamb", jurisdiction="FB")
+        cls.court_hib = CourtFactory(id="hib", jurisdiction="FB")
+        cls.court_gand = CourtFactory(id="gand", jurisdiction="FB")
+        cls.court_ca1 = CourtFactory(id="ca1", jurisdiction="F")
+        cls.court_cacd = CourtFactory(id="cacd", jurisdiction="FB")
+        cls.court_vib = CourtFactory(id="vib", jurisdiction="FB")
+        cls.court_mowd = CourtFactory(id="mowd", jurisdiction="FB")
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.r = get_redis_interface("CACHE")
+        keys_to_clean = [
+            "iquery:highest_known_pacer_case_id",
+            "iquery:court_wait:*",
+            "iquery.probing.enqueued:*",
+            "iquery:test_highest_known_pacer_case_id",
+            "iquery:pacer_case_id_current",
+            "iquery:court_blocked_attempts:*",
+            "iquery:court_empty_probe_attempts:*",
+            "iquery:latest_known_pacer_case_id",
+        ]
+        for key_to_clean in keys_to_clean:
+            key = self.r.keys(key_to_clean)
+            if key:
+                self.r.delete(*key)
+
+    def test_compute_next_binary_probe(self, mock_cookies):
+        """Confirm the method compute_next_binary_probe generates the expected
+        probe pattern based on the initial variables."""
+
+        highest_known_pacer_case_id = 0
+        probe_pattern = []
+        for i in range(18):
+            next_probe, _ = compute_next_binary_probe(
+                highest_known_pacer_case_id,
+                i + 1,
+                jitter=0,
+            )
+            probe_pattern.append(next_probe)
+
+        expected_pattern = [
+            1,
+            2,
+            4,
+            8,
+            16,
+            32,
+            64,
+            96,
+            128,
+            160,
+            192,
+            224,
+            256,
+            288,
+            320,
+            352,
+            384,
+            416,
+        ]
+        self.assertEqual(
+            expected_pattern,
+            probe_pattern,
+            msg="The probe pattern didn't match",
+        )
+
+        # Apply jitter.
+        probe_pattern_jitter = []
+        jitter = 5
+        for i in range(9):
+            next_probe, _ = compute_next_binary_probe(
+                highest_known_pacer_case_id, i + 1, jitter=jitter
+            )
+            probe_pattern_jitter.append(next_probe)
+
+        # Each element of probe_pattern_jitter can't deviate more than 13
+        # round(256 * 0.05)
+        unique_probe_pattern_jitter = set(probe_pattern_jitter)
+        # Ensure no duplicated values are generated.
+        self.assertEqual(
+            len(unique_probe_pattern_jitter), len(probe_pattern_jitter)
+        )
+
+        for i, (expected, actual) in enumerate(
+            zip(expected_pattern, probe_pattern_jitter)
+        ):
+            # jitter is not applied in the first iteration to speed up
+            # the detection of new cases once courts catch up.
+            jitter_applied = 0 if i == 0 else jitter
+            self.assertEqual(actual - jitter_applied, expected)
+
+    def test_jitter_is_capped(self, mock_cookies):
+        """Confirm that jitter can't be greater than IQUERY_MAX_PROBE"""
+
+        jitter = compute_binary_probe_jitter(testing=False)
+        self.assertTrue(jitter < settings.IQUERY_MAX_PROBE)
+
+    @patch(
+        "cl.corpus_importer.tasks.CaseQuery",
+        new=FakeCaseQueryReport,
+    )
+    def test_iquery_pages_probe_task(self, mock_cookies):
+        """Test probe_or_scrape_iquery_pages task."""
+
+        dockets = Docket.objects.filter(court_id=self.court_cand.pk)
+        self.assertEqual(dockets.count(), 0)
+        r = get_redis_interface("CACHE")
+        # Simulate a highest_known_pacer_case_id  = 8
+        r.hset("iquery:highest_known_pacer_case_id", self.court_cand.pk, 8)
+        r.hset(
+            "iquery:test_highest_known_pacer_case_id", self.court_cand.pk, 8
+        )
+        # Execute the task
+        probe_or_scrape_iquery_pages.delay(
+            self.court_cand.pk, "0", testing=True
+        )
+
+        # New highest_known_pacer_case_id according to the cand test pattern in
+        # test_patterns
+        # {
+        #         9: False, #1
+        #         10: False, #2
+        #         12: True, #4
+        #         13: True, #5
+        #         16: True, #8
+        #         18: True, #10
+        #         24: True, #16
+        #         40: False, #32
+        #         72: False, #64
+        #         136: False, #128
+        #         137: True, #129
+        #         264: True, #256
+        #     }
+        # Note that the probing is aborted on 136 after reaching to False hits
+        highest_known_pacer_case_id = r.hget(
+            "iquery:test_highest_known_pacer_case_id", self.court_cand.pk
+        )
+        self.assertEqual(int(highest_known_pacer_case_id), 24)
+        # Probing will add 3 more dockets
+        self.assertEqual(
+            dockets.count(), 3, msg="Docket number doesn't match."
+        )
+
+    @patch(
+        "cl.corpus_importer.tasks.CaseQuery",
+        new=FakeCaseQueryReport,
+    )
+    def test_iquery_pages_probe_nysd(self, mock_cookies):
+        """Test probe_or_scrape_iquery_pages."""
+
+        dockets = Docket.objects.filter(court_id=self.court_nysd.pk)
+        self.assertEqual(dockets.count(), 0)
+        r = get_redis_interface("CACHE")
+        # Simulate a highest_known_pacer_case_id  = 8
+        r.hset("iquery:highest_known_pacer_case_id", self.court_nysd.pk, 8)
+        r.hset(
+            "iquery:test_highest_known_pacer_case_id", self.court_nysd.pk, 8
+        )
+        # Execute the task
+        probe_or_scrape_iquery_pages.delay(
+            self.court_nysd.pk, None, testing=True
+        )
+
+        # New highest_known_pacer_case_id according to the nysd test pattern in
+        # cl.tests.fakes.test_patterns
+        # {
+        #         9: False,
+        #         10: False,
+        #         12: False,
+        #         16: True,
+        #         24: True,
+        #         40: True,
+        #         72: True,
+        #         104: True,
+        #         136: True,
+        #         168: True,
+        #         200: True,
+        #         232: True,
+        #         264: True,
+        #         296: True,
+        #         328: True,
+        #         360: True,
+        #         392: True,
+        #         424: True, #18
+        #         456: True,
+        #     }
+        # Note that the probe is terminated on 424 after reaching the 18 probe
+        # iterations.
+        highest_known_pacer_case_id = r.hget(
+            "iquery:test_highest_known_pacer_case_id", self.court_nysd.pk
+        )
+        self.assertEqual(int(highest_known_pacer_case_id), 424)
+        # Probing will add 15 more dockets
+        dockets = Docket.objects.filter(
+            court_id=self.court_nysd.pk,
+        )
+        self.assertEqual(
+            dockets.count(), 15, msg="Docket number doesn't match."
+        )
+        dockets_added = Docket.objects.filter(
+            court_id=self.court_nysd.pk,
+            pacer_case_id__in=[
+                "16",
+                "24",
+                "40",
+                "72",
+                "104",
+                "136",
+                "168",
+                "200",
+                "232",
+                "264",
+                "296",
+                "328",
+                "360",
+                "392",
+                "424",
+            ],
+        )
+        self.assertEqual(
+            dockets_added.count(), 15, msg="Docket number doesn't match."
+        )
+
+    @patch(
+        "cl.corpus_importer.tasks.CaseQuery",
+        new=FakeCaseQueryReport,
+    )
+    def test_iquery_pages_probe_court_down(self, mock_cookies):
+        """Test a court is down or has blocked us. Abort the scrape and set a
+        long wait equals to IQUERY_COURT_BLOCKED_WAIT."""
+
+        r = get_redis_interface("CACHE")
+        # Simulate a highest_known_pacer_case_id  = 8
+        r.hset("iquery:highest_known_pacer_case_id", self.court_gamb.pk, 8)
+        r.hset(
+            "iquery:test_highest_known_pacer_case_id", self.court_gamb.pk, 8
+        )
+        # Execute the task
+        probe_or_scrape_iquery_pages.delay(
+            self.court_gamb.pk, None, testing=True
+        )
+
+        # highest_known_pacer_case_id is not updated due to the block.
+        highest_known_pacer_case_id = r.hget(
+            "iquery:test_highest_known_pacer_case_id", self.court_gamb.pk
+        )
+        self.assertEqual(int(highest_known_pacer_case_id), 8)
+        # court_wait is set to IQUERY_COURT_BLOCKED_WAIT
+        court_wait = r.get(f"iquery:court_wait:{self.court_gamb.pk}")
+        self.assertEqual(int(court_wait), settings.IQUERY_COURT_BLOCKED_WAIT)
+
+    @patch(
+        "cl.corpus_importer.tasks.CaseQuery",
+        new=FakeCaseQueryReport,
+    )
+    @patch("cl.corpus_importer.tasks.logger")
+    def test_iquery_pages_probe_court_timeout(self, mock_logger, mock_cookies):
+        """Test a CaseQuery request times out. Abort the task after an iquery
+        page retrieval fails after individual retries."""
+
+        r = get_redis_interface("CACHE")
+        # Simulate a highest_known_pacer_case_id  = 8
+        r.hset("iquery:highest_known_pacer_case_id", self.court_hib.pk, 8)
+        r.hset("iquery:test_highest_known_pacer_case_id", self.court_hib.pk, 8)
+        # Execute the task
+        with patch("cl.lib.decorators.time.sleep") as mock_sleep:
+            probe_or_scrape_iquery_pages.delay(
+                self.court_hib.pk, None, testing=True
+            )
+
+        # 2 sleeps before aborting the task. The probe is retried 2 times
+        # independently via the @retry decorator.
+        self.assertEqual(mock_sleep.call_count, 2)
+        # highest_known_pacer_case_id is not updated due to the Timeout.
+        highest_known_pacer_case_id = r.hget(
+            "iquery:test_highest_known_pacer_case_id", self.court_hib.pk
+        )
+        self.assertEqual(int(highest_known_pacer_case_id), 8)
+
+        mock_logger.warning.assert_called_with(
+            "The court %s website is probably down. Aborting the probe task.",
+            self.court_hib.pk,
+        )
+
+    @patch(
+        "cl.corpus_importer.tasks.CaseQuery",
+        new=FakeCaseQueryReport,
+    )
+    def test_probe_iquery_pages_daemon(self, mock_cookies):
+        """Test probe_iquery_pages_daemon by providing an initial and final
+        pacer_case_ids to scrape."""
+
+        dockets = Docket.objects.all()
+        self.assertEqual(dockets.count(), 0)
+        r = get_redis_interface("CACHE")
+        r.hset("iquery:highest_known_pacer_case_id", self.court_canb.pk, 0)
+        r.hset("iquery:highest_known_pacer_case_id", self.court_cand.pk, 135)
+
+        # Set a big court_wait for the following courts in order to abort them in
+        # this test.
+        r.set(f"iquery:court_wait:{self.court_nysd.pk}", 1000, ex=3600)
+        r.set(f"iquery:court_wait:{self.court_gamb.pk}", 1000, ex=3600)
+        r.set(f"iquery:court_wait:{self.court_hib.pk}", 1000, ex=3600)
+        r.set(f"iquery:court_wait:{self.court_gand.pk}", 1000, ex=3600)
+        r.set(f"iquery:court_wait:{self.court_txed.pk}", 1000, ex=3600)
+        r.set(f"iquery:court_wait:{self.court_cacd.pk}", 1000, ex=3600)
+        r.set(f"iquery:court_wait:{self.court_vib.pk}", 1000, ex=3600)
+        r.set(f"iquery:court_wait:{self.court_mowd.pk}", 1000, ex=3600)
+
+        with patch("cl.lib.decorators.time.sleep") as mock_sleep:
+            call_command(
+                "probe_iquery_pages_daemon",
+                testing_iterations=1,
+            )
+        # 3 additional dockets should exist after complete the probe.
+        # 2 for canb and 1 for cand
+        self.assertEqual(
+            dockets.count(), 3, msg="Docket number doesn't match."
+        )
+
+    @patch(
+        "cl.corpus_importer.tasks.CaseQuery",
+        new=FakeCaseQueryReport,
+    )
+    @patch("cl.corpus_importer.tasks.logger")
+    def test_probe_iquery_pages_daemon_court_down_and_timeout(
+        self, mock_logger, mock_cookies
+    ):
+        """Test probe_iquery_pages_daemon when a court has blocked us or
+        is the requests are timing out.
+        """
+
+        dockets = Docket.objects.all()
+        self.assertEqual(dockets.count(), 0)
+        r = get_redis_interface("CACHE")
+        r.hset("iquery:highest_known_pacer_case_id", self.court_gamb.pk, 8)
+        r.hset("iquery:highest_known_pacer_case_id", self.court_hib.pk, 8)
+
+        court_wait_gamb = r.get(f"iquery:court_wait:{self.court_gamb.pk}")
+        self.assertEqual(court_wait_gamb, None)
+        court_wait_hib = r.get(f"iquery:court_wait:{self.court_hib.pk}")
+        self.assertEqual(court_wait_hib, None)
+
+        # Set a big court_wait for the following courts in order to abort them in
+        # this test.
+        r.set(f"iquery:court_wait:{self.court_cand.pk}", 1000, ex=3600)
+        r.set(f"iquery:court_wait:{self.court_nysd.pk}", 1000, ex=3600)
+        r.set(f"iquery:court_wait:{self.court_canb.pk}", 1000, ex=3600)
+        r.set(f"iquery:court_wait:{self.court_gand.pk}", 1000, ex=3600)
+        r.set(f"iquery:court_wait:{self.court_txed.pk}", 1000, ex=3600)
+        r.set(f"iquery:court_wait:{self.court_cacd.pk}", 1000, ex=3600)
+        r.set(f"iquery:court_wait:{self.court_vib.pk}", 1000, ex=3600)
+        r.set(f"iquery:court_wait:{self.court_mowd.pk}", 1000, ex=3600)
+
+        with patch("cl.lib.decorators.time.sleep") as mock_sleep:
+            call_command(
+                "probe_iquery_pages_daemon",
+                testing_iterations=1,
+            )
+
+        # Assertions for court_gamb blocked.
+        # highest_known_pacer_case_id is not updated due to court_gamb block.
+        highest_known_pacer_case_id = r.hget(
+            "iquery:highest_known_pacer_case_id", self.court_gamb.pk
+        )
+        self.assertEqual(int(highest_known_pacer_case_id), 8)
+        # court_wait is set to IQUERY_COURT_BLOCKED_WAIT
+        court_wait = r.get(f"iquery:court_wait:{self.court_gamb.pk}")
+        self.assertEqual(int(court_wait), settings.IQUERY_COURT_BLOCKED_WAIT)
+
+        # Assertions for court_hib timeouts.
+        # 2 sleeps before aborting the task. The probe is retried 2 times
+        # independently via the @retry decorator.
+        self.assertEqual(mock_sleep.call_count, 2)
+        # highest_known_pacer_case_id is not updated due to the block.
+        highest_known_pacer_case_id = r.hget(
+            "iquery:highest_known_pacer_case_id", self.court_hib.pk
+        )
+        self.assertEqual(int(highest_known_pacer_case_id), 8)
+        # court_wait is set to 2 (IQUERY_COURT_BLOCKED_WAIT)
+        expected_call = call(
+            "The court %s website is probably down. Aborting the probe task.",
+            self.court_hib.pk,
+        )
+        assert expected_call in mock_logger.warning.mock_calls, (
+            "Expected Timeout warning call was not triggered."
+        )
+
+    @patch(
+        "cl.corpus_importer.tasks.CaseQuery",
+        new=FakeCaseQueryReport,
+    )
+    def test_update_latest_case_id_and_schedule_iquery_sweep_integration(
+        self, mock_cookies
+    ):
+        """Test if the latest pacer_case_id is kept up to date upon docket
+        creation and if the iquery retrieval is performed properly.
+        """
+        # Connect handle_update_latest_case_id_and_schedule_iquery_sweep signal
+        # with a unique dispatch_uid for this test
+        test_dispatch_uid = (
+            "test_handle_update_latest_case_id_and_schedule_iquery_sweep"
+        )
+        post_save.connect(
+            handle_update_latest_case_id_and_schedule_iquery_sweep,
+            sender=Docket,
+            dispatch_uid=test_dispatch_uid,
+        )
+        try:
+            pacer_files = PacerHtmlFiles.objects.all()
+            dockets = Docket.objects.filter(court_id=self.court_gand)
+            self.assertEqual(dockets.count(), 0)
+
+            r = get_redis_interface("CACHE")
+            # Simulate a highest_known_pacer_case_id = 5
+            r.hset("iquery:highest_known_pacer_case_id", self.court_gand.pk, 5)
+            ### Create a Docket with a pacer_case_id bigger than highest_known_pacer_case_id
+            # IQUERY_SWEEP_UPLOADS_SIGNAL_ENABLED is False. So no signal should
+            # be processed.
+            with (
+                override_settings(IQUERY_SWEEP_UPLOADS_SIGNAL_ENABLED=False),
+                patch(
+                    "cl.corpus_importer.signals.update_latest_case_id_and_schedule_iquery_sweep",
+                    side_effect=lambda *args,
+                    **kwargs: update_latest_case_id_and_schedule_iquery_sweep(
+                        *args, **kwargs
+                    ),
+                ) as mock_iquery_sweep,
+                self.captureOnCommitCallbacks(execute=True),
+            ):
+                DocketFactory(
+                    court=self.court_gand,
+                    appeal_from=None,
+                    source=Docket.RECAP,
+                    case_name="New Incoming Docket",
+                    docket_number="2:20-cv-00601",
+                    pacer_case_id="20",
+                )
+
+            # update_latest_case_id_and_schedule_iquery_sweep shouldn't be called.
+            self.assertEqual(mock_iquery_sweep.call_count, 0)
+            # No additional Dockets should have been created.
+            self.assertEqual(
+                dockets.count(), 1, msg="Wrong number of dockets returned."
+            )
+            highest_known_pacer_case_id = r.hget(
+                "iquery:highest_known_pacer_case_id", self.court_gand.pk
+            )
+            # highest_known_pacer_case_id shouldn't be changed.
+            self.assertEqual(
+                int(highest_known_pacer_case_id),
+                5,
+                msg="Wrong pacer_case_id returned.",
+            )
+
+            ### Create a Docket with a pacer_case_id smaller than highest_known_pacer_case_id
+            with (
+                patch(
+                    "cl.corpus_importer.signals.update_latest_case_id_and_schedule_iquery_sweep",
+                    side_effect=lambda *args,
+                    **kwargs: update_latest_case_id_and_schedule_iquery_sweep(
+                        *args, **kwargs
+                    ),
+                ) as mock_iquery_sweep,
+                self.captureOnCommitCallbacks(execute=True),
+            ):
+                DocketFactory(
+                    court=self.court_gand,
+                    appeal_from=None,
+                    source=Docket.RECAP,
+                    docket_number="2:20-cv-00600",
+                    pacer_case_id="4",
+                )
+
+            # update_latest_case_id_and_schedule_iquery_sweep should be called 1 time
+            self.assertEqual(
+                mock_iquery_sweep.call_count,
+                1,
+                msg="The number of signals triggered didn't match.",
+            )
+
+            # highest_known_pacer_case_id shouldn't have changed.
+            highest_known_pacer_case_id = r.hget(
+                "iquery:highest_known_pacer_case_id", self.court_gand.pk
+            )
+            self.assertEqual(
+                int(highest_known_pacer_case_id),
+                5,
+                msg="Wrong pacer_case_id returned.",
+            )
+            # No extra dockets were created by the sweep.
+            self.assertEqual(dockets.count(), 2)
+
+            ### Create a Docket with a pacer_case_id bigger than highest_known_pacer_case_id
+            r.hset("iquery:pacer_case_id_current", self.court_gand.pk, 5)
+            with (
+                patch(
+                    "cl.corpus_importer.signals.update_latest_case_id_and_schedule_iquery_sweep",
+                    side_effect=lambda *args,
+                    **kwargs: update_latest_case_id_and_schedule_iquery_sweep(
+                        *args, **kwargs
+                    ),
+                ) as mock_iquery_sweep,
+                self.captureOnCommitCallbacks(execute=True),
+            ):
+                DocketFactory(
+                    court=self.court_gand,
+                    appeal_from=None,
+                    source=Docket.RECAP,
+                    case_name="New Incoming Docket",
+                    docket_number="2:20-cv-00601",
+                    pacer_case_id="8",
+                )
+
+            # update_latest_case_id_and_schedule_iquery_sweep should be called once.
+            # The 2 dockets retrieved by the iquery sweep shouldn't call
+            # update_latest_case_id_and_schedule_iquery_sweep.
+            self.assertEqual(mock_iquery_sweep.call_count, 1)
+
+            # Two dockets should have been created.
+            self.assertEqual(
+                dockets.count(), 5, msg="Wrong number of dockets returned."
+            )
+            # Two PACER HTML files should be stored by now via iquery sweep.
+            self.assertEqual(2, pacer_files.count())
+
+            highest_known_pacer_case_id = r.hget(
+                "iquery:highest_known_pacer_case_id", self.court_gand.pk
+            )
+            self.assertEqual(int(highest_known_pacer_case_id), 8)
+
+            ### Create an appellate RECAP docket, it should be ignored
+            with (
+                patch(
+                    "cl.corpus_importer.signals.update_latest_case_id_and_schedule_iquery_sweep",
+                    side_effect=lambda *args,
+                    **kwargs: update_latest_case_id_and_schedule_iquery_sweep(
+                        *args, **kwargs
+                    ),
+                ) as mock_iquery_sweep,
+                self.captureOnCommitCallbacks(execute=True),
+            ):
+                DocketFactory(
+                    court=self.court_ca1,
+                    source=Docket.RECAP,
+                    docket_number="2:20-cv-00603",
+                    pacer_case_id=9,
+                )
+
+            dockets = Docket.objects.filter(court_id=self.court_ca1)
+            # One docket created by the factory.
+            self.assertEqual(dockets.count(), 1)
+            highest_known_pacer_case_id = r.hget(
+                "iquery:highest_known_pacer_case_id", self.court_ca1.pk
+            )
+            # highest_known_pacer_case_id shouldn't exist for this court.
+            self.assertEqual(highest_known_pacer_case_id, None)
+
+            ### Integration test probing task + sweep task
+            # IQUERY_SWEEP_UPLOADS_SIGNAL_ENABLED True
+            dockets = Docket.objects.filter(court_id=self.court_cand.pk)
+            self.assertEqual(dockets.count(), 0)
+            r = get_redis_interface("CACHE")
+            # Simulate a highest_known_pacer_case_id  = 8
+            r.hset("iquery:highest_known_pacer_case_id", self.court_cand.pk, 8)
+            r.hset("iquery:pacer_case_id_current", self.court_cand.pk, 8)
+            with (
+                override_settings(IQUERY_SWEEP_UPLOADS_SIGNAL_ENABLED=True),
+                patch(
+                    "cl.corpus_importer.signals.update_latest_case_id_and_schedule_iquery_sweep",
+                    side_effect=lambda *args,
+                    **kwargs: update_latest_case_id_and_schedule_iquery_sweep(
+                        *args, **kwargs
+                    ),
+                ) as mock_iquery_sweep,
+                self.captureOnCommitCallbacks(execute=True),
+            ):
+                # Execute the probing task
+                probe_or_scrape_iquery_pages.delay(
+                    self.court_cand.pk, None, testing=True
+                )
+
+            # update_latest_case_id_and_schedule_iquery_sweep should be called
+            # 1 time only for the latest probing hit.
+            self.assertEqual(
+                mock_iquery_sweep.call_count,
+                1,
+                msg="Wrong number of sweep task called.",
+            )
+            # Probing will add 3 dockets (12, 16, 24) + 2 added for the sweep task (13,18).
+            self.assertEqual(
+                dockets.count(), 5, msg="Docket count doesn't match."
+            )
+            # 7 additional PACER HTML files should be stored by now, 3 added by the
+            # probing task + 4 added by the sweep task.
+            pacer_files = PacerHtmlFiles.objects.all()
+            self.assertEqual(9, pacer_files.count())
+            # Assert HTML content was properly stored in one of them.
+            self.assertEqual(
+                "<span>Test</span>", pacer_files[0].filepath.read().decode()
+            )
+
+            ### Integration test probing task + sweep
+            # IQUERY_SWEEP_UPLOADS_SIGNAL_ENABLED False
+            with override_settings(IQUERY_SWEEP_UPLOADS_SIGNAL_ENABLED=False):
+                # Create docket pacer_case_id 12, which is the last docket in
+                # the probe. Even though it already exists, it should trigger
+                # a sweep task.
+                DocketFactory(
+                    court=self.court_txed,
+                    appeal_from=None,
+                    source=Docket.RECAP,
+                    case_name="New Incoming Docket 12",
+                    docket_number="2:10-cv-00602",
+                    pacer_case_id="12",
+                )
+
+            dockets = Docket.objects.filter(court_id=self.court_txed.pk)
+            self.assertEqual(
+                dockets.count(), 1, msg="Docket count doesn't match for txed."
+            )
+            r = get_redis_interface("CACHE")
+            # Simulate a highest_known_pacer_case_id  = 8
+            r.hset("iquery:highest_known_pacer_case_id", self.court_txed.pk, 8)
+            r.hset("iquery:pacer_case_id_current", self.court_txed.pk, 8)
+            with (
+                override_settings(IQUERY_SWEEP_UPLOADS_SIGNAL_ENABLED=False),
+                patch(
+                    "cl.corpus_importer.signals.update_latest_case_id_and_schedule_iquery_sweep",
+                    side_effect=lambda *args,
+                    **kwargs: update_latest_case_id_and_schedule_iquery_sweep(
+                        *args, **kwargs
+                    ),
+                ) as mock_iquery_sweep,
+                self.captureOnCommitCallbacks(execute=True),
+            ):
+                # Execute the probing task
+                probe_or_scrape_iquery_pages.delay(
+                    self.court_txed.pk, None, testing=True
+                )
+
+            # update_latest_case_id_and_schedule_iquery_sweep should be called
+            # 1 time only for the latest probing hit.
+            self.assertEqual(
+                mock_iquery_sweep.call_count,
+                1,
+                msg="Wrong number of sweep task called.",
+            )
+            # Probing will add 3 dockets (9,10) + 1 added for the sweep task (11).
+            # Docket 12 already exists however, it should still trigger the sweep task that adds 11.
+            self.assertEqual(
+                dockets.count(), 4, msg="Docket count doesn't match for txed."
+            )
+        finally:
+            # Ensure the signal is disconnected after the test
+            post_save.disconnect(
+                handle_update_latest_case_id_and_schedule_iquery_sweep,
+                sender=Docket,
+                dispatch_uid=test_dispatch_uid,
+            )
+
+    def test_compute_blocked_court_wait(self, mock_cookies):
+        """Confirm the method compute_blocked_court_wait generates the expected
+        waiting pattern based on the block attempt."""
+
+        wait_pattern = []
+        total_accumulated_time_pattern = []
+        for i in range(settings.IQUERY_COURT_BLOCKED_MAX_ATTEMPTS):
+            next_blocked_court_wait, total_accumulated_time = (
+                compute_blocked_court_wait(
+                    i + 1,
+                )
+            )
+            wait_pattern.append(next_blocked_court_wait)
+            total_accumulated_time_pattern.append(total_accumulated_time)
+
+        expected_wait_pattern = [600, 1200, 2400, 4800, 9600, 19200]
+        expected_total_accumulated_time_pattern = [
+            600,
+            1800,
+            4200,
+            9000,
+            18600,
+            37800,
+        ]
+        self.assertEqual(
+            expected_wait_pattern,
+            wait_pattern,
+            msg="The blocked court wait pattern didn't match",
+        )
+        self.assertEqual(
+            expected_total_accumulated_time_pattern,
+            total_accumulated_time_pattern,
+            msg="The total blocked court accumulated wait pattern didn't match",
+        )
+
+    @patch(
+        "cl.corpus_importer.tasks.CaseQuery",
+        new=FakeCaseQueryReport,
+    )
+    @patch("cl.corpus_importer.tasks.logger")
+    def test_probe_iquery_pages_daemon_court_blocked_max_attempts(
+        self, mock_logger, mock_cookies
+    ):
+        """Test probe_iquery_pages_daemon when a court has blocked us for
+        several hours. After IQUERY_COURT_BLOCKED_MAX_ATTEMPTS is reached, an
+        alert via an error should be triggered so manual intervention can be
+        taken.
+        """
+
+        r = get_redis_interface("CACHE")
+        r.hset("iquery:highest_known_pacer_case_id", self.court_gamb.pk, 0)
+
+        court_wait_gamb = r.get(f"iquery:court_wait:{self.court_gamb.pk}")
+        self.assertEqual(court_wait_gamb, None)
+
+        # Set a big court_wait for the following courts in order to abort them in
+        # this test.
+        r.set(f"iquery:court_wait:{self.court_cand.pk}", 1000, ex=3600)
+        r.set(f"iquery:court_wait:{self.court_nysd.pk}", 1000, ex=3600)
+        r.set(f"iquery:court_wait:{self.court_canb.pk}", 1000, ex=3600)
+        r.set(f"iquery:court_wait:{self.court_gand.pk}", 1000, ex=3600)
+        r.set(f"iquery:court_wait:{self.court_txed.pk}", 1000, ex=3600)
+        r.set(f"iquery:court_wait:{self.court_hib.pk}", 1000, ex=3600)
+        r.set(f"iquery:court_wait:{self.court_cacd.pk}", 1000, ex=3600)
+        r.set(f"iquery:court_wait:{self.court_vib.pk}", 1000, ex=3600)
+        r.set(f"iquery:court_wait:{self.court_mowd.pk}", 1000, ex=3600)
+
+        tests = [600, 1200, 2400, 4800, 9600, 19200]
+        for expected_wait in tests:
+            with self.subTest(expected_wait=expected_wait):
+                r.delete(f"iquery:court_wait:{self.court_gamb.pk}")
+                with patch("cl.lib.decorators.time.sleep") as mock_sleep:
+                    call_command(
+                        "probe_iquery_pages_daemon",
+                        testing_iterations=1,
+                    )
+
+                # Assertions for court_gamb blocked.
+                # court_wait is set to IQUERY_COURT_BLOCKED_WAIT
+                court_wait = r.get(f"iquery:court_wait:{self.court_gamb.pk}")
+                self.assertEqual(int(court_wait), expected_wait)
+
+        # Test one more attempt. The alert error should be triggered.
+        r.delete(f"iquery:court_wait:{self.court_gamb.pk}")
+        with patch("cl.lib.decorators.time.sleep") as mock_sleep:
+            call_command(
+                "probe_iquery_pages_daemon",
+                testing_iterations=1,
+            )
+
+        mock_logger.error.assert_called_with(
+            "The court %s has blocked the iquery page probing "
+            "for around %s hours.",
+            self.court_gamb.pk,
+            10.5,
+        )
+        court_wait = r.get(f"iquery:court_wait:{self.court_gamb.pk}")
+        self.assertEqual(int(court_wait), 600)
+        court_blocked_attempts = r.get(
+            f"iquery:court_blocked_attempts:{self.court_gamb.pk}"
+        )
+        self.assertEqual(int(court_blocked_attempts), 0)
+
+    @patch(
+        "cl.corpus_importer.tasks.CaseQuery",
+        new=FakeCaseQueryReport,
+    )
+    @patch("cl.corpus_importer.tasks.logger")
+    @patch(
+        "cl.corpus_importer.management.commands.probe_iquery_pages_daemon.logger"
+    )
+    @override_settings(
+        IQUERY_EMPTY_PROBES_LIMIT_HOURS={
+            "default": 0.41,
+        },
+        IQUERY_PROBE_WAIT=300,
+    )
+    def test_probe_iquery_pages_daemon_court_got_stuck(
+        self, mock_logger_daemon, mock_logger, mock_cookies
+    ):
+        """Test probe_iquery_pages_daemon when the probe daemon got stuck in a
+        court after IQUERY_EMPTY_PROBES_LIMIT_HOURS are reached.
+        """
+
+        r = get_redis_interface("CACHE")
+        r.hset("iquery:highest_known_pacer_case_id", self.court_cacd.pk, 0)
+
+        # Set a big court_wait for the following courts in order to abort them in
+        # this test.
+        r.set(f"iquery:court_wait:{self.court_cand.pk}", 1000, ex=3600)
+        r.set(f"iquery:court_wait:{self.court_nysd.pk}", 1000, ex=3600)
+        r.set(f"iquery:court_wait:{self.court_canb.pk}", 1000, ex=3600)
+        r.set(f"iquery:court_wait:{self.court_gand.pk}", 1000, ex=3600)
+        r.set(f"iquery:court_wait:{self.court_txed.pk}", 1000, ex=3600)
+        r.set(f"iquery:court_wait:{self.court_hib.pk}", 1000, ex=3600)
+        r.set(f"iquery:court_wait:{self.court_gamb.pk}", 1000, ex=3600)
+        r.set(f"iquery:court_wait:{self.court_vib.pk}", 100, ex=3600)
+        r.set(f"iquery:court_wait:{self.court_mowd.pk}", 1000, ex=3600)
+
+        court_wait_cacd = r.get(f"iquery:court_wait:{self.court_cacd.pk}")
+        self.assertEqual(court_wait_cacd, None)
+
+        monday = datetime(2025, 7, 21)
+        monday_local = timezone.make_aware(
+            monday, timezone.get_default_timezone()
+        )
+        for test in range(1, 5):
+            with self.subTest(test=test):
+                r.delete(f"iquery:court_wait:{self.court_cacd.pk}")
+                with (
+                    time_machine.travel(monday_local, tick=False),
+                    patch("cl.lib.decorators.time.sleep") as mock_sleep,
+                ):
+                    call_command(
+                        "probe_iquery_pages_daemon",
+                        testing_iterations=1,
+                    )
+
+                # Assertions for court_cacd empty probe.
+                # court_wait is set to one hour.
+                empty_probe_attempts = r.get(
+                    f"iquery:court_empty_probe_attempts:{self.court_cacd.pk}"
+                )
+                self.assertEqual(int(empty_probe_attempts), test)
+
+        mock_logger_daemon.info.assert_any_call(
+            "Skipping court %s for %s hours.",
+            self.court_hib.pk,
+            round(3600 / 3600, 2),
+        )
+
+        # Test one more attempt. The alert error should be triggered.
+        r.delete(f"iquery:court_wait:{self.court_cacd.pk}")
+        with (
+            time_machine.travel(monday_local, tick=False),
+            patch("cl.lib.decorators.time.sleep") as mock_sleep,
+        ):
+            call_command(
+                "probe_iquery_pages_daemon",
+                testing_iterations=1,
+            )
+
+        mock_logger.error.assert_called_with(
+            "Court %s has accumulated many probe attempts over "
+            "approximately %s hours. It appears the probe may be stuck; "
+            "manual intervention may be required.",
+            self.court_cacd.pk,
+            0.41,
+        )
+        court_wait = r.get(f"iquery:court_wait:{self.court_cacd.pk}")
+        self.assertEqual(int(court_wait), 3600)
+        court_empty_attempts = r.get(
+            f"iquery:court_empty_probe_attempts:{self.court_cacd.pk}"
+        )
+        self.assertEqual(int(court_empty_attempts), 0)
+
+    @patch(
+        "cl.corpus_importer.tasks.CaseQuery",
+        new=FakeCaseQueryReport,
+    )
+    @patch("cl.corpus_importer.tasks.logger")
+    @override_settings(
+        IQUERY_EMPTY_PROBES_LIMIT_HOURS={
+            "default": 60,
+            "vib": 120,
+        },
+        IQUERY_PROBE_WAIT=14_400,
+    )
+    def test_probe_iquery_pages_daemon_special_court_got_stuck(
+        self, mock_logger, mock_cookies
+    ):
+        """Test probe_iquery_pages_daemon when the probe daemon got stuck in a
+        special court after its hardcoded limit is reached.
+        """
+
+        r = get_redis_interface("CACHE")
+        r.hset("iquery:highest_known_pacer_case_id", self.court_vib.pk, 0)
+
+        # Set a big court_wait for the following courts in order to abort them in
+        # this test.
+        r.set(f"iquery:court_wait:{self.court_cand.pk}", 1000, ex=3600)
+        r.set(f"iquery:court_wait:{self.court_nysd.pk}", 1000, ex=3600)
+        r.set(f"iquery:court_wait:{self.court_canb.pk}", 1000, ex=3600)
+        r.set(f"iquery:court_wait:{self.court_gand.pk}", 1000, ex=3600)
+        r.set(f"iquery:court_wait:{self.court_txed.pk}", 1000, ex=3600)
+        r.set(f"iquery:court_wait:{self.court_hib.pk}", 1000, ex=3600)
+        r.set(f"iquery:court_wait:{self.court_gamb.pk}", 1000, ex=3600)
+        r.set(f"iquery:court_wait:{self.court_cacd.pk}", 1000, ex=3600)
+        r.set(f"iquery:court_wait:{self.court_mowd.pk}", 1000, ex=3600)
+
+        court_wait_cacd = r.get(f"iquery:court_wait:{self.court_vib.pk}")
+        self.assertEqual(court_wait_cacd, None)
+
+        monday = datetime(2025, 7, 21)
+        monday_local = timezone.make_aware(
+            monday, timezone.get_default_timezone()
+        )
+        for test in range(1, 30):
+            with self.subTest(test=test):
+                r.delete(f"iquery:court_wait:{self.court_vib.pk}")
+                with (
+                    time_machine.travel(monday_local, tick=False),
+                    patch("cl.lib.decorators.time.sleep") as mock_sleep,
+                ):
+                    call_command(
+                        "probe_iquery_pages_daemon",
+                        testing_iterations=1,
+                    )
+
+                # Assertions for court_vib empty probe.
+                # court_wait is set to one hour.
+                empty_probe_attempts = r.get(
+                    f"iquery:court_empty_probe_attempts:{self.court_vib.pk}"
+                )
+                self.assertEqual(
+                    int(empty_probe_attempts), test, "Wrong empty probes."
+                )
+
+        # Test one more attempt. The alert error should be triggered.
+        r.delete(f"iquery:court_wait:{self.court_vib.pk}")
+        with (
+            time_machine.travel(monday_local, tick=False),
+            patch("cl.lib.decorators.time.sleep") as mock_sleep,
+        ):
+            call_command(
+                "probe_iquery_pages_daemon",
+                testing_iterations=1,
+            )
+
+        mock_logger.error.assert_called_with(
+            "Court %s has accumulated many probe attempts over "
+            "approximately %s hours. It appears the probe may be stuck; "
+            "manual intervention may be required.",
+            self.court_vib.pk,
+            120,
+        )
+        court_wait = r.get(f"iquery:court_wait:{self.court_vib.pk}")
+        self.assertEqual(int(court_wait), 3600)
+        court_empty_attempts = r.get(
+            f"iquery:court_empty_probe_attempts:{self.court_vib.pk}"
+        )
+        self.assertEqual(int(court_empty_attempts), 0)
+
+    @patch(
+        "cl.corpus_importer.tasks.CaseQuery",
+        new=FakeCaseQueryReport,
+    )
+    @patch("cl.corpus_importer.tasks.logger")
+    @patch(
+        "cl.corpus_importer.management.commands.probe_iquery_pages_daemon.logger"
+    )
+    @override_settings(
+        IQUERY_EMPTY_PROBES_LIMIT_HOURS={
+            "default": 0.41,
+        },
+        IQUERY_PROBE_WAIT=300,
+    )
+    def test_probe_iquery_pages_daemon_ignores_empty_probes_on_weekends(
+        self, mock_logger_daemon, mock_logger, mock_cookies
+    ):
+        """Test probe_iquery_pages_daemon ignores empty probes on weekends.
+        Courts typically do not publish new cases on weekends.
+        """
+
+        r = get_redis_interface("CACHE")
+        r.hset("iquery:highest_known_pacer_case_id", self.court_cacd.pk, 0)
+
+        # Set a big court_wait for the following courts in order to abort them in
+        # this test.
+        r.set(f"iquery:court_wait:{self.court_cand.pk}", 1000, ex=3600)
+        r.set(f"iquery:court_wait:{self.court_nysd.pk}", 1000, ex=3600)
+        r.set(f"iquery:court_wait:{self.court_canb.pk}", 1000, ex=3600)
+        r.set(f"iquery:court_wait:{self.court_gand.pk}", 1000, ex=3600)
+        r.set(f"iquery:court_wait:{self.court_txed.pk}", 1000, ex=3600)
+        r.set(f"iquery:court_wait:{self.court_hib.pk}", 1000, ex=3600)
+        r.set(f"iquery:court_wait:{self.court_gamb.pk}", 1000, ex=3600)
+        r.set(f"iquery:court_wait:{self.court_vib.pk}", 100, ex=3600)
+        r.set(f"iquery:court_wait:{self.court_mowd.pk}", 1000, ex=3600)
+
+        court_wait_cacd = r.get(f"iquery:court_wait:{self.court_cacd.pk}")
+        self.assertEqual(court_wait_cacd, None)
+
+        saturday = datetime(2025, 7, 19)
+        saturday_local = timezone.make_aware(
+            saturday, timezone.get_default_timezone()
+        )
+        sunday = datetime(2025, 7, 20)
+        sunday_local = timezone.make_aware(
+            sunday, timezone.get_default_timezone()
+        )
+        for test in range(1, 6):
+            with self.subTest(test=test):
+                r.delete(f"iquery:court_wait:{self.court_cacd.pk}")
+                weekend_day = sunday_local if test % 2 == 0 else saturday_local
+                with (
+                    time_machine.travel(weekend_day, tick=False),
+                    patch("cl.lib.decorators.time.sleep") as mock_sleep,
+                ):
+                    call_command(
+                        "probe_iquery_pages_daemon",
+                        testing_iterations=1,
+                    )
+
+                # court_empty_probe_attempts for court 'cacd' shouldn't be
+                # incremented, since all empty probes are occurring over the
+                # weekend.
+                empty_probe_attempts = r.get(
+                    f"iquery:court_empty_probe_attempts:{self.court_cacd.pk}"
+                )
+                self.assertEqual(empty_probe_attempts, None)
+                mock_logger.info.assert_called_with(
+                    "Ignoring empty probe over the weekend for court %s - case IDs from %s to %s.",
+                    self.court_cacd.pk,
+                    str(0),
+                    str(416),
+                )
+
+    @patch(
+        "cl.scrapers.tasks.CaseQuery",
+        new=FakeCaseQueryReport,
+    )
+    def test_prevent_update_docket_info_iquery_from_triggering_sweeps(
+        self, mock_cookies
+    ):
+        """Confirm that update_latest_case_id_and_schedule_iquery_sweep is not
+        called by update_docket_info_iquery task.
+        """
+        # Connect handle_update_latest_case_id_and_schedule_iquery_sweep signal
+        # with a unique dispatch_uid for this test
+        test_dispatch_uid = (
+            "test_2_handle_update_latest_case_id_and_schedule_iquery_sweep"
+        )
+        post_save.connect(
+            handle_update_latest_case_id_and_schedule_iquery_sweep,
+            sender=Docket,
+            dispatch_uid=test_dispatch_uid,
+        )
+
+        with override_settings(IQUERY_SWEEP_UPLOADS_SIGNAL_ENABLED=False):
+            docket_gand = DocketFactory(
+                court=self.court_gand,
+                source=Docket.RECAP,
+                appeal_from=None,
+                case_name="GAND Docket",
+                docket_number="2:20-cv-00609",
+                pacer_case_id="8",
+            )
+
+            docket_cand = DocketFactory(
+                court=self.court_cand,
+                source=Docket.RECAP,
+                appeal_from=None,
+                case_name="CAND Docket",
+                docket_number="2:20-cv-00606",
+                pacer_case_id="16",
+            )
+        try:
+            r = get_redis_interface("CACHE")
+            r.hset("iquery:highest_known_pacer_case_id", self.court_gand.pk, 5)
+            # Test case with IQUERY_SWEEP_UPLOADS_SIGNAL_ENABLED=False
+            with (
+                override_settings(IQUERY_SWEEP_UPLOADS_SIGNAL_ENABLED=False),
+                patch(
+                    "cl.corpus_importer.signals.update_latest_case_id_and_schedule_iquery_sweep",
+                    side_effect=lambda *args,
+                    **kwargs: update_latest_case_id_and_schedule_iquery_sweep(
+                        *args, **kwargs
+                    ),
+                ) as mock_iquery_sweep,
+                self.captureOnCommitCallbacks(execute=True),
+                patch("cl.scrapers.tasks.get_or_cache_pacer_cookies"),
+            ):
+                update_docket_info_iquery.apply_async(
+                    args=(docket_gand.pk, docket_gand.court_id)
+                )
+
+            # update_latest_case_id_and_schedule_iquery_sweep shouldn't be called.
+            self.assertEqual(mock_iquery_sweep.call_count, 0)
+
+            # Test case with IQUERY_SWEEP_UPLOADS_SIGNAL_ENABLED=True
+            with (
+                override_settings(IQUERY_SWEEP_UPLOADS_SIGNAL_ENABLED=True),
+                patch(
+                    "cl.corpus_importer.signals.update_latest_case_id_and_schedule_iquery_sweep",
+                    side_effect=lambda *args,
+                    **kwargs: update_latest_case_id_and_schedule_iquery_sweep(
+                        *args, **kwargs
+                    ),
+                ) as mock_iquery_sweep,
+                self.captureOnCommitCallbacks(execute=True),
+                patch("cl.scrapers.tasks.get_or_cache_pacer_cookies"),
+            ):
+                update_docket_info_iquery.apply_async(
+                    args=(docket_cand.pk, docket_cand.court_id)
+                )
+
+            # update_latest_case_id_and_schedule_iquery_sweep shouldn't be called.
+            self.assertEqual(mock_iquery_sweep.call_count, 0)
+        finally:
+            # Ensure the signal is disconnected after the test
+            post_save.disconnect(
+                handle_update_latest_case_id_and_schedule_iquery_sweep,
+                sender=Docket,
+                dispatch_uid=test_dispatch_uid,
+            )
+
+    def test_nightly_pacer_updates_queries(self, mock_cookies):
+        """Test nightly_pacer_updates command queries."""
+
+        d_1 = DocketFactory(
+            source=Docket.RECAP,
+            court=self.court_canb,
+            appeal_from=None,
+            pacer_case_id="12345",
+            date_filed=None,
+            date_terminated=None,
+            case_name="",
+        )
+        d_2 = DocketFactory(
+            source=Docket.RECAP,
+            court=self.court_canb,
+            appeal_from=None,
+            pacer_case_id="12346",
+            date_filed=None,
+            date_terminated=date(2018, 11, 4),
+            case_name="",
+        )
+        two_weeks_ago = now() - timedelta(days=14)
+        with time_machine.travel(two_weeks_ago, tick=False):
+            d_3 = DocketFactory(
+                source=Docket.RECAP,
+                appeal_from=None,
+                court=self.court_canb,
+                pacer_case_id="12346",
+                date_filed=date(2018, 11, 4),
+                date_terminated=None,
+                case_name="",
+            )
+
+        user_profile = UserProfileWithParentsFactory()
+        DocketAlertFactory(
+            docket=d_2,
+            user=user_profile.user,
+            alert_type=DocketAlert.SUBSCRIPTION,
+        )
+        DocketAlertFactory(
+            docket=d_3,
+            user=user_profile.user,
+            alert_type=DocketAlert.SUBSCRIPTION,
+        )
+
+        # Confirm queries return the expected docket IDs
+        docket_ids = get_docket_ids_missing_info(5)
+        self.assertEqual(
+            set(docket_ids),
+            {d_1.pk, d_2.pk},
+            msg="Wrong IDs returned by get_docket_ids_missing_info",
+        )
+
+        docket_ids_alerts = get_docket_ids_docket_alerts()
+        self.assertEqual(
+            set(docket_ids_alerts),
+            {d_3.pk},
+            msg="Wrong IDs returned by get_docket_ids_docket_alerts",
+        )
+
+        docket_ids_no_case_name = get_docket_ids_week_ago_no_case_name()
+        self.assertEqual(
+            set(docket_ids_no_case_name),
+            {d_1.pk, d_2.pk},
+            msg="Wrong IDs returned by get_docket_ids_week_ago_no_case_name",
+        )
+
+    def test_can_retrieve_old_prayers_to_check(self, mock_cookies):
+        """Verifies retrieval of old, unchecked RECAP documents for 'pray and pay'."""
+        mock_date = now().replace(day=1, hour=5)
+        # Create DocketEntry instances with different filing dates
+        ten_days_old_entry = DocketEntryFactory(
+            date_filed=mock_date - timedelta(days=10)
+        )
+        ninety_one_days_old_entry = DocketEntryFactory(
+            date_filed=mock_date - timedelta(days=91)
+        )
+        ninety_five_days_old_entry = DocketEntryFactory(
+            date_filed=mock_date - timedelta(days=95)
+        )
+
+        # Create RECAPDocument instances associated with the DocketEntry instances
+        rd_1 = RECAPDocumentFactory(docket_entry=ten_days_old_entry)
+        rd_2 = RECAPDocumentFactory(
+            docket_entry=ninety_one_days_old_entry,
+        )
+        rd_3 = RECAPDocumentFactory(
+            docket_entry=ninety_one_days_old_entry,
+            document_type=RECAPDocument.ATTACHMENT,
+            attachment_number=1,
+        )
+        rd_4 = RECAPDocumentFactory(
+            docket_entry=ninety_five_days_old_entry,
+        )
+        rd_5 = RECAPDocumentFactory(
+            docket_entry=ninety_five_days_old_entry,
+            document_type=RECAPDocument.ATTACHMENT,
+            attachment_number=1,
+        )
+
+        # Simulate PrayerAvailability records with different last_checked dates
+        PrayerAvailability.objects.create(
+            recap_document=rd_1, last_checked=mock_date - timedelta(days=3)
+        )
+        PrayerAvailability.objects.create(
+            recap_document=rd_2, last_checked=mock_date - timedelta(days=3)
+        )
+        PrayerAvailability.objects.create(
+            recap_document=rd_3, last_checked=mock_date - timedelta(days=1)
+        )
+        PrayerAvailability.objects.create(
+            recap_document=rd_4, last_checked=mock_date - timedelta(days=7)
+        )
+        PrayerAvailability.objects.create(
+            recap_document=rd_5, last_checked=mock_date - timedelta(days=2)
+        )
+
+        # Retrieve the RECAP documents that should be checked
+        with time_machine.travel(mock_date, tick=False):
+            recap_documents = get_recap_documents_pray_and_pay()
+
+        self.assertIn(rd_2, recap_documents)
+        self.assertIn(rd_4, recap_documents)
+        # Not old enough
+        self.assertNotIn(rd_1, recap_documents)
+        # Not expected: Last Checked on the same day it should have been unsealed
+        self.assertNotIn(rd_3, recap_documents)
+        # Not expected: Checked after it should have been unsealed
+        self.assertNotIn(rd_5, recap_documents)
+
+    def test_get_latest_pacer_case_id_for_courts(self, mock_cookies):
+        """Test get_latest_pacer_case_id_for_courts helper."""
+        today = date.today()
+        d_canb_old = DocketFactory(
+            court=self.court_canb,
+            appeal_from=None,
+            source=Docket.RECAP,
+            pacer_case_id="23000",
+            date_filed=date(2018, 11, 4),
+        )
+        d_canb_latest = DocketFactory(
+            court=self.court_canb,
+            appeal_from=None,
+            source=Docket.RECAP,
+            pacer_case_id="43000",
+            date_filed=today,
+        )
+        d_cand_old = DocketFactory(
+            court=self.court_cand,
+            appeal_from=None,
+            source=Docket.RECAP,
+            pacer_case_id="103000",
+            date_filed=date(2018, 11, 4),
+        )
+        d_cand_latest = DocketFactory(
+            court=self.court_cand,
+            appeal_from=None,
+            source=Docket.RECAP,
+            pacer_case_id="209000",
+            date_filed=today,
+        )
+
+        call_command(
+            "ready_mix_cases_project",
+            task="set-latest-case-ids",
+            court_type="all",
+        )
+
+        r = get_redis_interface("CACHE")
+        latest_court_ids = get_latest_pacer_case_id_for_courts(
+            [self.court_cand.pk, self.court_canb.pk, self.court_mowd.pk], r
+        )
+        # The latest pacer_case_id from each court should be returned.
+        self.assertEqual(
+            latest_court_ids[self.court_cand.pk],
+            int(d_cand_latest.pacer_case_id),
+        )
+        self.assertEqual(
+            latest_court_ids[self.court_canb.pk],
+            int(d_canb_latest.pacer_case_id),
+        )
+
+    @patch(
+        "cl.scrapers.tasks.CaseQuery",
+        new=FakeCaseQueryReport,
+    )
+    @patch(
+        "cl.corpus_importer.tasks.CaseQuery",
+        new=FakeCaseQueryReport,
+    )
+    def test_perform_fixed_sweeps_when_court_is_not_up_to_date(
+        self, mock_cookies
+    ):
+        """Confirm that the iquery probe command performs a fixed sweep when it
+        is known that there is a more recent pacer_case_id in DB.
+        """
+
+        with override_settings(IQUERY_SWEEP_UPLOADS_SIGNAL_ENABLED=False):
+            today = date.today()
+            DocketFactory(
+                court=self.court_mowd,
+                appeal_from=None,
+                source=Docket.RECAP,
+                case_name="MOWD Docket 2",
+                docket_number="2:20-cv-006032",
+                pacer_case_id="3021",
+                date_filed=today,
+            )
+
+        # Set latest know pacer_case_ids and store in Redis.
+        call_command(
+            "ready_mix_cases_project",
+            task="set-latest-case-ids",
+            court_type="all",
+        )
+
+        dockets = Docket.objects.all()
+        self.assertEqual(dockets.count(), 1)
+        r = get_redis_interface("CACHE")
+        r.hset("iquery:highest_known_pacer_case_id", self.court_mowd.pk, 3000)
+        r.hset("iquery:pacer_case_id_current", self.court_mowd.pk, 3000)
+
+        # Set a big court_wait for the following courts in order to abort them in
+        # this test.
+        r.set(f"iquery:court_wait:{self.court_canb.pk}", 1000, ex=3600)
+        r.set(f"iquery:court_wait:{self.court_cand.pk}", 1000, ex=3600)
+        r.set(f"iquery:court_wait:{self.court_nysd.pk}", 1000, ex=3600)
+        r.set(f"iquery:court_wait:{self.court_gamb.pk}", 1000, ex=3600)
+        r.set(f"iquery:court_wait:{self.court_hib.pk}", 1000, ex=3600)
+        r.set(f"iquery:court_wait:{self.court_gand.pk}", 1000, ex=3600)
+        r.set(f"iquery:court_wait:{self.court_txed.pk}", 1000, ex=3600)
+        r.set(f"iquery:court_wait:{self.court_cacd.pk}", 1000, ex=3600)
+        r.set(f"iquery:court_wait:{self.court_vib.pk}", 1000, ex=3600)
+
+        with (
+            override_settings(
+                IQUERY_SWEEP_UPLOADS_SIGNAL_ENABLED=True, IQUERY_FIXED_SWEEP=10
+            ),
+            patch("cl.lib.decorators.time.sleep") as mock_sleep,
+            patch(
+                "cl.corpus_importer.tasks.query_iquery_page",
+                return_value=({}, ""),
+            ) as mock_query_iquery_page,
+        ):
+            call_command(
+                "probe_iquery_pages_daemon",
+                testing_iterations=1,
+            )
+
+        # query_iquery_page should be called only one time on fixed sweep mode.
+        self.assertEqual(
+            mock_query_iquery_page.call_count,
+            1,
+            "query_iquery_page shouldn't be called.",
+        )
+
+        highest_known_pacer_case_id = r.hget(
+            "iquery:highest_known_pacer_case_id", self.court_mowd.pk
+        )
+        pacer_case_id_current = r.hget(
+            "iquery:pacer_case_id_current", self.court_mowd.pk
+        )
+        self.assertEqual(int(highest_known_pacer_case_id), 3010)
+        self.assertEqual(int(pacer_case_id_current), 3009)
+
+        # No additional dockets have been added at this point.
+        self.assertEqual(
+            dockets.count(), 1, msg="Docket number doesn't match."
+        )
+
+        with (
+            override_settings(
+                IQUERY_SWEEP_UPLOADS_SIGNAL_ENABLED=True, IQUERY_FIXED_SWEEP=10
+            ),
+            patch("cl.lib.decorators.time.sleep") as mock_sleep,
+            patch(
+                "cl.corpus_importer.tasks.query_iquery_page",
+                return_value=({}, ""),
+            ) as mock_query_iquery_page,
+        ):
+            call_command(
+                "probe_iquery_pages_daemon",
+                testing_iterations=1,
+            )
+
+        # 3 additional dockets should exist the sweep is completed.
+        self.assertEqual(
+            dockets.count(), 4, msg="Docket number doesn't match."
+        )
+        highest_known_pacer_case_id = r.hget(
+            "iquery:highest_known_pacer_case_id", self.court_mowd.pk
+        )
+        pacer_case_id_current = r.hget(
+            "iquery:pacer_case_id_current", self.court_mowd.pk
+        )
+        self.assertEqual(int(highest_known_pacer_case_id), 3020)
+        self.assertEqual(int(pacer_case_id_current), 3019)
+
+        # Test switching to exploration mode when reaching the latest known PACER case ID.
+        test_dispatch_uid = (
+            "test_fixed_handle_update_latest_case_id_and_schedule_iquery_sweep"
+        )
+        post_save.connect(
+            handle_update_latest_case_id_and_schedule_iquery_sweep,
+            sender=Docket,
+            dispatch_uid=test_dispatch_uid,
+        )
+        try:
+            with (
+                override_settings(
+                    IQUERY_SWEEP_UPLOADS_SIGNAL_ENABLED=True,
+                    IQUERY_FIXED_SWEEP=10,
+                ),
+                patch("cl.lib.decorators.time.sleep") as mock_sleep,
+                self.captureOnCommitCallbacks(execute=True),
+            ):
+                call_command(
+                    "probe_iquery_pages_daemon",
+                    testing_iterations=1,
+                )
+
+            # 1 additional dockets should be added during the exploration mode.
+            self.assertEqual(
+                dockets.count(), 5, msg="Docket number doesn't match."
+            )
+            highest_known_pacer_case_id = r.hget(
+                "iquery:highest_known_pacer_case_id", self.court_mowd.pk
+            )
+            pacer_case_id_current = r.hget(
+                "iquery:pacer_case_id_current", self.court_mowd.pk
+            )
+            self.assertEqual(int(highest_known_pacer_case_id), 3022)
+            self.assertEqual(int(pacer_case_id_current), 3021)
+        finally:
+            # Ensure the signal is disconnected after the test
+            post_save.disconnect(
+                handle_update_latest_case_id_and_schedule_iquery_sweep,
+                sender=Docket,
+                dispatch_uid=test_dispatch_uid,
+            )
+
+
+class WestCitationImportTest(TestCase):
+    def test_parse_citation(self) -> None:
+        """Test parse citation for federal and journal citations"""
+        correct_response = [
+            {
+                "volume": "238",
+                "reporter": "F.3d",
+                "page": "273",
+                "type": Citation.FEDERAL,
+            },
+            {
+                "volume": "72",
+                "reporter": "Soc. Serv. Rev.",
+                "page": "318",
+                "type": Citation.JOURNAL,
+            },
+        ]
+        citation_strings = ["238 F.3d 273", "72 Soc.Sec.Rep.Serv. 318"]
+        valid_citations = parse_citations(citation_strings)
+        self.assertEqual(
+            valid_citations, correct_response, msg="Citations incorrect parsed"
+        )
+
+
+class CaseNamesTest(SimpleTestCase):
+    def test_check_case_names_match(self) -> None:
+        """Can we check if the case names match?"""
+        case_names_tests = (
+            (
+                "U.S. v. Smith",
+                "United States v. Smith",
+                True,
+            ),
+            (
+                "United States v. Guerrero-Martinez",  # 736793
+                "United States v. Hector Guerrero-Martinez, AKA Hector Guerrero AKA Hector Martinez-Guerrero",
+                True,
+            ),
+            (
+                "In re CP",  # 2140442
+                "In Re CP",
+                True,
+            ),
+            (
+                "Dennis v. City of Easton",  # 730246
+                "Richard Dennis, Penelope Dennis, Loretta M. Dennis v. City of Easton, Edward J. Ferraro, Robet S. Stein, Doris Asteak, Paul Schleuter, Howard B. White, Easton Board of Health",
+                True,
+            ),
+            (
+                "Parmelee v. Bruggeman",  # 736598
+                "Allan Parmelee v. Milford Bruggeman Janine Bruggeman Friend of the Court for the State of Michigan Nancy Rose, Employee of the State of Michigan for the Friend of the Court Glenda Friday, Employee of the State of Michigan for the Friend of the Court Karen Dunn, Employee of the State of Michigan for the Friend of the Court Thomas Kreckman, Employee of the State of Michigan for the Friend of the Court State of Michigan",
+                True,
+            ),
+            (
+                "Automobile Assur. Financial Corp. v. Syrett Corp.",  # 735935
+                "Automobile Assurance Financial Corporation, a Utah Corporation Venuti and Associates, Inc., a Utah Corporation Venuti Partners, Ltd., a Utah Limited Partnership Frank P. Venuti, an Individual, Parker M. Nielson v. Syrett Corporation, a Delaware Corporation, Formerly a Utah Corporation, John R. Riley, an Individual, Third-Party-Defendant",
+                True,
+            ),
+            (
+                "Christopher Ambroze, M.D., PC v. Aetna Health Plans of New York, Inc.",  # 735476
+                "Christopher Ambroze, M.D., P.C., Rockville Anesthesia Group, Llp, Harvey Finkelstein, Plainview Anesthesiologists, P.C., Joseph A. Singer, Atlantic Anesthesia Associates, P.C. v. Aetna Health Plans of New York, Inc., Aetna Health Management, Inc., Aetna Life and Casualty Company, C. Frederick Berger, and Gregg Stolzberg",
+                True,
+            ),
+            (
+                "O'Neal v. Merkel",  # 730350
+                "Terence Kenneth O'Neal v. T.E. Merkel Nurse Cashwell Nurse Allen Nurse Davis Mr. Conn, and Franklin E. Freeman, Jr. Gary Dixon Doctor Lowy Doctor Shaw Doctor Castalloe Harry Allsbrook Mr. Cherry",
+                True,
+            ),
+        )
+        for wl_casename, cl_casename, overlap in case_names_tests:
+            self.assertEqual(
+                check_case_names_match(wl_casename, cl_casename),
+                overlap,
+                msg=f"Case names don't match: {wl_casename} - {cl_casename}",
+            )
+
+
+class AWSManifestTest(TestCase):
+    def setUp(self) -> None:
+        self.r = get_redis_interface("CACHE")
+
+    @patch(
+        "cl.corpus_importer.management.commands.make_aws_manifest_files.compute_monthly_export"
+    )
+    def test_skips_export_if_previous_timestamp_doesnt_exists(
+        self, mock_compute_monthly_export
+    ):
+        """Verifies the command skips monthly export if no previous timestamp is found."""
+        # Ensure no previous timestamp exists in redis
+        export_key = f"bulk_import:{SEARCH_TYPES.OPINION}"
+        self.r.delete(export_key)
+
+        call_command(
+            "make_aws_manifest_files",
+            record_type=SEARCH_TYPES.OPINION,
+            bucket_name="test-bucket",
+            monthly_export=True,
+        )
+        # Assert that compute_monthly_export was NOT called,
+        # indicating the timestamp check prevented execution.
+        mock_compute_monthly_export.assert_not_called()
+
+    @patch(
+        "cl.corpus_importer.management.commands.make_aws_manifest_files.compute_monthly_export"
+    )
+    def test_command_stores_current_timestamp_after_delta_export(
+        self, mock_compute_monthly_export
+    ):
+        """Verifies the command stores the current timestamp after an export."""
+        timestamp_two_weeks_ago = datetime.now() - timedelta(weeks=2)
+        export_key = f"bulk_import:{SEARCH_TYPES.ORAL_ARGUMENT}"
+        self.r.set(export_key, str(timestamp_two_weeks_ago), 60 * 60)
+
+        timestamp_now = timezone.now()
+        with time_machine.travel(timestamp_now, tick=False):
+            call_command(
+                "make_aws_manifest_files",
+                record_type=SEARCH_TYPES.ORAL_ARGUMENT,
+                bucket_name="test-bucket",
+                monthly_export=True,
+            )
+        # Assert that compute_monthly_export was called
+        mock_compute_monthly_export.assert_called_once()
+
+        # Assert that the timestamp retrieved from Redis is the expected current
+        # timestamp
+        timestamp_from_cache = self.r.get(export_key)
+        self.assertEqual(str(timestamp_now), timestamp_from_cache)
+
+    @patch(
+        "cl.corpus_importer.management.commands.make_aws_manifest_files.export_records_in_batches"
+    )
+    @patch(
+        "cl.corpus_importer.management.commands.make_aws_manifest_files.compute_monthly_export"
+    )
+    def test_command_stores_current_timestamp_after_full_export(
+        self, mock_compute_monthly_export, mock_compute_full_export
+    ):
+        """Verifies the command stores the current timestamp after a full export."""
+        timestamp_two_weeks_ago = datetime.now() - timedelta(weeks=2)
+        export_key = f"bulk_import:{SEARCH_TYPES.ORAL_ARGUMENT}"
+        self.r.set(export_key, str(timestamp_two_weeks_ago), 60 * 60)
+
+        timestamp_now = timezone.now()
+        with time_machine.travel(timestamp_now, tick=False):
+            call_command(
+                "make_aws_manifest_files",
+                record_type=SEARCH_TYPES.ORAL_ARGUMENT,
+                bucket_name="test-bucket",
+                all_records=True,
+            )
+        # Assert that compute_monthly_export was not called
+        mock_compute_monthly_export.assert_not_called()
+
+        mock_compute_full_export.assert_called_once()
+
+        # Assert that the timestamp retrieved from Redis is the expected current
+        # timestamp
+        timestamp_from_cache = self.r.get(export_key)
+        self.assertEqual(str(timestamp_now), timestamp_from_cache)
+
+    def test_can_get_recent_records_from_nested_models(self):
+        """Verifies get_monthly_record_ids_by_type returns records updated
+        directly or through related models."""
+        last_export_timestamp = datetime.now() - timedelta(weeks=1)
+        school = SchoolFactory(name="New York Law School")
+        # Create older Person records with associated nested objects
+        with time_machine.travel(
+            last_export_timestamp - timedelta(weeks=1), tick=False
+        ):
+            person_1 = PersonFactory.create(gender="m")
+            ABARatingFactory(person=person_1, year_rated=2005)
+            EducationFactory(person=person_1, school=school)
+            PositionFactory(person=person_1)
+            PositionFactory(person=person_1)
+
+            person_2 = PersonFactory.create()
+            rating_person_2 = ABARatingFactory(
+                person=person_2, rating="q", year_rated=2005
+            )
+            EducationFactory(person=person_2, school=school)
+            PositionFactory(person=person_2)
+
+            person_3 = PersonFactory.create(gender="m")
+            ABARatingFactory(person=person_3, year_rated=2005)
+            EducationFactory(person=person_3, school=school)
+            PositionFactory(person=person_3)
+
+            person_4 = PersonFactory.create(gender="m")
+            ABARatingFactory(person=person_4, year_rated=2005)
+            EducationFactory(person=person_4, school=school)
+            PositionFactory(person=person_4)
+
+            person_5 = PersonFactory.create()
+            ABARatingFactory(person=person_5, year_rated=2005)
+            EducationFactory(person=person_5, school=school)
+            position_person_5 = PositionFactory(person=person_5)
+
+            person_6 = PersonFactory()
+            PositionFactory(person=person_6)
+
+            person_7 = PersonFactory()
+            ABARatingFactory(person=person_7, year_rated=2004)
+            PositionFactory(person=person_7)
+
+            # Create more older person records
+            PersonFactory.create_batch(3)
+
+        school_2 = SchoolFactory(name="American University")
+        # Update existing Person records or their related nested objects
+        with time_machine.travel(
+            last_export_timestamp + timedelta(days=2), tick=False
+        ):
+            person_1.name_first = "New name"
+            person_1.save()
+
+            rating_person_2.rating = "wq"
+            rating_person_2.save()
+
+            ABARatingFactory(person=person_3, year_rated=2020)
+            EducationFactory(person=person_4, school=school_2)
+
+            position_person_5.position_type = Position.JUSTICE
+            position_person_5.save()
+
+            PoliticalAffiliationFactory(person=person_6)
+
+            person_8 = PersonFactory()
+            PositionFactory(person=person_8)
+
+            # Create new Person records
+            PersonFactory.create_batch(10)
+
+        records = get_monthly_record_ids_by_type(
+            SEARCH_TYPES.PEOPLE, last_export_timestamp
+        )
+
+        # Check the total number of returned records
+        # Should include the 6 updated/affected old records and 1 newly created
+        # record
+        self.assertEqual(len(records), 7)
+
+        record_ids = [x[0] for x in records]
+        # Assert that the updated/affected old records are included
+        # Person_1's name was updated
+        self.assertIn(person_1.id, record_ids)
+        # A related ABARating was updated
+        self.assertIn(person_2.id, record_ids)
+        # A new related ABARating was created
+        self.assertIn(person_3.id, record_ids)
+        # A new related Education was created
+        self.assertIn(person_4.id, record_ids)
+        # A related Position was updated
+        self.assertIn(person_5.id, record_ids)
+        # A new related PoliticalAffiliation was created
+        self.assertIn(person_6.id, record_ids)
+        # A new record with a Judge position
+        self.assertIn(person_8.id, record_ids)
+        # Assert that the old record that was not updated is NOT included
+        self.assertNotIn(person_7.id, record_ids)
+
+    def test_get_monthly_harvard_non_ocr_opinions(self):
+        """Verifies retrieval of Harvard Law, non-OCR opinion IDs"""
+        last_export_timestamp = datetime.now() - timedelta(weeks=1)
+        # Create opinions with different sources and OCR status before the
+        # timestamp
+        with time_machine.travel(
+            last_export_timestamp - timedelta(weeks=1), tick=False
+        ):
+            opinion_1 = OpinionWithParentsFactory(
+                cluster=OpinionClusterFactory(
+                    source=SOURCES.HARVARD_CASELAW, docket=DocketFactory()
+                ),
+                extracted_by_ocr=False,
+            )
+            opinion_2 = OpinionWithParentsFactory(
+                cluster=OpinionClusterFactory(
+                    source=SOURCES.HARVARD_CASELAW, docket=DocketFactory()
+                ),
+                extracted_by_ocr=False,
+            )
+            opinion_3 = OpinionWithParentsFactory(
+                cluster=OpinionClusterFactory(
+                    source=SOURCES.COURT_WEBSITE, docket=DocketFactory()
+                ),
+                extracted_by_ocr=True,
+            )
+
+        # Create and update opinions after the timestamp
+        with time_machine.travel(
+            last_export_timestamp + timedelta(days=2), tick=False
+        ):
+            opinion_1.author_str = "Author updated"
+            opinion_1.save()
+            opinion_3.author_str = "Author updated"
+            opinion_3.save()
+            opinion_4 = OpinionWithParentsFactory(
+                cluster=OpinionClusterFactory(
+                    source=SOURCES.COLUMBIA_ARCHIVE, docket=DocketFactory()
+                ),
+                extracted_by_ocr=True,
+            )
+            opinion_5 = OpinionWithParentsFactory(
+                cluster=OpinionClusterFactory(
+                    source=SOURCES.HARVARD_CASELAW, docket=DocketFactory()
+                ),
+                extracted_by_ocr=False,
+            )
+
+        records = get_monthly_record_ids_by_type(
+            SEARCH_TYPES.OPINION, last_export_timestamp
+        )
+        # Check the total number of returned records
+        print(records)
+        self.assertEqual(len(records), 2)
+
+        record_ids = [x[0] for x in records]
+        # Updated after timestamp, Harvard, not OCR
+        self.assertIn(opinion_1.id, record_ids)
+        # Created after timestamp, Harvard, not OCR
+        self.assertIn(opinion_5.id, record_ids)
+        # Created before timestamp, not updated
+        self.assertNotIn(opinion_2.id, record_ids)
+        # Created after timestamp, but OCR'd and not Harvard
+        self.assertNotIn(opinion_4.id, record_ids)
+        # Updated after timestamp, but OCR'd and Not Harvard
+        self.assertNotIn(opinion_4.id, record_ids)
+
+    def test_can_get_recent_records_from_flat_models(self):
+        """Verifies get_monthly_record_ids_by_type returns records created or
+        updated after a timestamp for flat models."""
+        last_export_timestamp = datetime.now() - timedelta(weeks=1)
+
+        # Create some old audio records
+        with time_machine.travel(
+            last_export_timestamp - timedelta(weeks=1), tick=False
+        ):
+            old_audio_1 = AudioFactory()
+            old_audio_2 = AudioFactory()
+            old_audio_3 = AudioFactory()
+            for _ in range(4):
+                AudioFactory()
+
+        # Update two of the older records and create new ones after the
+        # timestamp
+        with time_machine.travel(
+            last_export_timestamp + timedelta(days=2), tick=False
+        ):
+            old_audio_1.case_name = "Oral argument updated 1"
+            old_audio_1.save()
+
+            old_audio_2.case_name = "Oral argument updated 2"
+            old_audio_2.save()
+            for _ in range(8):
+                AudioFactory()
+
+        records = get_monthly_record_ids_by_type(
+            SEARCH_TYPES.ORAL_ARGUMENT, last_export_timestamp
+        )
+        # Check the total number of returned records
+        # Should include the 2 updated old records and the 8 newly created
+        # records
+        self.assertEqual(len(records), 10)
+
+        record_ids = [x[0] for x in records]
+        # Verify that the updated records are included
+        self.assertIn(old_audio_1.id, record_ids)
+        self.assertIn(old_audio_2.id, record_ids)
+        # Verify that the old record that was not updated is NOT included
+        self.assertNotIn(old_audio_3.id, record_ids)
+
+
+class LlmTest(TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        cls.court_ga = CourtFactory(id="gasd")
+        cls.opinion_cluster = OpinionClusterWithChildrenAndParentsFactory(
+            docket=DocketFactory(
+                court=cls.court_ga,
+                case_name="Carrecter v. Herrin",
+            ),
+            case_name="Carrecter v. Herrin",
+            case_name_short="Carrecter",
+            date_filed=date.today(),
+            sub_opinions=RelatedFactory(
+                OpinionWithChildrenFactory,
+                factory_related_name="cluster",
+                plain_text="IN THE UNITED STATES DISTRICT COURT \nFOR THE SOUTHERN DISTRICT OF GEORGIA \nSTATESBORO DIVISION \n\nJMARKUS CARRECTER, \nPlaintiff,                           CIVIL ACTION NO.: 6:25-cv-17 \n      Vv.\nGEORGE HERRIN, JR., TYRONE OLIVER,  | \nand GREGORY DOZIER, \n            Defendants. \n\nORDER \n     The  Magistrate  Judge  issued  a  Report  and  Recommendation  for the  Court  to  dismiss \nPlaintiff's  cause  of  action.   Doc.  7.   Plaintiff did  not  file  Objections  to  this  Report  and \nRecommendation, and the time to do so has elapsed.  Accordingly, upon review, I find no clear \nerror  in  the  Magistrate  Judge’s  Report  and  Recommendation  and  ADOPT  the  Report  and \nRecommendation as the opinion of the Court.  See Macort v. Prem, Inc., 208 F. App’x 781, 784 \n(11th  Cir,  2006)  (If no  specific  objections  are  made  or  no  objections  are  made  at  all,  “the \nappropriate standard of review for the report and recommendation is clear error.”).  1 DISMISS \nwithout prejudice Plaintiffs Complaint, DIRECT the Clerk of Court to CLOSE this case and \nenter the appropriate judgment of dismissal, and DENY Plaintiff leave to file in forma pauperis. \n     SO ORDERED, this        day of September, 2025. \n\n                                               GL: \n                         /              BOL \n                        /       HONORABLEY’RANDAL HALL \n                        \\     UNITED STATES DISTRICT COURT \n                              SOUTHERN DISTRICT OF GEORGIA ",
+            ),
+        )
+
+        cls.de = DocketEntryFactory(
+            docket=cls.opinion_cluster.docket,
+            entry_number=8,
+        )
+        cls.recap_doc = RECAPDocumentFactory(
+            docket_entry=cls.de,
+            pacer_doc_id="05705053987",
+            document_number="8",
+            document_type=RECAPDocument.PACER_DOCUMENT,
+        )
+
+        cls.valid_response = CaseNameExtractionResponse(
+            is_opinion=True,
+            case_name_short="Carrecter",
+            case_name="'Carrecter v. Herri",
+            case_name_full="JMARKUS CARRECTER, Plaintiff, v. GEORGE HERRIN, JR., TYRONE OLIVER, and GREGORY DOZIER, Defendants.",
+            case_name_match=True,
+            needs_ocr=False,
+            error=None,
+        )
+
+    @mock.patch.dict(
+        "os.environ", {"OPENAI_CASE_LAW_INFERENCE_KEY": "123"}, clear=True
+    )
+    @mock.patch("cl.corpus_importer.tasks.call_llm")
+    def test_classify_opinion_case_name_task_updates_fields(
+        self, mock_call_llm
+    ):
+        """Verifies that the classify_opinion_case_name_task updates OpinionCluster fields correctly"""
+        mock_call_llm.return_value = self.valid_response
+
+        classify_case_name_by_llm(self.opinion_cluster.pk, self.recap_doc.pk)
+
+        self.opinion_cluster.refresh_from_db()
+
+        self.assertEqual(
+            self.opinion_cluster.case_name_full,
+            "JMARKUS CARRECTER, Plaintiff, v. GEORGE HERRIN, JR., TYRONE OLIVER, and GREGORY DOZIER, Defendants.",
+        )
+
+    @mock.patch("cl.corpus_importer.tasks.call_llm")
+    @mock.patch.dict(
+        "os.environ", {"OPENAI_CASE_LAW_INFERENCE_KEY": "123"}, clear=True
+    )
+    @mock.patch.object(classify_case_name_by_llm, "retry", autospec=True)
+    def test_classify_opinion_case_name_task_retries_on_ratelimit(
+        self, mock_retry, mock_call_llm
+    ):
+        """Tests that the task retries once when call_llm raises a RateLimitError,
+        then proceeds successfully with a valid response on retry.
+        """
+
+        error_body = b'{"error":{"message":"Rate limit exceeded","type":"rate_limit_exceeded"}}'
+        mock_response = MockResponse(429, error_body)
+        setattr(mock_response, "request", {})
+        setattr(mock_response, "headers", {"x-request-id": "1"})
+
+        # Side effect list: raise first, then return success json on retry
+        side_effects = [
+            RateLimitError(
+                "Rate limit exceeded", response=mock_response, body=error_body
+            ),
+            self.valid_response,
+        ]
+
+        def call_llm_side_effect(*args, **kwargs):
+            result = side_effects.pop(0)
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        mock_call_llm.side_effect = call_llm_side_effect
+
+        # patch retry so it raises celery.exceptions.Retry
+        mock_retry.side_effect = Retry()
+
+        with self.assertRaises(Retry):
+            # expected retry exception
+            classify_case_name_by_llm(
+                self.opinion_cluster.pk, self.recap_doc.pk
+            )
+
+        mock_retry.assert_called_once()
+
+        # After retry exception, manually call the task again with successful mock response
+        # to simulate the retry handling completing successfully.
+        mock_call_llm.side_effect = None
+        mock_call_llm.return_value = self.valid_response
+
+        classify_case_name_by_llm(self.opinion_cluster.pk, self.recap_doc.pk)
+        self.opinion_cluster.refresh_from_db()
+
+        self.assertEqual(
+            self.opinion_cluster.case_name_full,
+            "JMARKUS CARRECTER, Plaintiff, v. GEORGE HERRIN, JR., TYRONE OLIVER, and GREGORY DOZIER, Defendants.",
+        )
+
+    @mock.patch("cl.corpus_importer.tasks.call_llm")
+    @mock.patch("cl.corpus_importer.tasks.logger")
+    @mock.patch.dict(
+        "os.environ", {"OPENAI_CASE_LAW_INFERENCE_KEY": "123"}, clear=True
+    )
+    def test_classify_case_name_by_llm_handles_validation_error(
+        self, mock_logger, mock_call_llm
+    ):
+        """Test that classify_case_name_by_llm catches Pydantic ValidationError from call_llm and handles it correctly
+        by logging and returning without an exception
+        """
+
+        mock_call_llm.side_effect = ValidationError.from_exception_data(
+            "Invalid data", line_errors=[]
+        )
+
+        result = classify_case_name_by_llm(
+            self.opinion_cluster.pk, self.recap_doc.pk
+        )
+
+        self.assertIsNone(result)
+
+        # Logger.error should have been called at least once with validation error message
+        mock_logger.error.assert_called()
+        called_messages = [
+            args[0] for args, _ in mock_logger.error.call_args_list
+        ]
+        self.assertTrue(
+            any(
+                "validation error" in message.lower()
+                for message in called_messages
+            )
         )

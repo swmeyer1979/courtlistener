@@ -1,7 +1,7 @@
 # Functions to parse court data in XML format into a list of dictionaries.
 import os
 import re
-import xml.etree.cElementTree as ET
+import xml.etree.ElementTree as ET
 
 import dateutil.parser as dparser
 from juriscraper.lib.string_utils import (
@@ -66,7 +66,7 @@ def parse_file(file_path):
     )
     if not info["court_id"]:
         raise Exception(
-            f"Failed to find a court ID for \"{''.join(raw_info.get('court', []))}\"."
+            f'Failed to find a court ID for "{"".join(raw_info.get("court", []))}".'
         )
 
     # get the full panel text and extract judges from it
@@ -152,8 +152,8 @@ def parse_file(file_path):
                 o for o in info["opinions"] if o["type"] == current_type
             ]
             if relevant_opinions:
-                relevant_opinions[-1]["opinion"] += "\n%s" % "\n".join(
-                    last_texts
+                relevant_opinions[-1]["opinion"] += "\n{}".format(
+                    "\n".join(last_texts)
                 )
                 relevant_opinions[-1]["opinion_texts"].extend(last_texts)
             else:
@@ -205,7 +205,7 @@ def get_text(file_path):
 
     :param file_path: A path the file to be parsed.
     """
-    with open(file_path, "r") as f:
+    with open(file_path) as f:
         file_string = f.read()
     raw_info = {}
 
@@ -282,9 +282,11 @@ def get_text(file_path):
                 raw_info.setdefault("opinions", []).append(
                     {
                         "type": opinion_type,
-                        "byline": current_byline["name"]
-                        if current_byline["type"] == opinion_type
-                        else None,
+                        "byline": (
+                            current_byline["name"]
+                            if current_byline["type"] == opinion_type
+                            else None
+                        ),
                         "opinion": get_xml_string(child),
                     }
                 )
@@ -310,7 +312,7 @@ def get_xml_string(e):
     :param e: An XML element.
     """
     inner_string = re.sub(
-        r"(^<%s\b.*?>|</%s\b.*?>$)" % (e.tag, e.tag), "", ET.tostring(e)
+        rf"(^<{e.tag}\b.*?>|</{e.tag}\b.*?>$)", "", ET.tostring(e)
     )
     return inner_string.decode().strip()
 
@@ -396,7 +398,7 @@ def get_state_court_object(raw_court, file_path):
 
     # this messes up for, e.g. 'St. Louis', and 'U.S. Circuit Court, but works
     # for all others
-    if "." in raw_court and not any([s in raw_court for s in ["St.", "U.S"]]):
+    if "." in raw_court and not any(s in raw_court for s in ["St.", "U.S"]):
         j = raw_court.find(".")
         r = raw_court[:j]
 

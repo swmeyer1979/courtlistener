@@ -41,8 +41,9 @@ class RssFeedStatus(AbstractDateTimeModel):
         blank=True,
     )
     status = models.SmallIntegerField(
-        help_text="The current status of this feed. Possible values are: %s"
-        % ", ".join(["(%s): %s" % (t[0], t[1]) for t in PROCESSING_STATUSES]),
+        help_text="The current status of this feed. Possible values are: {}".format(
+            ", ".join(f"({t[0]}): {t[1]}" for t in PROCESSING_STATUSES)
+        ),
         choices=PROCESSING_STATUSES,
     )
     is_sweep = models.BooleanField(
@@ -101,24 +102,15 @@ class RssFeedData(AbstractDateTimeModel):
     def reprocess_item(
         self,
         metadata_only: bool = False,
-        index: bool = True,
     ) -> None:
         """Reprocess the RSS feed
 
         :param metadata_only: If True, only do the metadata, not the docket
         entries.
-        :param index: Whether to save to Solr (note that none will be sent
         when doing medata only since no entries are modified).
         """
         from cl.recap_rss.tasks import merge_rss_feed_contents
-        from cl.search.tasks import add_items_to_solr
 
         rss_feed = PacerRssFeed(map_cl_to_pacer_id(self.court_id))
         rss_feed._parse_text(self.file_contents)
-        response = merge_rss_feed_contents(
-            rss_feed.data, self.court_id, metadata_only
-        )
-        if index:
-            add_items_to_solr(
-                response.get("rds_for_solr", []), "search.RECAPDocument"
-            )
+        merge_rss_feed_contents(rss_feed.data, self.court_id, metadata_only)

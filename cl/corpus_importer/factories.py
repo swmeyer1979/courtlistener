@@ -36,24 +36,26 @@ class CaseLawFactory(factory.DictFactory):
     docket_number = Faker("federal_district_docket_number")
 
 
-class RssDocketEntryDataFactory(factory.DictFactory):
-    date_filed = Faker("date_object")
-    description = ""
-    document_number = Faker("pyint", min_value=1, max_value=100)
-    pacer_doc_id = Faker("random_id_string")
-    pacer_seq_no = Faker("random_id_string")
-    short_description = Faker("text", max_nb_chars=40)
-
-
-class RssDocketDataFactory(factory.DictFactory):
-    court_id = FuzzyText(length=4, chars=string.ascii_lowercase, suffix="d")
+class FreeOpinionRowDataFactory(factory.DictFactory):
     case_name = Faker("case_name")
-    docket_entries = factory.List(
-        [factory.SubFactory(RssDocketEntryDataFactory)]
-    )
+    cause = Faker("text", max_nb_chars=8)
+    court_id = FuzzyText(length=4, chars=string.ascii_lowercase, suffix="d")
+    date_filed = Faker("date_object")
+    description = Faker("text", max_nb_chars=10)
     docket_number = Faker("federal_district_docket_number")
-    office = Faker("pyint", min_value=1, max_value=100)
-    chapter = Faker("pyint", min_value=1, max_value=100)
-    trustee_str = Faker("text", max_nb_chars=15)
-    type = Faker("text", max_nb_chars=8)
+    document_number = Faker("pyint", min_value=1, max_value=100)
+    nature_of_suit = Faker("text", max_nb_chars=8)
     pacer_case_id = Faker("random_id_string")
+    pacer_doc_id = Faker("random_id_string")
+    pacer_seq_no = Faker("pyint", min_value=1, max_value=10000)
+
+
+class CaseQueryDataFactory(factory.DictFactory):
+    assigned_to_str = Faker("name_female")
+    case_name = Faker("case_name")
+    case_name_raw = Faker("case_name")
+    court_id = FuzzyText(length=4, chars=string.ascii_lowercase, suffix="d")
+    date_filed = Faker("date_object")
+    date_last_filing = Faker("date_object")
+    date_terminated = Faker("date_object")
+    docket_number = Faker("federal_district_docket_number")

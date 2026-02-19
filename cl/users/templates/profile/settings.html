@@ -22,7 +22,7 @@
             <div class="row">
                 <div class="col-sm-6">
                     <div class="form-group">
-                        <label for="id_first_name">First Name</label>
+                        <label for="id_first_name">First Name*</label>
                         {{ user_form.first_name }}
                         {% if user_form.first_name.errors %}
                             <p class="help-block">
@@ -35,7 +35,7 @@
                 </div>
                 <div class="col-sm-6">
                     <div class="form-group">
-                        <label for="id_last_name">Last Name</label>
+                        <label for="id_last_name">Last Name*</label>
                         {{ user_form.last_name }}
                         {% if user_form.last_name.errors %}
                             <p class="help-block">
@@ -159,19 +159,6 @@
                 {% endif %}
             </div>
 
-            <div class="form-group">
-                <label for="id_wants_newsletter">
-                    {{ profile_form.wants_newsletter }}
-                    Send me the monthly newsletter</label>
-                {% if profile_form.wants_newsletter.errors %}
-                    <p class="help-block">
-                        {% for error in profile_form.wants_newsletter.errors %}
-                            {{ error|escape }}
-                        {% endfor %}
-                    </p>
-                {% endif %}
-            </div>
-
             <div class="form-group" >
                 <label for="id_docket_default_order_desc" >
                     {{ profile_form.docket_default_order_desc }}
@@ -179,19 +166,6 @@
                 {% if profile_form.docket_default_order_desc.errors %}
                     <p class="help-block">
                         {% for error in profile_form.docket_default_order_desc.errors %}
-                            {{ error|escape }}
-                        {% endfor %}
-                    </p>
-                {% endif %}
-            </div>
-
-            <div class="form-group v-offset-below-4">
-                <label for="id_is_tester">
-                    {{ profile_form.is_tester }}
-                    Join the beta testing group to try features before full release</label>
-                {% if profile_form.is_tester.errors %}
-                    <p class="help-block">
-                        {% for error in profile_form.is_tester.errors %}
                             {{ error|escape }}
                         {% endfor %}
                     </p>

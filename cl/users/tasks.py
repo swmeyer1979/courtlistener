@@ -1,14 +1,23 @@
 import logging
-from urllib.parse import urljoin
+from http import HTTPStatus
 
-import requests
 from celery import Task
 from django.conf import settings
+from django.contrib.auth.models import User
+from django.core.mail import send_mail
+from django.template import loader
 from django.utils.timezone import now
+from requests.exceptions import HTTPError, Timeout
 
 from cl.api.models import Webhook, WebhookEvent
 from cl.celery_init import app
 from cl.lib.email_utils import make_multipart_email
+from cl.lib.neon_utils import NeonClient
+from cl.lib.zoho import (
+    ContactsModule,
+    LeadsModule,
+    build_zoho_payload_from_user,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -22,57 +31,158 @@ def abort_or_retry(task, exc):
 
 
 @app.task(
-    bind=True, max_retries=5, interval_start=5 * 60, interval_step=5 * 60
+    bind=True,
+    autoretry_for=(Timeout,),
+    max_retries=3,
+    interval_start=5,
+    ignore_result=True,
 )
-def update_moosend_subscription(self: Task, email: str, action: str) -> None:
-    """Subscribe or unsubscribe email address to moosend mailing list.
-
-    Perform update if email address is already registered.
-
-    :param self: The celery task
-    :param email: The user's email address
-    :param action: Action to perfom on moosend
-    :return: None
+def create_neon_account(self: Task, user_id: int) -> None:
     """
-    allowed_actions = ["subscribe", "unsubscribe"]
-    assert action in allowed_actions, f"'{action}' is not an allowed action."
-    params = {"apikey": settings.MOOSEND_API_KEY}  # type: ignore
+    Checks for existing Neon CRM accounts using the user's email address
+    and handles account creation or sends an email alert to donate@free.law
+    when multiple unmerged accounts share the same email address, requesting
+    further action to resolve the issue and minimize data inconsistencies.
 
-    if action == "subscribe":
-        path = f"/v3/subscribers/{settings.MOOSEND_DEFAULT_LIST_ID}/subscribe.json"  # type: ignore
-    else:
-        path = f"/v3/subscribers/{settings.MOOSEND_DEFAULT_LIST_ID}/unsubscribe.json"  # type: ignore
+    Args:
+        user_id (int): The ID of the user to check and potentially create an
+        account for.
+    """
+    user = User.objects.select_related("profile").get(pk=user_id)
+    neon_client = NeonClient()
+    neon_accounts = neon_client.search_account_by_email(user.email)
 
-    try:
-        r = requests.post(
-            url=urljoin(settings.MOOSEND_API_URL, path),  # type: ignore
-            params=params,
-            json={
-                "Email": email,
-            },
-            timeout=30,
+    if len(neon_accounts) > 1:
+        # Neon CRM automatically merges accounts with identical names and
+        # email addresses. This process, called Account Match feature, ensures
+        # consistent data across records. However, If the accounts are very
+        # close (email and phone match but not name) the accounts will be
+        # entered into the Partial Match Queue. This queue allows users to
+        # review these potential matches and decide whether to merge them
+        # manually.
+        subject = f"[Action Needed]: Please merge multiple accounts found for {user.email}"
+        txt_template = "emails/neon_multiple_accounts.txt"
+        body = loader.get_template(txt_template).render({"user": user})
+        send_mail(
+            subject,
+            body,
+            settings.DEFAULT_FROM_EMAIL,
+            ["donate@free.law"],
         )
-    except requests.RequestException as exc:
-        abort_or_retry(self, exc)
+        return None
+
+    profile = user.profile  # type: ignore
+    if len(neon_accounts) == 1:
+        # We found an existing account that matches the email address. we'll
+        # use that one instead of creating a new one to avoid potential future
+        # merges.
+        profile.neon_account_id = neon_accounts[0]["Account ID"]
+        profile.save(update_fields=["neon_account_id"])
+        return None
+
+    if len(neon_accounts) == 0:
+        # No account found, create one
+        try:
+            new_account_id = neon_client.create_account(user)
+        except HTTPError as exc:
+            if (
+                exc.response.status_code != HTTPStatus.INTERNAL_SERVER_ERROR
+                or self.request.retries == self.max_retries
+            ):
+                raise exc
+            raise self.retry(exc=exc)
+        profile.neon_account_id = new_account_id
+        profile.save(update_fields=["neon_account_id"])
+
+
+@app.task(
+    bind=True,
+    autoretry_for=(Timeout,),
+    max_retries=3,
+    interval_start=5,
+    ignore_result=True,
+)
+def update_neon_account(self: Task, user_id: int) -> None:
+    """
+    Updates the Neon CRM account associated with the given user_id.
+
+    This task retrieves the user information from the database, fetches the
+    Neon CRM account ID, and then updates the Neon CRM account with any
+    relevant user data changes.
+
+    Args:
+        user_id (int): The ID of the user whose Neon CRM account should be
+        updated.
+
+    """
+    user = User.objects.select_related("profile").get(pk=user_id)
+    profile = user.profile  # type: ignore
+    neon_client = NeonClient()
+    neon_client.update_account(user, profile.neon_account_id)
+
+
+@app.task(
+    bind=True,
+    autoretry_for=(Timeout,),
+    max_retries=3,
+    interval_start=5,
+    ignore_result=True,
+)
+def create_or_update_zoho_account(
+    self: Task, user_id: int, milestone: int
+) -> None:
+    """
+    Celery task to create or update a Zoho CRM record for a given user.
+
+    This task:
+    - Builds a Zoho payload from the User model
+    - Checks if the user exists as a Contact or Lead in Zoho
+    - Updates the existing record or creates a new Lead if none exist
+
+    :param user_id: The primary key of the user to sync with Zoho
+    :param milestone: A milestone value to store in the 'API_calls' field
+    """
+    user = User.objects.select_related("profile").get(pk=user_id)
+    milestone_payload = {"API_calls": milestone}
+
+    # Initialize Zoho modules
+    contacts_module = ContactsModule()
+    contacts_module.initialize()
+
+    leads_module = LeadsModule()
+    leads_module.initialize()
+
+    lead_records = leads_module.get_record_by_cl_id_or_email(
+        emails=[user.email], cl_ids=[user.pk]
+    )
+    # Update the first matching Lead, if found
+    if lead_records:
+        payload = build_zoho_payload_from_user(user, leads_module.module_name)
+        leads_module.update_record(
+            lead_records[0].get_id(), payload | milestone_payload
+        )
         return
 
-    j = r.json()
-    code = j.get("Code")
+    # Try to find existing Zoho records
+    contact_records = contacts_module.get_record_by_cl_id_or_email(
+        emails=[user.email], cl_ids=[user.pk]
+    )
+    # Update the first matching Contact, if found
+    if contact_records:
+        payload = build_zoho_payload_from_user(
+            user, contacts_module.module_name
+        )
+        contacts_module.update_record(
+            contact_records[0].get_id(), payload | milestone_payload
+        )
+        return
 
-    if code == 0:
-        logger.info(
-            "Successfully completed '%s' action on '%s' in moosend.",
-            action,
-            email,
-        )
-    else:
-        error = j.get("Error", "Unknown error")
-        logger.warning(
-            "Did not complete '%s' action on '%s' in moosend: '%s'",
-            action,
-            email,
-            error,
-        )
+    # Otherwise, create a new Lead
+    payload = (
+        build_zoho_payload_from_user(user, leads_module.module_name)
+        | milestone_payload
+    )
+    leads_module.create_record(payload)
 
 
 @app.task(ignore_result=True)

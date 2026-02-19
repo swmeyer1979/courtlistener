@@ -15,56 +15,16 @@ REST_FRAMEWORK = {
     # Versioning
     "DEFAULT_VERSIONING_CLASS": "rest_framework.versioning.URLPathVersioning",
     "DEFAULT_VERSION": "v3",
-    "ALLOWED_VERSIONS": {"v3"},
+    "ALLOWED_VERSIONS": {"v3", "v4"},
     # Throttles
     "DEFAULT_THROTTLE_CLASSES": (
         "rest_framework.throttling.AnonRateThrottle",
         "cl.api.utils.ExceptionalUserRateThrottle",
     ),
-    "DEFAULT_THROTTLE_RATES": {"anon": "100/day", "user": "5000/hour"},
-    "OVERRIDE_THROTTLE_RATES": {
-        # Throttling down.
-        # Didn't respond to emails, 2023-10-02
-        "Tylersuard": "10/hour",
-        # Didn't respond to emails, 2023-08-04
-        "skalecorn12": "10/hour",
-        # Didn't respond to emails; looks unsavory.
-        "donier": "10/hour",
-        # Doing a background check service, we told them we didn't want to work
-        # with them.
-        "elios": "10/hour",
-        # Sent multiple emails, but no response.
-        "bchecker": "1/hour",
-        # No response
-        "commernet": "1/hour",
-        "zealousgalileo": "1/hour",
-        "tuhinharit": "1/hour",  # Deep pagination
-        "JaneDoe": "1/hour",
-        "chinamkm": "1/hour",
-        "shreyngd": "100/hour",
-        "leo": "100/hour",
-        "miffy": "100/hour",
-        "safetynet": "100/hour",
-        "snusbase": "1/hour",
-        "gavinjburns": "1/hour",
-        # Send multiple emails, but they haven't responded
-        "linkfenzhao": "10/hour",
-        # From fokal.ai, using multiple accounts to dodge limitations
-        "manu.jose": "10/hour",
-        "shishir": "10/hour",
-        "shishir.kumar": "10/hour",
-        # Throttling up.
-        "JonasHappel": "10000/hour",
-        "YFIN": "430000/day",
-        "mlissner": "1000000/hour",  # Needed for benchmarking (not greed)
-        "gpilapil": "10000/hour",
-        "peidelman": "20000/hour",
-        "waldo": "10000/hour",
-        "hdave4": "15000/hour",  # GSU
-        "ellliottt": "15000/hour",
-        "flooie": "20000/hour",  # Needed for testing
-        "WarrenLex": "20000/hour",  # For big litigation days (wow)
-        "quevon24": "500000/hour",  # Perform tests, clone cases in local env
+    "DEFAULT_THROTTLE_RATES": {
+        "anon": "100/day",
+        "user": "5000/hour",
+        "citations": "60/min",
     },
     # Auth
     "DEFAULT_AUTHENTICATION_CLASSES": (
@@ -86,12 +46,14 @@ REST_FRAMEWORK = {
     ),
     # Filtering
     "DEFAULT_FILTER_BACKENDS": (
-        # This is a tweaked version of RestFrameworkFilterBackend
+        # DisabledHTMLFilterBackend disables showing filters in the browsable API
         "cl.api.utils.DisabledHTMLFilterBackend",
+        # Validates query params and logs/blocks unknown filter parameters
+        "cl.api.utils.UnknownFilterParamValidationBackend",
         "rest_framework.filters.OrderingFilter",
     ),
     # Assorted & Sundry
-    "DEFAULT_PAGINATION_CLASS": "cl.api.pagination.ShallowOnlyPageNumberPagination",
+    "DEFAULT_PAGINATION_CLASS": "cl.api.pagination.VersionBasedPagination",
     "PAGE_SIZE": 20,
     "URL_FIELD_NAME": "resource_uri",
     "DEFAULT_METADATA_CLASS": "cl.api.utils.SimpleMetadataWithFilters",
@@ -102,3 +64,10 @@ REST_FRAMEWORK = {
 
 if DEVELOPMENT:
     REST_FRAMEWORK["DEFAULT_THROTTLE_RATES"]["anon"] = "10000/day"  # type: ignore
+
+BLOCK_NEW_V3_USERS = env.bool("BLOCK_NEW_V3_USERS", default=False)
+
+# Controls whether unknown API filter parameters should be blocked (400 error)
+# or just logged. Set to True to block invalid filter parameters.
+# Phase 1: False (log only), Phase 2: True (block requests)
+BLOCK_UNKNOWN_FILTERS = env.bool("BLOCK_UNKNOWN_FILTERS", default=False)

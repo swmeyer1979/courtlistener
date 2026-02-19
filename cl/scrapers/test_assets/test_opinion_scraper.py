@@ -1,3 +1,4 @@
+import re
 from datetime import datetime
 from os.path import join
 
@@ -7,7 +8,7 @@ from juriscraper.OpinionSite import OpinionSite
 
 class Site(OpinionSite):
     def __init__(self):
-        super(Site, self).__init__()
+        super().__init__()
         self.court_id = self.__module__
         self.url = join(
             settings.INSTALL_ROOT,
@@ -23,7 +24,7 @@ class Site(OpinionSite):
         path = "//name/text()"
         return list(self.html.xpath(path))
 
-    def _get_case_dates(self):
+    def _get_case_dates(self) -> list[datetime]:
         path = "//date/text()"
         return [
             datetime.strptime(date_string, "%Y/%m/%d")
@@ -53,3 +54,47 @@ class Site(OpinionSite):
     def _get_judges(self):
         path = "//judge/text()"
         return list(self.html.xpath(path))
+
+    def _get_lower_court_numbers(self):
+        path = "//lower_court_number"
+        return [i.text for i in self.html.xpath(path)]
+
+    def _get_lower_court_judges(self):
+        path = "//lower_court_judge"
+        return [i.text for i in self.html.xpath(path)]
+
+    def extract_from_text(self, scraped_text):
+        metadata = {}
+        docket_regex = r"Docket Number: (?P<docket>\d+-\d+)"
+        disposition_regex = r"Disposition: (?P<disposition>\w+)"
+        citation_regex = r"20\d{2} VT \d+"
+        originating_court_information_regex = (
+            r"Originating Court Docket Number: (?P<oci_docket_number>\d+-\d+)"
+        )
+
+        if docket_match := re.search(docket_regex, scraped_text):
+            metadata["Docket"] = {
+                "docket_number": docket_match.group("docket")
+            }
+
+        if disposition_match := re.search(disposition_regex, scraped_text):
+            metadata["OpinionCluster"] = {
+                "disposition": disposition_match.group("disposition")
+            }
+
+        if citation_match := re.search(citation_regex, scraped_text):
+            metadata["Citation"] = citation_match.group(0)
+
+        if oci_match := re.search(
+            originating_court_information_regex, scraped_text
+        ):
+            metadata["OriginatingCourtInformation"] = {
+                "docket_number": oci_match.group("oci_docket_number")
+            }
+
+        return metadata
+
+    @staticmethod
+    def cleanup_content(content):
+        """Implemented just to override OpinionSite.cleanup_content for tests"""
+        return content

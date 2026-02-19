@@ -1,5 +1,5 @@
 import rest_framework_filters as filters
-from django.db.models import QuerySet
+from django.db.models import Prefetch, QuerySet
 
 from cl.api.utils import (
     ALL_TEXT_LOOKUPS,
@@ -7,19 +7,21 @@ from cl.api.utils import (
     DATE_LOOKUPS,
     DATETIME_LOOKUPS,
     INTEGER_LOOKUPS,
+    FilterManyToManyMixin,
     NoEmptyFilterSet,
 )
-from cl.people_db.lookup_utils import lookup_judge_by_name_components
 from cl.people_db.models import (
     ABARating,
     Attorney,
     Education,
     Party,
+    PartyType,
     Person,
     PoliticalAffiliation,
     Position,
     Race,
     RetentionEvent,
+    Role,
     School,
     Source,
 )
@@ -41,7 +43,7 @@ class ABARatingFilter(NoEmptyFilterSet):
     class Meta:
         model = ABARating
         fields = {
-            "id": ["exact"],
+            "id": INTEGER_LOOKUPS,
             "date_created": DATETIME_LOOKUPS,
             "date_modified": DATETIME_LOOKUPS,
             "year_rated": INTEGER_LOOKUPS,
@@ -54,7 +56,7 @@ class PoliticalAffiliationFilter(NoEmptyFilterSet):
     class Meta:
         model = PoliticalAffiliation
         fields = {
-            "id": ["exact"],
+            "id": INTEGER_LOOKUPS,
             "date_created": DATETIME_LOOKUPS,
             "date_modified": DATETIME_LOOKUPS,
             "date_start": DATE_LOOKUPS,
@@ -74,7 +76,7 @@ class SchoolFilter(NoEmptyFilterSet):
     class Meta:
         model = School
         fields = {
-            "id": ["exact"],
+            "id": INTEGER_LOOKUPS,
             "date_created": DATETIME_LOOKUPS,
             "date_modified": DATETIME_LOOKUPS,
             "name": ALL_TEXT_LOOKUPS,
@@ -91,7 +93,7 @@ class EducationFilter(NoEmptyFilterSet):
     class Meta:
         model = Education
         fields = {
-            "id": ["exact"],
+            "id": INTEGER_LOOKUPS,
             "date_created": DATETIME_LOOKUPS,
             "date_modified": DATETIME_LOOKUPS,
             "degree_year": ["exact"],
@@ -105,7 +107,7 @@ class RetentionEventFilter(NoEmptyFilterSet):
     class Meta:
         model = RetentionEvent
         fields = {
-            "id": ["exact"],
+            "id": INTEGER_LOOKUPS,
             "position": ["exact"],
             "date_created": DATETIME_LOOKUPS,
             "date_modified": DATETIME_LOOKUPS,
@@ -127,7 +129,7 @@ class PositionFilter(NoEmptyFilterSet):
     class Meta:
         model = Position
         fields = {
-            "id": ["exact"],
+            "id": INTEGER_LOOKUPS,
             "position_type": ["exact"],
             "person": ["exact"],
             "appointer": ["exact"],
@@ -155,24 +157,6 @@ class PositionFilter(NoEmptyFilterSet):
             "location_city": BASIC_TEXT_LOOKUPS,
             "location_state": BASIC_TEXT_LOOKUPS,
         }
-
-
-class PersonDisclosureFilter(NoEmptyFilterSet):
-    """Filters for looking up judges in the disclosure pages"""
-
-    fullname = filters.Filter(method="filter_fullname")
-
-    def filter_fullname(
-        self,
-        queryset: QuerySet,
-        name: str,
-        value: str,
-    ) -> QuerySet:
-        return lookup_judge_by_name_components(queryset, value)
-
-    class Meta:
-        model = Person
-        fields = {}
 
 
 class PersonFilter(NoEmptyFilterSet):
@@ -229,7 +213,7 @@ class PersonFilter(NoEmptyFilterSet):
     class Meta:
         model = Person
         fields = {
-            "id": ["exact"],
+            "id": INTEGER_LOOKUPS,
             "date_created": DATETIME_LOOKUPS,
             "date_modified": DATETIME_LOOKUPS,
             "date_dob": DATE_LOOKUPS,
@@ -249,43 +233,142 @@ class PersonFilter(NoEmptyFilterSet):
         }
 
 
-class PartyFilter(NoEmptyFilterSet):
+class PartyFilter(NoEmptyFilterSet, FilterManyToManyMixin):
     docket = filters.RelatedFilter(
         "cl.search.filters.DocketFilter",
         field_name="dockets",
         queryset=Docket.objects.all(),
+        distinct=True,
     )
     attorney = filters.RelatedFilter(
         "cl.people_db.filters.AttorneyFilter",
         field_name="attorneys",
         queryset=Attorney.objects.all(),
+        distinct=True,
     )
+    filter_nested_results = filters.BooleanFilter(
+        field_name="roles", method="filter_join_tables"
+    )
+
+    # Attributes for the mixin
+    # **Important:** Keep this mapping up-to-date with any changes to
+    # RelatedFilters or custom labels in this class to avoid unexpected
+    # behavior.
+    join_table_cleanup_mapping = {
+        "dockets": "docket",
+        "attorneys": "attorney",
+    }
 
     class Meta:
         model = Party
         fields = {
-            "id": ["exact"],
+            "id": INTEGER_LOOKUPS,
             "date_created": DATETIME_LOOKUPS,
             "date_modified": DATETIME_LOOKUPS,
             "name": ALL_TEXT_LOOKUPS,
         }
 
+    def filter_join_tables(
+        self, qs: QuerySet, name: str, value: bool
+    ) -> QuerySet:
+        """
+        Filters a QuerySet based on a many-to-many relationship involving the
+        `Role` and `PartyType` model.
 
-class AttorneyFilter(NoEmptyFilterSet):
+        Args:
+            qs: The original QuerySet to be filtered.
+            name: The name of the field to filter on.
+            value: The value of the request filter.
+
+        Returns:
+            The filtered QuerySet, prefetched with the filtered many-to-many
+            relationship.
+        """
+        if not value:
+            return qs
+
+        filters = self.get_filters_for_join_table()
+        if not filters:
+            return qs
+
+        prefetch_roles = Prefetch(
+            name,
+            queryset=Role.objects.filter(**filters),
+            to_attr="filtered_roles",
+        )
+        prefetch_party_types = Prefetch(
+            name,
+            queryset=PartyType.objects.filter(
+                **{
+                    key: value
+                    for key, value in filters.items()
+                    if key.startswith("docket")
+                }
+            ),
+            to_attr="filtered_party_types",
+        )
+        return qs.prefetch_related(prefetch_roles, prefetch_party_types)
+
+
+class AttorneyFilter(NoEmptyFilterSet, FilterManyToManyMixin):
     docket = filters.RelatedFilter(
         "cl.search.filters.DocketFilter",
         field_name="roles__docket",
         queryset=Docket.objects.all(),
+        distinct=True,
     )
     parties_represented = filters.RelatedFilter(
-        PartyFilter, field_name="roles__party", queryset=Party.objects.all()
+        PartyFilter,
+        field_name="roles__party",
+        queryset=Party.objects.all(),
+        distinct=True,
     )
+    filter_nested_results = filters.BooleanFilter(
+        field_name="roles", method="filter_roles"
+    )
+
+    # Attributes for the mixin
+    # **Important:** Keep this mapping up-to-date with any changes to
+    # RelatedFilters or custom labels in this class to avoid unexpected
+    # behavior.
+    join_table_cleanup_mapping = {
+        "roles__docket": "docket",
+        "roles__party": "party",
+    }
 
     class Meta:
         model = Attorney
         fields = {
-            "id": ["exact"],
+            "id": INTEGER_LOOKUPS,
             "date_created": DATETIME_LOOKUPS,
             "date_modified": DATETIME_LOOKUPS,
             "name": ALL_TEXT_LOOKUPS,
         }
+
+    def filter_roles(self, qs: QuerySet, name: str, value: bool) -> QuerySet:
+        """
+        Filters a QuerySet based on a many-to-many relationship involving the
+        `Role` model.
+
+        Args:
+            qs: The original QuerySet to be filtered.
+            name: The name of the many-to-many field to filter on.
+            value: The value to filter the many-to-many relationship with.
+
+        Returns:
+            The filtered QuerySet, prefetched with the filtered many-to-many
+            relationship.
+        """
+        if not value:
+            return qs
+
+        role_filters = self.get_filters_for_join_table()
+        if not role_filters:
+            return qs
+
+        prefetch = Prefetch(
+            name,
+            queryset=Role.objects.filter(**role_filters),
+            to_attr="filtered_roles",
+        )
+        return qs.prefetch_related(prefetch)

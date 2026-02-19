@@ -6,12 +6,18 @@ from django.conf import settings
 from django.urls import reverse
 from selenium.common.exceptions import NoSuchElementException
 from selenium.webdriver.common.by import By
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.wait import WebDriverWait
 from timeout_decorator import timeout_decorator
 
 from cl.disclosures.factories import (
+    DebtFactory,
     FinancialDisclosureFactory,
     FinancialDisclosurePositionFactory,
+    GiftFactory,
     InvestmentFactory,
+    ReimbursementFactory,
+    SpousalIncomeFactory,
 )
 from cl.disclosures.models import (
     CODES,
@@ -57,7 +63,7 @@ class DisclosureIngestionTest(TestCase):
     def test_financial_disclosure_ingestion(self) -> None:
         """Can we successfully ingest disclosures at a high level?"""
 
-        with open(self.test_file, "r") as f:
+        with open(self.test_file) as f:
             extracted_data = json.load(f)
         Investment.objects.all().delete()
 
@@ -102,7 +108,7 @@ class DisclosureIngestionTest(TestCase):
         self.assertEqual(
             investment_count,
             84,
-            f"Should have 84 ingested investments",
+            "Should have 84 ingested investments",
         )
 
 
@@ -132,6 +138,31 @@ class DisclosureAPITest(TestCase):
         )
         InvestmentFactory.create_batch(
             10, financial_disclosure=fd, redacted=True
+        )
+        DebtFactory.create(
+            financial_disclosure=fd, creditor_name="JP Morgan Chase"
+        )
+        DebtFactory.create_batch(10, financial_disclosure=fd, redacted=False)
+        SpousalIncomeFactory.create(
+            financial_disclosure=fd,
+            source_type="A big Trust Fund",
+        )
+        SpousalIncomeFactory.create_batch(
+            10, financial_disclosure=fd, redacted=False
+        )
+        GiftFactory.create(
+            financial_disclosure=fd,
+            source="John Oliver",
+            description="Luxury Motor Coach",
+            value="2,000,000.00 dollars",
+        )
+        GiftFactory.create_batch(10, financial_disclosure=fd, redacted=False)
+        ReimbursementFactory.create(
+            financial_disclosure=fd,
+            location="Honolulu, Hawaii",
+        )
+        ReimbursementFactory.create_batch(
+            10, financial_disclosure=fd, redacted=False
         )
 
     async def test_disclosure_position_api(self) -> None:
@@ -207,8 +238,42 @@ class DisclosureAPITest(TestCase):
         r = await self.async_client.get(self.path, q)
         self.assertEqual(r.json()["count"], 1, msg="Wrong disclosure count")
 
+    async def test_gift_filtering(self) -> None:
+        """Can we filter gifts by description?"""
+        self.path = reverse("gift-list", kwargs={"version": "v3"})
+        self.q = {"description": "Luxury Motor Coach"}
+        r = await self.async_client.get(self.path, self.q)
+        self.assertEqual(r.json()["count"], 1, msg="Failed Gift filter")
 
-class DisclosureReactLoadTest(BaseSeleniumTest):
+    async def test_reimbursement_filtering(self) -> None:
+        """Can we filter reimbursements by location?"""
+        self.path = reverse("reimbursement-list", kwargs={"version": "v3"})
+        self.q = {"location__icontains": "hawaii"}
+        r = await self.async_client.get(self.path, self.q)
+        self.assertEqual(
+            r.json()["count"], 1, msg="Failed Reimbursement filter"
+        )
+
+    async def test_spousal_income_filtering(self) -> None:
+        """Can we filter spousal income by source_type?"""
+        self.path = reverse("spouseincome-list", kwargs={"version": "v3"})
+        self.q = {"source_type__icontains": "trust fund"}
+        r = await self.async_client.get(self.path, self.q)
+        self.assertEqual(
+            r.json()["count"], 1, msg="Failed Spousal Income filter"
+        )
+
+    async def test_debt_filtering(self) -> None:
+        """Can we filter debts by creditor?"""
+        self.path = reverse("debt-list", kwargs={"version": "v3"})
+        self.q = {"creditor_name__icontains": "JP Morgan"}
+        r = await self.async_client.get(self.path, self.q)
+        self.assertEqual(r.json()["count"], 1, msg="Failed Debt filter")
+
+
+class DisclosurePageTest(BaseSeleniumTest):
+    """Tests for static disclosure pages with HTMX typeahead."""
+
     def setUp(self) -> None:
         judge = PersonWithChildrenFactory.create(
             name_first="Judith",
@@ -222,39 +287,63 @@ class DisclosureReactLoadTest(BaseSeleniumTest):
     def tearDown(self) -> None:
         FinancialDisclosure.objects.all().delete()
         Person.objects.all().delete()
+        super().tearDown()
 
     @timeout_decorator.timeout(SELENIUM_TIMEOUT)
     def test_disclosure_homepage(self) -> None:
         """Can we load disclosure homepage?"""
+        wait = WebDriverWait(self.browser, 3)
         self.browser.get(self.live_server_url)
-        link = self.browser.find_element(By.ID, "navbar-fd")
+        dropdown = self.browser.find_element(By.ID, "navbar-fd")
+        dropdown.click()
+        link = self.browser.find_element(
+            By.LINK_TEXT, "Search Financial Disclosures"
+        )
         link.click()
         self.assertIn(
             "Judicial Financial Disclosures Database", self.browser.title
         )
-        search_bar = self.browser.find_element(By.ID, "main-query-box")
+        search_bar = wait.until(
+            EC.visibility_of_element_located((By.ID, "main-query-box"))
+        )
         self.assertTrue(
-            search_bar.is_displayed(), msg="React-root failed to load"
+            search_bar.is_displayed(), msg="Search bar failed to load"
         )
 
     @timeout_decorator.timeout(SELENIUM_TIMEOUT)
     def test_disclosure_search(self) -> None:
-        """Can we search for judges?"""
+        """Can we search for judges using HTMX typeahead?"""
+        wait = WebDriverWait(self.browser, 5)
         self.browser.get(self.live_server_url)
         self.browser.implicitly_wait(2)
-        link = self.browser.find_element(By.ID, "navbar-fd")
-        link.click()
+        self.browser.find_element(By.ID, "navbar-fd").click()
+        self.browser.find_element(
+            By.LINK_TEXT, "Search Financial Disclosures"
+        ).click()
         self.assertIn(
             "Judicial Financial Disclosures Database", self.browser.title
         )
-        search_bar = self.browser.find_element(By.ID, "id_disclosures_search")
+        search_bar = wait.until(
+            EC.visibility_of_element_located((By.ID, "main-query-box"))
+        )
         self.assertTrue(
-            search_bar.is_displayed(), msg="React-root failed to load"
+            search_bar.is_displayed(), msg="Search bar failed to load"
         )
 
+        # Verify no results initially
         with self.assertRaises(NoSuchElementException):
             self.browser.find_element(By.CSS_SELECTOR, ".tr-results")
 
-        search_bar.send_keys("Judith")
-        results = self.browser.find_elements(By.CSS_SELECTOR, ".tr-results")
+        # Type in search box and wait for HTMX response
+        search_input = self.browser.find_element(
+            By.ID, "id_disclosures_search"
+        )
+        search_input.send_keys("Judith")
+
+        # Wait for HTMX to load results
+        results = wait.until(
+            EC.presence_of_all_elements_located(
+                (By.CSS_SELECTOR, ".tr-results")
+            )
+        )
         self.assertEqual(len(results), 1, msg="Incorrect results displayed")

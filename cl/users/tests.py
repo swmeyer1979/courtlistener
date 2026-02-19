@@ -1,6 +1,7 @@
 import json
-import logging
 from datetime import datetime, timedelta
+from http import HTTPStatus
+from itertools import product
 from pathlib import Path
 from unittest import mock
 from unittest.mock import MagicMock, patch
@@ -8,6 +9,7 @@ from unittest.mock import MagicMock, patch
 import time_machine
 from asgiref.sync import sync_to_async
 from django.conf import settings
+from django.contrib import admin
 from django.contrib.auth.hashers import make_password
 from django.contrib.auth.models import User
 from django.contrib.auth.tokens import default_token_generator
@@ -18,30 +20,27 @@ from django.core.mail import (
     get_connection,
     send_mail,
 )
-from django.test import Client
+from django.test import AsyncClient
 from django.test.utils import override_settings
 from django.urls import reverse
 from django.utils.http import urlsafe_base64_encode
 from django.utils.timezone import now
-from django_ses import signals
-from rest_framework.status import (
-    HTTP_200_OK,
-    HTTP_201_CREATED,
-    HTTP_204_NO_CONTENT,
-    HTTP_404_NOT_FOUND,
-    HTTP_500_INTERNAL_SERVER_ERROR,
-)
+from django_ses import SESBackend, signals
 from selenium.webdriver.common.by import By
 from timeout_decorator import timeout_decorator
 
-from cl.alerts.factories import DocketAlertFactory
+from cl.alerts.factories import (
+    AlertFactory,
+    DocketAlertFactory,
+    DocketAlertWithParentsFactory,
+)
 from cl.alerts.models import DocketAlert, DocketAlertEvent
 from cl.api.factories import WebhookEventFactory, WebhookFactory
 from cl.api.models import (
     Webhook,
     WebhookEvent,
     WebhookEventType,
-    WebhookHistoryEvent,
+    WebhookVersions,
 )
 from cl.favorites.factories import UserTagFactory
 from cl.favorites.models import (
@@ -51,7 +50,7 @@ from cl.favorites.models import (
     UserTagEvent,
 )
 from cl.lib.email_backends import get_email_count
-from cl.lib.redis_utils import make_redis_interface
+from cl.lib.redis_utils import get_redis_interface
 from cl.lib.test_helpers import SimpleUserDataMixin
 from cl.search.factories import DocketFactory
 from cl.tests.base import SELENIUM_TIMEOUT, BaseSeleniumTest
@@ -64,6 +63,7 @@ from cl.tests.cases import (
 )
 from cl.tests.utils import MockResponse as MockPostResponse
 from cl.tests.utils import make_client
+from cl.users.admin import UserAdmin
 from cl.users.email_handlers import (
     add_bcc_random,
     get_email_body,
@@ -90,7 +90,6 @@ from cl.users.models import (
     FailedEmail,
     UserProfile,
 )
-from cl.users.tasks import update_moosend_subscription
 
 
 class UserTest(LiveServerTestCase):
@@ -109,9 +108,9 @@ class UserTest(LiveServerTestCase):
             r = await self.async_client.get(path)
             self.assertEqual(
                 r.status_code,
-                HTTP_200_OK,
-                msg="Got wrong status code for page at: {path}. "
-                "Status Code: {code}".format(path=path, code=r.status_code),
+                HTTPStatus.OK,
+                msg=f"Got wrong status code for page at: {path}. "
+                f"Status Code: {r.status_code}",
             )
 
     @patch("hcaptcha.fields.hCaptchaField.validate", return_value=True)
@@ -127,7 +126,7 @@ class UserTest(LiveServerTestCase):
             "skip_me_if_alive": "",
             "consent": True,
         }
-        response = await sync_to_async(self.client.post)(
+        response = await self.async_client.post(
             f"{self.live_server_url}{reverse('register')}",
             params,
             follow=True,
@@ -135,7 +134,7 @@ class UserTest(LiveServerTestCase):
         self.assertRedirects(
             response,
             f"{reverse('register_success')}"
-            f"?next=/&email=pan%40courtlistener.com",
+            "?next=/&email=pan%40courtlistener.com",
         )
 
     async def test_redirects(self) -> None:
@@ -172,17 +171,100 @@ class UserTest(LiveServerTestCase):
                     self.assertNotIn(
                         next_param,
                         response.content.decode(),
-                        msg="'%s' found in HTML of response. This suggests it was "
-                        "not cleaned by the sanitize_redirection function."
-                        % next_param,
+                        msg=f"'{next_param}' found in HTML of response. This suggests it was "
+                        "not cleaned by the sanitize_redirection function.",
                     )
                 else:
                     self.assertIn(
                         next_param,
                         response.content.decode(),
-                        msg="'%s' not found in HTML of response. This suggests it "
-                        "was sanitized when it should not have been."
-                        % next_param,
+                        msg=f"'{next_param}' not found in HTML of response. This suggests it "
+                        "was sanitized when it should not have been.",
+                    )
+
+    async def test_prevent_text_injection_in_success_registration(self):
+        """Can we handle text injection attacks?"""
+        evil_text = "visit https://evil.com/malware.exe to win $100 giftcard"
+        url_params = [
+            # A safe redirect and email
+            (reverse("faq"), "test@free.law", False),
+            # Text injection attack
+            (reverse("faq"), evil_text, True),
+            # open redirect and text injection attack
+            ("https://evil.com&email=e%40e.net", evil_text, True),
+        ]
+
+        for next_param, email, is_evil in url_params:
+            url = "{host}{path}?next={next}&email={email}".format(
+                host=self.live_server_url,
+                path=reverse("register_success"),
+                next=next_param,
+                email=email,
+            )
+            response = await self.async_client.get(url)
+            with self.subTest("Checking url", url=url):
+                if is_evil:
+                    self.assertNotIn(
+                        email,
+                        response.content.decode(),
+                        msg=f"'{email}' found in HTML of response. This indicates a "
+                        "potential security vulnerability. The view likely "
+                        "failed to properly validate it.",
+                    )
+                else:
+                    self.assertIn(
+                        email,
+                        response.content.decode(),
+                        msg=f"'{email}' not found in HTML of response. This suggests a "
+                        "a potential issue with the validation logic. The email "
+                        "address may have been incorrectly identified as invalid",
+                    )
+
+    async def test_login_redirects(self) -> None:
+        """Do we allow good redirects in login while banning bad ones?"""
+        next_params = [
+            # A safe redirect
+            (reverse("faq"), False),
+            # Redirection to the register page
+            (reverse("register"), True),
+            # No open redirects (to a domain outside CL)
+            ("https://evil.com&email=e%40e.net", True),
+            # No javascript (!)
+            ("javascript:confirm(document.domain)", True),
+            # No spaces
+            ("/test test", True),
+            # CRLF injection attack
+            (
+                "/%0d/evil.com/&email=Your+Account+still+in+maintenance,please+click+Return+below",
+                True,
+            ),
+            # XSS vulnerabilities
+            (
+                "register/success/?next=java%0d%0ascript%0d%0a:alert(document.cookie)&email=Reflected+XSS+here",
+                True,
+            ),
+        ]
+        for next_param, is_not_safe in next_params:
+            bad_url = "{host}{path}?next={next}".format(
+                host=self.live_server_url,
+                path=reverse("sign-in"),
+                next=next_param,
+            )
+            response = await self.async_client.get(bad_url)
+            with self.subTest("Checking redirect in login", url=bad_url):
+                if is_not_safe:
+                    self.assertNotIn(
+                        f'value="{next_param}"',
+                        response.content.decode(),
+                        msg=f"'{next_param}' found in HTML of response. This suggests it was "
+                        "not cleaned by the sanitize_redirection function.",
+                    )
+                else:
+                    self.assertIn(
+                        f'value="{next_param}"',
+                        response.content.decode(),
+                        msg=f"'{next_param}' not found in HTML of response. This suggests it "
+                        "was sanitized when it should not have been.",
                     )
 
 
@@ -194,10 +276,54 @@ class UserDataTest(LiveServerTestCase):
             user__username=params["username"],
             user__password=make_password(params["password"]),
         )
-        r = await sync_to_async(self.client.post)(
+        r = await self.async_client.post(
             reverse("sign-in"), params, follow=True
         )
         self.assertRedirects(r, "/")
+
+    async def test_registration_rejects_malicious_first_name_input(
+        self,
+    ) -> None:
+        tests = (
+            # Invalid
+            ("evil.com", False),
+            ("http://test", False),
+            ("email@test.test", False),
+            ("/test/", False),
+            # Valid
+            ("My fullname", True),
+            ("Test Test", True),
+            ("Éric Terrien-Pascal", True),
+            ("Tel'c", True),
+        )
+        for first_name, is_valid in tests:
+            with self.subTest(
+                f"Trying to register using {first_name} as first name.",
+                first_name=first_name,
+                is_valid=is_valid,
+            ):
+                r = await self.async_client.post(
+                    reverse("register"),
+                    {
+                        "username": "aamon",
+                        "email": "user@free.law",
+                        "password1": "a",
+                        "password2": "a",
+                        "first_name": first_name,
+                        "last_name": "Marquis of Hell",
+                        "skip_me_if_alive": "",
+                    },
+                )
+                if not is_valid:
+                    self.assertIn(
+                        "First name must not contain any special characters.",
+                        r.content.decode(),
+                    )
+                else:
+                    self.assertNotIn(
+                        "First name must not contain any special characters.",
+                        r.content.decode(),
+                    )
 
     async def test_confirming_an_email_address(self) -> None:
         """Tests whether we can confirm the case where an email is associated
@@ -215,7 +341,7 @@ class UserDataTest(LiveServerTestCase):
             200,
             r.status_code,
             msg="Did not get 200 code when activating account. "
-            "Instead got %s" % r.status_code,
+            f"Instead got {r.status_code}",
         )
         self.assertIn(
             "has been confirmed",
@@ -246,7 +372,7 @@ class UserDataTest(LiveServerTestCase):
             200,
             r.status_code,
             msg="Did not get 200 code when activating account. "
-            "Instead got %s" % r.status_code,
+            f"Instead got {r.status_code}",
         )
         ups = UserProfile.objects.filter(pk__in=[up.pk for up in ups])
         async for up in ups:
@@ -282,7 +408,7 @@ class ProfileTest(SimpleUserDataMixin, TestCase):
 
         # Log in, get the API again, and then load the profile page
         self.assertTrue(
-            await sync_to_async(self.async_client.login)(
+            await self.async_client.alogin(
                 username="pandora", password="password"
             )
         )
@@ -292,16 +418,16 @@ class ProfileTest(SimpleUserDataMixin, TestCase):
 
         # Now get the API page
         r = await self.async_client.get(reverse("view_api"))
-        self.assertEqual(r.status_code, HTTP_200_OK)
+        self.assertEqual(r.status_code, HTTPStatus.OK)
 
     async def test_deleting_your_account(self) -> None:
         """Can we delete an account properly?"""
         self.assertTrue(
-            await sync_to_async(self.client.login)(
+            await self.async_client.alogin(
                 username="pandora", password="password"
             )
         )
-        response = await sync_to_async(self.client.post)(
+        response = await self.async_client.post(
             reverse("delete_account"),
             {"password": "password"},
             follow=True,
@@ -363,11 +489,11 @@ class ProfileTest(SimpleUserDataMixin, TestCase):
 
         # Delete user account.
         self.assertTrue(
-            await sync_to_async(self.client.login)(
+            await self.async_client.alogin(
                 username=user_1.user.username, password="password"
             )
         )
-        await sync_to_async(self.client.post)(
+        await self.async_client.post(
             reverse("delete_account"),
             {"password": "password"},
             follow=True,
@@ -419,11 +545,11 @@ class ProfileTest(SimpleUserDataMixin, TestCase):
 
         # Delete user account.
         self.assertTrue(
-            await sync_to_async(self.client.login)(
+            await self.async_client.alogin(
                 username=user_1.user.username, password="password"
             )
         )
-        await sync_to_async(self.client.post)(
+        await self.async_client.post(
             reverse("delete_account"),
             {"password": "password"},
             follow=True,
@@ -440,6 +566,164 @@ class ProfileTest(SimpleUserDataMixin, TestCase):
         docket_tag_events_first = await docket_tag_events.afirst()
         self.assertEqual(docket_tag_events_first.tag_id, tag_1_user_2.pk)
 
+    async def test_redirect_to_search_alerts_if_no_alerts(self):
+        """Tests redirection to search alerts when a user has no alerts"""
+        # Create a user profile with no associated alerts
+        user_with_no_alert = await sync_to_async(
+            UserProfileWithParentsFactory
+        )()
+        # Log in the created user
+        await self.async_client.alogin(
+            username=user_with_no_alert.user.username, password="password"
+        )
+        # Load the 'profile_alerts' URL and follow redirects
+        r = await self.async_client.get(reverse("profile_alerts"), follow=True)
+        # Assert that the request was redirected to 'profile_search_alerts'.
+        self.assertRedirects(
+            r,
+            expected_url=reverse("profile_search_alerts"),
+            target_status_code=HTTPStatus.OK,
+        )
+
+    async def test_redirect_to_docket_alerts_if_no_search_alerts(self):
+        """Tests redirection to docket alerts page when a user has no search alerts."""
+        # Create a user profile
+        user_with_docket_alert = await sync_to_async(
+            UserProfileWithParentsFactory
+        )()
+        # Create a docket and a docket alert associated with the user
+        docket = await sync_to_async(DocketFactory)()
+        await sync_to_async(DocketAlertFactory)(
+            docket=docket, user=user_with_docket_alert.user
+        )
+        # Log in the created user
+        await self.async_client.alogin(
+            username=user_with_docket_alert.user, password="password"
+        )
+        # Load the 'profile_alerts' URL and follow redirects
+        r = await self.async_client.get(reverse("profile_alerts"), follow=True)
+        # Assert that the request was redirected to 'profile_docket_alerts'
+        self.assertRedirects(
+            r,
+            expected_url=reverse("profile_docket_alerts"),
+            target_status_code=HTTPStatus.OK,
+        )
+
+    async def test_redirect_to_search_alerts_if_has_search_alerts(self):
+        """Tests redirection to search alerts page when a user has search alerts, regardless of docket alerts."""
+        # Create a user profile
+        user_with_search_alert = await sync_to_async(
+            UserProfileWithParentsFactory
+        )()
+        await self.async_client.alogin(
+            username=user_with_search_alert.user.username, password="password"
+        )
+        # Create a search alert for the user.
+        await sync_to_async(AlertFactory)(user=user_with_search_alert.user)
+        # Loads the 'profile_alerts' page and follow redirects.
+        r = await self.async_client.get(reverse("profile_alerts"), follow=True)
+        # Assert redirection to the 'profile_search_alerts' page.
+        self.assertRedirects(
+            r,
+            expected_url=reverse("profile_search_alerts"),
+            target_status_code=HTTPStatus.OK,
+        )
+        # Create a docket and a docket alert for the same user.
+        docket = await sync_to_async(DocketFactory)()
+        await sync_to_async(DocketAlertFactory)(
+            docket=docket, user=user_with_search_alert.user
+        )
+        # Loads the 'profile_alerts' page and follow redirects.
+        r = await self.async_client.get(reverse("profile_alerts"), follow=True)
+        # Assert that it still redirects to 'profile_search_alerts' because a
+        # search alert exists
+        self.assertRedirects(
+            r,
+            expected_url=reverse("profile_search_alerts"),
+            target_status_code=HTTPStatus.OK,
+        )
+
+    async def test_docket_alerts_sorting(self):
+        """Tests docket ordering on the docket alerts page."""
+        # Create a user profile
+        up = await sync_to_async(UserProfileWithParentsFactory)()
+        user_with_docket_alerts = up.user
+        # Create some dockets and docket alerts associated with the user
+        das = []
+        das.append(
+            await sync_to_async(DocketAlertWithParentsFactory)(
+                user=user_with_docket_alerts,
+                date_last_hit=now() - timedelta(days=2),
+                docket__date_filed=now().date() - timedelta(days=2),
+            )
+        )
+        das.append(
+            await sync_to_async(DocketAlertWithParentsFactory)(
+                user=user_with_docket_alerts,
+                date_last_hit=now() - timedelta(days=1),
+                docket__date_filed=now().date() - timedelta(days=1),
+            )
+        )
+        das.append(
+            await sync_to_async(DocketAlertWithParentsFactory)(
+                user=user_with_docket_alerts,
+                date_last_hit=now(),
+                docket__date_filed=now().date(),
+            )
+        )
+        # Log in the created user
+        await self.async_client.alogin(
+            username=user_with_docket_alerts, password="password"
+        )
+
+        tests = (
+            ("", lambda x: x.date_last_hit),
+            ("invalid", lambda x: x.date_last_hit),
+            ("hit", lambda x: x.date_last_hit),
+            ("name", lambda x: x.docket.case_name),
+            ("court", lambda x: x.docket.court.short_name),
+            ("date_filed", lambda x: x.docket.date_filed),
+            ("docket_number", lambda x: x.docket.docket_number),
+        )
+
+        # Create ascending/descending tests for each test case in the form:
+        # ("hit", lambda, "-"), etc.
+        tests = ((*x, y) for x, y in product(tests, ["", "-"]))
+
+        for order_name, sorter, direction in tests:
+            with self.subTest(
+                "Checking docket alert sorting",
+                order_by=f"{direction}{order_name}",
+            ):
+                r = await self.async_client.get(
+                    reverse("profile_docket_alerts"),
+                    query_params={"order_by": f"{direction}{order_name}"},
+                )
+                c = r.context
+                if order_name in ("", "invalid"):
+                    direction = "-"
+                    order_name = "hit"
+                das.sort(key=sorter, reverse=True if direction else False)
+                self.assertEqual(
+                    list(c["docket_alerts"]),
+                    das,
+                    f"\nExpected {order_name}: {[sorter(x) for x in das]}\n"
+                    f"Got      {order_name}: {[sorter(x) for x in c['docket_alerts']]}",
+                )
+
+                sorting_fields = c["sorting_fields"]
+                for col, vals in sorting_fields.items():
+                    # Test url_param
+                    if order_name == col and direction == "":
+                        self.assertEqual(vals["url_param"], f"-{order_name}")
+                    else:
+                        self.assertEqual(vals["url_param"], col)
+                    # Test direction
+                    if order_name == col and direction == "-":
+                        self.assertEqual(vals["direction"], "down")
+                    else:
+                        self.assertEqual(vals["direction"], "up")
+
 
 class DisposableEmailTest(SimpleUserDataMixin, TestCase):
     """
@@ -453,7 +737,7 @@ class DisposableEmailTest(SimpleUserDataMixin, TestCase):
     bad_email = f"{user}@{bad_domain}"
 
     def setUp(self) -> None:
-        self.client = Client()
+        self.client = AsyncClient()
 
     async def test_can_i_create_account_with_bad_email_address(self) -> None:
         """Is an error thrown if we try to use a banned email address?"""
@@ -477,11 +761,9 @@ class DisposableEmailTest(SimpleUserDataMixin, TestCase):
     async def test_can_i_change_to_bad_email_address(self) -> None:
         """Is an error thrown if we try to change to a bad email address?"""
         self.assertTrue(
-            await sync_to_async(self.client.login)(
-                username="pandora", password="password"
-            )
+            await self.client.alogin(username="pandora", password="password")
         )
-        r = await sync_to_async(self.client.post)(
+        r = await self.client.post(
             reverse("view_settings"),
             {"email": self.bad_email},
             follow=True,
@@ -667,10 +949,11 @@ class SNSWebhookTest(TestCase):
             signals.bounce_received,
         )
         # Check if warning is logged
-        warning_part_one = "Unexpected ContentRejected soft bounce for "
-        warning_part_two = "bounce@simulator.amazonses.com, message_id: "
         mock_logging.warning.assert_called_with(
-            f"{warning_part_one}{warning_part_two}"
+            "Unexpected %s soft bounce for %s, message_id: %s",
+            "ContentRejected",
+            "bounce@simulator.amazonses.com",
+            "",
         )
 
     def test_handle_soft_bounce_create_back_off(self) -> None:
@@ -937,10 +1220,10 @@ class SNSWebhookTest(TestCase):
             signals.bounce_received,
         )
         # Check if a warning is logged
-        warning_part_one = "Unexpected Suppressed hard bounce for "
-        warning_part_two = "bounce@simulator.amazonses.com"
         mock_logging.warning.assert_called_with(
-            f"{warning_part_one}{warning_part_two}"
+            "Unexpected %s hard bounce for %s",
+            "Suppressed",
+            "bounce@simulator.amazonses.com",
         )
         email_ban_count = EmailFlag.objects.filter(
             email_address="bounce@simulator.amazonses.com",
@@ -1261,8 +1544,10 @@ class CustomBackendEmailTest(RestartSentEmailQuotaMixin, TestCase):
         self.assertEqual(
             stored_email[0].to, ["success@simulator.amazonses.com"]
         )
-        self.assertEqual(stored_email[0].plain_text, "Body goes here")
-        self.assertEqual(stored_email[0].html_message, "<p>Body goes here</p>")
+        self.assertEqual(stored_email[0].plain_text, "Body goes here\n")
+        self.assertEqual(
+            stored_email[0].html_message, "<p>Body goes here</p>\n"
+        )
 
         # Confirm if email is sent
         self.assertEqual(len(mail.outbox), 1)
@@ -1276,8 +1561,48 @@ class CustomBackendEmailTest(RestartSentEmailQuotaMixin, TestCase):
         # Verify if the email unique identifier "X-CL-ID" header was added
         self.assertTrue(message_sent.extra_headers["X-CL-ID"])
         # Compare body contents
-        self.assertEqual(plaintext_body, "Body goes here")
-        self.assertEqual(html_body, "<p>Body goes here</p>")
+        self.assertEqual(plaintext_body, "Body goes here\n")
+        self.assertEqual(html_body, "<p>Body goes here</p>\n")
+
+    @patch("boto3.Session")
+    def test_email_as_bytes_ses_compatibility(
+        self, mock_session: MagicMock
+    ) -> None:
+        """Verify django-ses email sending works with Python 3.13.
+
+        This is a regression test for issue #6736 where Python 3.13 removed
+        the `linesep` parameter from Message.as_bytes(), causing a TypeError
+        when sending emails via django-ses. The fix was to upgrade django-ses
+        to a version with Python 3.13 support (4.6.0+).
+
+        This test uses the actual SESBackend with a mocked boto3 session to
+        exercise the code path that calls message.as_bytes().
+        """
+        # Mock the boto3 session and SES client
+        mock_client = MagicMock()
+        mock_client.send_raw_email.return_value = {
+            "MessageId": "test-id",
+            "ResponseMetadata": {"RequestId": "test-request-id"},
+        }
+        mock_session.return_value.client.return_value = mock_client
+
+        email = EmailMultiAlternatives(
+            subject="Test as_bytes compatibility",
+            body="Plain text body",
+            from_email="testing@courtlistener.com",
+            to=["success@simulator.amazonses.com"],
+        )
+        email.attach_alternative("<p>HTML body</p>", "text/html")
+
+        # Send through the actual SES backend - this exercises the code path
+        # that calls message.as_bytes() internally. Before django-ses 4.6.0,
+        # this would raise: TypeError: Message.as_bytes() got an unexpected
+        # keyword argument 'linesep'
+        backend = SESBackend()
+        backend.send_messages([email])
+
+        # Verify the mocked SES client was called
+        mock_client.send_raw_email.assert_called_once()
 
     def test_email_message_class(self) -> None:
         """This test checks if Django EmailMessage class works properly using
@@ -1289,7 +1614,7 @@ class CustomBackendEmailTest(RestartSentEmailQuotaMixin, TestCase):
             "Body goes here",
             "testing@courtlistener.com",
             ["success@simulator.amazonses.com"],
-            ["bcc_success@simulator.amazonses.com"],
+            bcc=["bcc_success@simulator.amazonses.com"],
             cc=["cc_success@simulator.amazonses.com"],
             headers={"X-Entity-Ref-ID": "9598e6b0-d88c-488e"},
             reply_to=["reply_success@simulator.amazonses.com"],
@@ -1303,7 +1628,7 @@ class CustomBackendEmailTest(RestartSentEmailQuotaMixin, TestCase):
         self.assertEqual(
             stored_email[0].to, ["success@simulator.amazonses.com"]
         )
-        self.assertEqual(stored_email[0].plain_text, "Body goes here")
+        self.assertEqual(stored_email[0].plain_text, "Body goes here\n")
         self.assertEqual(
             stored_email[0].bcc, ["bcc_success@simulator.amazonses.com"]
         )
@@ -1329,7 +1654,7 @@ class CustomBackendEmailTest(RestartSentEmailQuotaMixin, TestCase):
         # Verify if the email unique identifier "X-CL-ID" header was added
         self.assertTrue(message_sent.extra_headers["X-CL-ID"])
         # Compare body contents, this message only has plain/text version
-        self.assertEqual(plaintext_body, "Body goes here")
+        self.assertEqual(plaintext_body, "Body goes here\n")
         self.assertEqual(html_body, "")
 
     def test_multialternative_email(self) -> None:
@@ -1340,14 +1665,14 @@ class CustomBackendEmailTest(RestartSentEmailQuotaMixin, TestCase):
 
         msg = EmailMultiAlternatives(
             subject="This is the subject",
-            body="Body goes here",
+            body="Body goes here 世界 ñ ⚖️",
             from_email="testing@courtlistener.com",
             to=["success@simulator.amazonses.com"],
             bcc=["bcc_success@simulator.amazonses.com"],
             cc=["cc_success@simulator.amazonses.com"],
-            headers={f"X-Entity-Ref-ID": "9598e6b0-d88c-488e"},
+            headers={"X-Entity-Ref-ID": "9598e6b0-d88c-488e"},
         )
-        html = "<p>Body goes here</p>"
+        html = "<p>Body goes here 世界 ñ ⚖️</p>"
         msg.attach_alternative(html, "text/html")
         msg.send()
 
@@ -1357,8 +1682,12 @@ class CustomBackendEmailTest(RestartSentEmailQuotaMixin, TestCase):
         self.assertEqual(
             stored_email[0].to, ["success@simulator.amazonses.com"]
         )
-        self.assertEqual(stored_email[0].plain_text, "Body goes here")
-        self.assertEqual(stored_email[0].html_message, "<p>Body goes here</p>")
+        self.assertEqual(
+            stored_email[0].plain_text, "Body goes here 世界 ñ ⚖️\n"
+        )
+        self.assertEqual(
+            stored_email[0].html_message, "<p>Body goes here 世界 ñ ⚖️</p>\n"
+        )
         self.assertEqual(
             stored_email[0].bcc, ["bcc_success@simulator.amazonses.com"]
         )
@@ -1381,8 +1710,8 @@ class CustomBackendEmailTest(RestartSentEmailQuotaMixin, TestCase):
         # Verify if the email unique identifier "X-CL-ID" header was added
         self.assertTrue(message_sent.extra_headers["X-CL-ID"])
         # Compare body contents, this message has a plain and html version
-        self.assertEqual(plaintext_body, "Body goes here")
-        self.assertEqual(html_body, "<p>Body goes here</p>")
+        self.assertEqual(plaintext_body, "Body goes here 世界 ñ ⚖️\n")
+        self.assertEqual(html_body, "<p>Body goes here 世界 ñ ⚖️</p>\n")
 
     def test_multialternative_only_plain_email(self) -> None:
         """This test checks if Django EmailMultiAlternatives class works
@@ -1397,14 +1726,14 @@ class CustomBackendEmailTest(RestartSentEmailQuotaMixin, TestCase):
             to=["success@simulator.amazonses.com"],
             bcc=["bcc_success@simulator.amazonses.com"],
             cc=["cc_success@simulator.amazonses.com"],
-            headers={f"X-Entity-Ref-ID": "9598e6b0-d88c-488e"},
+            headers={"X-Entity-Ref-ID": "9598e6b0-d88c-488e"},
         )
         msg.send()
 
         # Retrieve stored email and compare content
         stored_email = EmailSent.objects.all()
         self.assertEqual(stored_email.count(), 1)
-        self.assertEqual(stored_email[0].plain_text, "Body goes here")
+        self.assertEqual(stored_email[0].plain_text, "Body goes here\n")
         self.assertEqual(stored_email[0].html_message, "")
 
         # Confirm if email is sent
@@ -1421,7 +1750,7 @@ class CustomBackendEmailTest(RestartSentEmailQuotaMixin, TestCase):
         self.assertTrue(message_sent.extra_headers["X-Entity-Ref-ID"])
         self.assertTrue(message_sent.extra_headers["X-CL-ID"])
         # Compare body contents, this message has only plain/text version
-        self.assertEqual(plaintext_body, "Body goes here")
+        self.assertEqual(plaintext_body, "Body goes here\n")
         self.assertEqual(html_body, "")
 
     def test_multialternative_only_html_email(self) -> None:
@@ -1437,14 +1766,14 @@ class CustomBackendEmailTest(RestartSentEmailQuotaMixin, TestCase):
             to=["success@simulator.amazonses.com"],
             bcc=["bcc_success@simulator.amazonses.com"],
             cc=["cc_success@simulator.amazonses.com"],
-            headers={f"X-Entity-Ref-ID": "9598e6b0-d88c-488e"},
+            headers={"X-Entity-Ref-ID": "9598e6b0-d88c-488e"},
         )
         msg.content_subtype = "html"
         msg.send()
 
         # Retrieve stored email and compare content
         stored_email = EmailSent.objects.latest("id")
-        self.assertEqual(stored_email.html_message, "<p>Body goes here</p>")
+        self.assertEqual(stored_email.html_message, "<p>Body goes here</p>\n")
         self.assertEqual(stored_email.plain_text, "")
 
         # Confirm if email is sent
@@ -1459,7 +1788,7 @@ class CustomBackendEmailTest(RestartSentEmailQuotaMixin, TestCase):
         self.assertTrue(message_sent.extra_headers["X-CL-ID"])
         # Compare body contents, this message has only html/text version
         self.assertEqual(plaintext_body, "")
-        self.assertEqual(html_body, "<p>Body goes here</p>")
+        self.assertEqual(html_body, "<p>Body goes here</p>\n")
 
     def test_sending_email_with_attachment(self) -> None:
         """This test checks if Django EmailMessage class works
@@ -1471,7 +1800,7 @@ class CustomBackendEmailTest(RestartSentEmailQuotaMixin, TestCase):
             "Body goes here",
             "testing@courtlistener.com",
             ["success@simulator.amazonses.com"],
-            ["bcc_success@simulator.amazonses.com"],
+            bcc=["bcc_success@simulator.amazonses.com"],
             cc=["cc_success@simulator.amazonses.com"],
             headers={"X-Entity-Ref-ID": "9598e6b0-d88c-488e"},
         )
@@ -1591,7 +1920,7 @@ class CustomBackendEmailTest(RestartSentEmailQuotaMixin, TestCase):
             bcc=["bcc_success@simulator.amazonses.com"],
             cc=["cc_success@simulator.amazonses.com"],
             reply_to=["reply_success@simulator.amazonses.com"],
-            headers={f"X-Entity-Ref-ID": "9598e6b0-d88c-488e"},
+            headers={"X-Entity-Ref-ID": "9598e6b0-d88c-488e"},
         )
         html = "<p>Body goes here</p>"
         msg.attach_alternative(html, "text/html")
@@ -1611,7 +1940,7 @@ class CustomBackendEmailTest(RestartSentEmailQuotaMixin, TestCase):
             stored_email.plain_text,
             stored_email.from_email,
             stored_email.to,
-            stored_email.bcc,
+            bcc=stored_email.bcc,
             cc=stored_email.cc,
             reply_to=stored_email.reply_to,
             headers=stored_email.headers,
@@ -1633,8 +1962,8 @@ class CustomBackendEmailTest(RestartSentEmailQuotaMixin, TestCase):
         plaintext_body, html_body = get_email_body(message)
         # Compare second message sent with the original message content
         self.assertEqual(message_sent.subject, "This is the subject")
-        self.assertEqual(plaintext_body, "Body goes here")
-        self.assertEqual(html_body, "<p>Body goes here</p>")
+        self.assertEqual(plaintext_body, "Body goes here\n")
+        self.assertEqual(html_body, "<p>Body goes here</p>\n")
         self.assertEqual(message_sent.from_email, "testing@courtlistener.com")
         self.assertEqual(message_sent.to, ["success@simulator.amazonses.com"])
         self.assertEqual(
@@ -1719,7 +2048,7 @@ class CustomBackendEmailTest(RestartSentEmailQuotaMixin, TestCase):
                 "bounce@simulator.amazonses.com",
                 "<complaint@simulator.amazonses.com>",
             ],
-            ["BCC User <bcc@example.com>", "bcc@example.com"],
+            bcc=["BCC User <bcc@example.com>", "bcc@example.com"],
             cc=["CC User <cc@example.com>", "cc@example.com"],
             reply_to=["Reply User <another@example.com>", "reply@example.com"],
             headers={"X-Entity-Ref-ID": "9598e6b0-d88c-488e"},
@@ -1757,12 +2086,12 @@ class CustomBackendEmailTest(RestartSentEmailQuotaMixin, TestCase):
         plaintext_body, html_body = get_email_body(message)
 
         # Confirm if normal email version is sent
-        self.assertEqual(plaintext_body, "Body goes here")
+        self.assertEqual(plaintext_body, "Body goes here\n")
 
         # Retrieve stored email and compare content
         stored_email = EmailSent.objects.all()
         self.assertEqual(stored_email.count(), 1)
-        self.assertEqual(stored_email[0].plain_text, "Body goes here")
+        self.assertEqual(stored_email[0].plain_text, "Body goes here\n")
         self.assertEqual(
             stored_email[0].from_email,
             "User Admin <testing@courtlistener.com>",
@@ -1957,7 +2286,7 @@ class CustomBackendEmailTest(RestartSentEmailQuotaMixin, TestCase):
         returned True.
         """
         total = 0
-        for i in range(50):
+        for _ in range(50):
             val = self.call_bcc_random(message, bcc_rate, iterations)
             total = total + val
         average = total / 50
@@ -2045,7 +2374,7 @@ class CustomBackendEmailTest(RestartSentEmailQuotaMixin, TestCase):
             [
                 "Admin User <success@simulator.amazonses.com>",
             ],
-            ("BCC User <bcc@example.com>", "bcc@example.com"),
+            bcc=("BCC User <bcc@example.com>", "bcc@example.com"),
         )
         email.send()
         message_sent = mail.outbox[1]
@@ -2096,7 +2425,7 @@ class CustomBackendEmailTest(RestartSentEmailQuotaMixin, TestCase):
             [
                 "Admin User <success@simulator.amazonses.com>",
             ],
-            ("BCC User <bcc@example.com>", "bcc@example.com"),
+            bcc=("BCC User <bcc@example.com>", "bcc@example.com"),
         )
         email.send()
         message_sent = mail.outbox[1]
@@ -2111,9 +2440,14 @@ class CustomBackendEmailTest(RestartSentEmailQuotaMixin, TestCase):
             stored_email[1].bcc, ["bcc@example.com", "bcc@example.com"]
         )
 
+    @patch(
+        "cl.lib.email_backends.get_email_prefix",
+        return_value="test-email-counter",
+    )
     @override_settings(EMAIL_MAX_TEMP_COUNTER=5)
-    def test_redis_email_counter(self) -> None:
+    def test_redis_email_counter(self, mock_prefix) -> None:
         """Test logic to count the number of emails sent by the app"""
+        self.restart_sent_email_quota("test-email-counter")
         for i in range(23):
             email = EmailMessage(
                 f"This is the subject {i}",
@@ -2123,18 +2457,22 @@ class CustomBackendEmailTest(RestartSentEmailQuotaMixin, TestCase):
             )
             email.send()
 
-        r = make_redis_interface("CACHE")
-        self.assertEqual(int(r.get("email:temp_counter")), 3)
-        self.assertEqual(r.zcard("email:delivery_attempts"), 4)
+        r = get_redis_interface("CACHE")
+        self.assertEqual(int(r.get("test-email-counter:temp_counter")), 3)
+        self.assertEqual(r.zcard("test-email-counter:delivery_attempts"), 4)
         email_counter = get_email_count(r)
         self.assertEqual(email_counter, 23)
 
+    @patch(
+        "cl.lib.email_backends.get_email_prefix",
+        return_value="test-emergency-break",
+    )
     @override_settings(
         EMAIL_EMERGENCY_THRESHOLD=5,
     )
-    def test_daily_quota_emergency_brake(self) -> None:
+    def test_daily_quota_emergency_brake(self, mock_prefix) -> None:
         """Test email daily quota emergency brake"""
-
+        self.restart_sent_email_quota("test-emergency-break")
         # Send 5 emails independently.
         for i in range(5):
             email = EmailMessage(
@@ -2150,13 +2488,13 @@ class CustomBackendEmailTest(RestartSentEmailQuotaMixin, TestCase):
         stored_email = EmailSent.objects.all()
         self.assertEqual(stored_email.count(), 5)
 
-        r = make_redis_interface("CACHE")
+        r = get_redis_interface("CACHE")
         email_counter = get_email_count(r)
         self.assertEqual(email_counter, 5)
 
         # Send an additional email that exceeds the quota.
         email = EmailMessage(
-            f"This is the subject 6",
+            "This is the subject 6",
             "Body goes here",
             "testing@courtlistener.com",
             ["bounce@simulator.amazonses.com"],
@@ -2167,12 +2505,16 @@ class CustomBackendEmailTest(RestartSentEmailQuotaMixin, TestCase):
         # No additional messsage should be stored.
         self.assertEqual(stored_email.count(), 5)
 
+    @patch(
+        "cl.lib.email_backends.get_email_prefix",
+        return_value="test-mass-email",
+    )
     @override_settings(
         EMAIL_EMERGENCY_THRESHOLD=5,
     )
-    def test_daily_quota_emergency_brake_mass_mail(self) -> None:
+    def test_daily_quota_emergency_brake_mass_mail(self, mock_prefix) -> None:
         """Test email daily quota emergency brake sending mass email."""
-
+        self.restart_sent_email_quota("test-mass-email")
         # Send 5 emails at once.
         messages = []
         for i in range(5):
@@ -2190,13 +2532,13 @@ class CustomBackendEmailTest(RestartSentEmailQuotaMixin, TestCase):
         self.assertEqual(len(mail.outbox), 5)
         stored_email = EmailSent.objects.all()
         self.assertEqual(stored_email.count(), 5)
-        r = make_redis_interface("CACHE")
+        r = get_redis_interface("CACHE")
         email_counter = get_email_count(r)
         self.assertEqual(email_counter, 5)
 
         # Send an additional email that exceeds the quota.
         email = EmailMessage(
-            f"This is the subject 6",
+            "This is the subject 6",
             "Body goes here",
             "testing@courtlistener.com",
             ["bounce@simulator.amazonses.com"],
@@ -2302,8 +2644,8 @@ class RetryFailedEmailTest(RestartSentEmailQuotaMixin, TestCase):
 
         # Check if warning is logged
         mock_logging.warning.assert_called_with(
-            f"The message: 5e9b3e8e-93c8-497f-abd4-00f6ddd566f0 can't be "
-            "enqueued because it doesn't exist anymore."
+            "The message: %s can't be enqueued because it doesn't exist anymore.",
+            "5e9b3e8e-93c8-497f-abd4-00f6ddd566f0",
         )
 
     def test_compose_message_from_db_retrieve_user_email(self) -> None:
@@ -2323,7 +2665,7 @@ class RetryFailedEmailTest(RestartSentEmailQuotaMixin, TestCase):
             bcc=["bcc_success@simulator.amazonses.com"],
             cc=["cc_success@simulator.amazonses.com"],
             reply_to=["reply_success@simulator.amazonses.com"],
-            headers={f"X-Entity-Ref-ID": "9598e6b0-d88c-488e"},
+            headers={"X-Entity-Ref-ID": "9598e6b0-d88c-488e"},
         )
         html = "<p>Body goes here</p>"
         msg.attach_alternative(html, "text/html")
@@ -2350,8 +2692,8 @@ class RetryFailedEmailTest(RestartSentEmailQuotaMixin, TestCase):
 
         # Compare second message sent with the original message content
         self.assertEqual(message_sent.subject, "This is the subject")
-        self.assertEqual(plaintext_body, "Body goes here")
-        self.assertEqual(html_body, "<p>Body goes here</p>")
+        self.assertEqual(plaintext_body, "Body goes here\n")
+        self.assertEqual(html_body, "<p>Body goes here</p>\n")
         self.assertEqual(message_sent.from_email, "testing@courtlistener.com")
         self.assertEqual(message_sent.to, ["new_address@courtlistener.com"])
         self.assertEqual(message_sent.bcc, [])
@@ -2388,7 +2730,7 @@ class RetryFailedEmailTest(RestartSentEmailQuotaMixin, TestCase):
         message = message_sent.message()
         plaintext_body, html_body = get_email_body(message)
         self.assertEqual(message_sent.subject, "This is the subject")
-        self.assertEqual(plaintext_body, "Body goes here")
+        self.assertEqual(plaintext_body, "Body goes here\n")
         self.assertEqual(message_sent.from_email, "testing@courtlistener.com")
         self.assertEqual(message_sent.to, ["anon_address@courtlistener.com"])
 
@@ -2485,7 +2827,7 @@ class RetryFailedEmailTest(RestartSentEmailQuotaMixin, TestCase):
         # Emails are sent
         self.assertEqual(len(mail.outbox), 2)
         # Retrieve the stored messages and update its message_id for testing
-        stored_emails = list(EmailSent.objects.all())
+        stored_emails = list(EmailSent.objects.all().order_by("pk"))
         stored_emails[0].message_id = "5e9b3e8e-93c8-497f-abd4-00f6ddd566f0"
         stored_emails[0].save()
 
@@ -2887,7 +3229,7 @@ class EmailBrokenTest(ESIndexTestCase, TestCase):
         user.password = make_password("password")
         await user.asave()
         # Authenticate user
-        login = await sync_to_async(self.async_client.login)(
+        login = await self.async_client.alogin(
             username=user.username, password="password"
         )
         r = await self.async_client.get(path)
@@ -2938,7 +3280,7 @@ class EmailBrokenTest(ESIndexTestCase, TestCase):
         user.email = "complaint@simulator.amazonses.com"
         user.password = make_password("password")
         await user.asave()
-        login = await sync_to_async(self.async_client.login)(
+        login = await self.async_client.alogin(
             username=user.username, password="password"
         )
         r = await self.async_client.get(path)
@@ -2972,7 +3314,7 @@ class EmailBrokenTest(ESIndexTestCase, TestCase):
         user.password = make_password("password")
         await user.asave()
         # Authenticate user
-        login = await sync_to_async(self.async_client.login)(
+        login = await self.async_client.alogin(
             username=user.username, password="password"
         )
         r = await self.async_client.get(path)
@@ -3015,7 +3357,7 @@ class EmailBrokenTest(ESIndexTestCase, TestCase):
         # email error.
         user.email = "new@simulator.amazonses.com"
         await user.asave()
-        login = await sync_to_async(self.async_client.login)(
+        login = await self.async_client.alogin(
             username=user.username, password="password"
         )
 
@@ -3033,7 +3375,7 @@ class EmailBrokenTest(ESIndexTestCase, TestCase):
         user.email = "bounce@simulator.amazonses.com"
         user.password = make_password("password")
         await user.asave()
-        await sync_to_async(self.async_client.login)(
+        await self.async_client.alogin(
             username=user.username, password="password"
         )
         r = await self.async_client.get(path)
@@ -3079,73 +3421,6 @@ class MockResponse:
         return self.json_data
 
 
-class MoosendTest(TestCase):
-    email = "testing@courtlistener.com"  # Test email address
-
-    def mock_subscribe_valid(*args, **kwargs):
-        data = {
-            "Code": 0,
-            "Error": None,
-            "Context": {
-                "ID": "38fb8eb6-cca5-43d5-b61b-2c36334ad7d0",
-                "Name": None,
-                "Mobile": None,
-                "Email": "testing@courtlistener.com",
-                "CreatedOn": "/Date(1655320447877)/",
-                "UpdatedOn": None,
-                "UnsubscribedOn": None,
-                "UnsubscribedFromID": None,
-                "SubscribeType": 1,
-                "SubscribeMethod": 2,
-                "CustomFields": [],
-                "RemovedOn": None,
-                "Tags": [],
-            },
-        }
-
-        return MockResponse(data, 200)
-
-    def mock_unsubscribe_valid(*args, **kwargs):
-        data = {"Code": 0, "Error": None, "Context": None}
-        return MockResponse(data, 200)
-
-    @mock.patch(
-        "cl.users.tasks.requests.post", side_effect=mock_subscribe_valid
-    )
-    def test_subscribe(self, mocked_post) -> None:
-        """This test checks that moosend mailing list subscription is successful"""
-        logger = logging.getLogger("cl.users.tasks")
-        action = "subscribe"
-        with mock.patch.object(logger, "info") as mock_info:
-            update_moosend_subscription.delay(self.email, action)
-            # It's implemented like this because logging library is optimized to use %s
-            # formatting style, avoids call  __str__() method automatically, also logs
-            # from update_moosend_subscription are in %s style
-            mock_info.assert_called_once_with(
-                "Successfully completed '%s' action on '%s' in moosend.",
-                action,
-                self.email,
-            )
-
-    @mock.patch(
-        "cl.users.tasks.requests.post", side_effect=mock_unsubscribe_valid
-    )
-    def test_unsubscribe(self, mocked_post) -> None:
-        """This test checks that moosend mailing list unsubscription is successful"""
-        logger = logging.getLogger("cl.users.tasks")
-        action = "unsubscribe"
-        with mock.patch.object(logger, "info") as mock_info:
-            update_moosend_subscription.delay(self.email, action)
-            # It's implemented like this because logging library is optimized to use %s
-            # formatting style, avoids call __str__() method automatically, also logs
-            # from update_moosend_subscription are in %s style
-            mock_info.assert_called_once_with(
-                "Successfully completed '%s' action on '%s' in moosend.",
-                action,
-                self.email,
-            )
-
-
 class WebhooksHTMXTests(APITestCase):
     """Check that API CRUD operations are working well for search webhooks."""
 
@@ -3162,28 +3437,30 @@ class WebhooksHTMXTests(APITestCase):
     def tearDown(cls):
         Webhook.objects.all().delete()
 
-    def make_a_webhook(
+    async def make_a_webhook(
         self,
         client,
         url="https://example.com",
         event_type=WebhookEventType.DOCKET_ALERT,
         enabled=True,
+        version=WebhookVersions.v1,
     ):
         data = {
             "url": url,
             "event_type": event_type,
             "enabled": enabled,
+            "version": version,
         }
-        return client.post(self.webhook_path, data)
+        return await client.post(self.webhook_path, data)
 
     async def test_make_an_webhook(self) -> None:
         """Can we make a webhook?"""
 
         # Make a webhook
         webhooks = Webhook.objects.all()
-        response = await sync_to_async(self.make_a_webhook)(self.client)
+        response = await self.make_a_webhook(self.client)
         self.assertEqual(await webhooks.acount(), 1)
-        self.assertEqual(response.status_code, HTTP_201_CREATED)
+        self.assertEqual(response.status_code, HTTPStatus.CREATED)
 
         # New or updated webhook notification for admins should go out
         self.assertEqual(len(mail.outbox), 1)
@@ -3195,26 +3472,26 @@ class WebhooksHTMXTests(APITestCase):
 
         # Make a webhook
         webhooks = Webhook.objects.all()
-        response = await sync_to_async(self.make_a_webhook)(
+        response = await self.make_a_webhook(
             self.client, url="http://example.com"
         )
         # No webhook should be created since we don't allow HTTP endpoints.
         self.assertEqual(await webhooks.acount(), 0)
-        self.assertEqual(response.status_code, HTTP_200_OK)
+        self.assertEqual(response.status_code, HTTPStatus.OK)
 
     async def test_list_users_webhooks(self) -> None:
         """Can we list user's own webhooks?"""
 
         # Make a webhook for user_1
-        await sync_to_async(self.make_a_webhook)(self.client)
+        await self.make_a_webhook(self.client)
 
         webhook_path_list = reverse(
             "webhooks-list",
             kwargs={"format": "html"},
         )
         # Get the webhooks for user_1
-        response = await sync_to_async(self.client.get)(webhook_path_list)
-        self.assertEqual(response.status_code, HTTP_200_OK)
+        response = await self.client.get(webhook_path_list)
+        self.assertEqual(response.status_code, HTTPStatus.OK)
 
     async def test_delete_webhook(self) -> None:
         """Can we delete a webhook?
@@ -3222,10 +3499,10 @@ class WebhooksHTMXTests(APITestCase):
         """
 
         # Make two webhooks for user_1
-        await sync_to_async(self.make_a_webhook)(
+        await self.make_a_webhook(
             self.client, event_type=WebhookEventType.DOCKET_ALERT
         )
-        await sync_to_async(self.make_a_webhook)(
+        await self.make_a_webhook(
             self.client, event_type=WebhookEventType.SEARCH_ALERT
         )
 
@@ -3239,10 +3516,8 @@ class WebhooksHTMXTests(APITestCase):
         )
 
         # Delete the webhook for user_1
-        response = await sync_to_async(self.client.delete)(
-            webhook_1_path_detail
-        )
-        self.assertEqual(response.status_code, HTTP_204_NO_CONTENT)
+        response = await self.client.delete(webhook_1_path_detail)
+        self.assertEqual(response.status_code, HTTPStatus.NO_CONTENT)
         self.assertEqual(await webhooks.acount(), 1)
 
         webhooks_first = await webhooks.afirst()
@@ -3252,10 +3527,8 @@ class WebhooksHTMXTests(APITestCase):
         )
 
         # user_2 tries to delete a user_1 webhook, it should fail
-        response = await sync_to_async(self.client_2.delete)(
-            webhook_2_path_detail
-        )
-        self.assertEqual(response.status_code, HTTP_404_NOT_FOUND)
+        response = await self.client_2.delete(webhook_2_path_detail)
+        self.assertEqual(response.status_code, HTTPStatus.NOT_FOUND)
         self.assertEqual(await webhooks.acount(), 1)
 
     async def test_webhook_detail(self) -> None:
@@ -3264,7 +3537,7 @@ class WebhooksHTMXTests(APITestCase):
         """
 
         # Make one webhook for user_1
-        await sync_to_async(self.make_a_webhook)(self.client)
+        await self.make_a_webhook(self.client)
         webhooks = Webhook.objects.all()
         self.assertEqual(await webhooks.acount(), 1)
         webhooks_first = await webhooks.afirst()
@@ -3274,20 +3547,18 @@ class WebhooksHTMXTests(APITestCase):
         )
 
         # Get the webhook detail for user_1
-        response = await sync_to_async(self.client.get)(webhook_1_path_detail)
-        self.assertEqual(response.status_code, HTTP_200_OK)
+        response = await self.client.get(webhook_1_path_detail)
+        self.assertEqual(response.status_code, HTTPStatus.OK)
 
         # user_2 tries to get user_1 webhook, it should fail
-        response = await sync_to_async(self.client_2.get)(
-            webhook_1_path_detail
-        )
-        self.assertEqual(response.status_code, HTTP_404_NOT_FOUND)
+        response = await self.client_2.get(webhook_1_path_detail)
+        self.assertEqual(response.status_code, HTTPStatus.NOT_FOUND)
 
     async def test_webhook_update(self) -> None:
         """Can we update a webhook?"""
 
         # Make one webhook for user_1
-        await sync_to_async(self.make_a_webhook)(self.client)
+        await self.make_a_webhook(self.client)
         webhooks = Webhook.objects.all()
         self.assertEqual(await webhooks.acount(), 1)
 
@@ -3307,13 +3578,12 @@ class WebhooksHTMXTests(APITestCase):
             "url": "https://example.com/updated",
             "event_type": webhooks_first.event_type,
             "enabled": webhooks_first.enabled,
+            "version": webhooks_first.version,
         }
-        response = await sync_to_async(self.client.put)(
-            webhook_1_path_detail, data_updated
-        )
+        response = await self.client.put(webhook_1_path_detail, data_updated)
 
         # Check that the webhook was updated
-        self.assertEqual(response.status_code, HTTP_200_OK)
+        self.assertEqual(response.status_code, HTTPStatus.OK)
         webhooks_first = await webhooks.afirst()
         self.assertEqual(webhooks_first.url, "https://example.com/updated")
 
@@ -3326,7 +3596,7 @@ class WebhooksHTMXTests(APITestCase):
         """Can we send a test webhook event?"""
 
         # Make one webhook for user_1
-        await sync_to_async(self.make_a_webhook)(self.client)
+        await self.make_a_webhook(self.client)
         webhooks = Webhook.objects.all()
         self.assertEqual(await webhooks.acount(), 1)
 
@@ -3341,14 +3611,12 @@ class WebhooksHTMXTests(APITestCase):
                 200, mock_raw=True
             ),
         ):
-            response = await sync_to_async(self.client.post)(
-                webhook_1_path_test, {}
-            )
+            response = await self.client.post(webhook_1_path_test, {})
         # Compare the test webhook event data.
-        self.assertEqual(response.status_code, HTTP_200_OK)
+        self.assertEqual(response.status_code, HTTPStatus.OK)
         webhook_event = WebhookEvent.objects.all().order_by("date_created")
         webhook_event_first = await webhook_event.afirst()
-        self.assertEqual(webhook_event_first.status_code, HTTP_200_OK)
+        self.assertEqual(webhook_event_first.status_code, HTTPStatus.OK)
         self.assertEqual(webhook_event_first.debug, True)
         self.assertEqual(
             webhook_event_first.content["payload"]["results"][0]["id"],
@@ -3361,16 +3629,14 @@ class WebhooksHTMXTests(APITestCase):
                 500, mock_raw=True
             ),
         ):
-            response = await sync_to_async(self.client.post)(
-                webhook_1_path_test, {}
-            )
+            response = await self.client.post(webhook_1_path_test, {})
         # Compare the test webhook event data.
         self.assertEqual(await webhook_event.acount(), 2)
         webhook_event_last = await webhook_event.select_related(
             "webhook"
         ).alast()
         self.assertEqual(
-            webhook_event_last.status_code, HTTP_500_INTERNAL_SERVER_ERROR
+            webhook_event_last.status_code, HTTPStatus.INTERNAL_SERVER_ERROR
         )
         self.assertEqual(webhook_event_last.debug, True)
         self.assertEqual(
@@ -3379,6 +3645,54 @@ class WebhooksHTMXTests(APITestCase):
         )
         # Webhook failure count shouldn't be increased by a webhook test event
         self.assertEqual(webhook_event_last.webhook.failure_count, 0)
+
+    async def test_send_webhook_test_all_types(self) -> None:
+        """Can we send a webhook test event for all webhook types?"""
+
+        test_cases = {
+            f"{event_type.label} - {version.label}": {
+                "event_type": event_type,
+                "version": version,
+            }
+            for event_type, version in product(
+                WebhookEventType, WebhookVersions
+            )
+        }
+
+        for label, params in test_cases.items():
+            with self.subTest(label=label):
+                await Webhook.objects.all().adelete()
+                await WebhookEvent.objects.all().adelete()
+                await self.make_a_webhook(
+                    self.client,
+                    event_type=params["event_type"],
+                    version=params["version"],
+                )
+                webhooks = Webhook.objects.all()
+                self.assertEqual(await webhooks.acount(), 1)
+
+                webhooks_first = await webhooks.afirst()
+                webhook_1_path_test = reverse(
+                    "webhooks-test-webhook",
+                    kwargs={"pk": webhooks_first.pk, "format": "json"},
+                )
+                with mock.patch(
+                    "cl.api.webhooks.requests.post",
+                    side_effect=lambda *args, **kwargs: MockPostResponse(
+                        200, mock_raw=True
+                    ),
+                ):
+                    response = await self.client.post(webhook_1_path_test, {})
+                # Compare the test webhook event data.
+                self.assertEqual(response.status_code, HTTPStatus.OK)
+                webhook_event = WebhookEvent.objects.all().order_by(
+                    "date_created"
+                )
+                webhook_event_first = await webhook_event.afirst()
+                self.assertEqual(
+                    webhook_event_first.status_code, HTTPStatus.OK
+                )
+                self.assertEqual(webhook_event_first.debug, True)
 
     async def test_list_webhook_events(self) -> None:
         """Can we list the user's webhook events?"""
@@ -3402,12 +3716,10 @@ class WebhooksHTMXTests(APITestCase):
         self.assertEqual(await webhooks.acount(), 1)
 
         # Get the webhooks for user_1
-        response = await sync_to_async(self.client.get)(
-            webhook_event_path_list
-        )
-        self.assertEqual(response.status_code, HTTP_200_OK)
+        response = await self.client.get(webhook_event_path_list)
+        self.assertEqual(response.status_code, HTTPStatus.OK)
         # There shouldn't be results for user_1
-        self.assertEqual(response.content, b"\n\n")
+        self.assertEqual(response.content.strip(), b"")
 
         sa_webhook = await sync_to_async(WebhookFactory)(
             user=self.user_1,
@@ -3422,9 +3734,327 @@ class WebhooksHTMXTests(APITestCase):
         self.assertEqual(await webhooks.acount(), 2)
 
         # Get the webhooks for user_1
-        response = await sync_to_async(self.client.get)(
-            webhook_event_path_list
-        )
-        self.assertEqual(response.status_code, HTTP_200_OK)
+        response = await self.client.get(webhook_event_path_list)
+        self.assertEqual(response.status_code, HTTPStatus.OK)
         # There should be results for user_1
-        self.assertNotEqual(response.content, b"\n\n")
+        self.assertNotEqual(response.content.strip(), b"")
+
+    async def test_get_available_webhook_versions(self) -> None:
+        """Can we get users available versions for a webhook event type?"""
+
+        await sync_to_async(WebhookFactory)(
+            user=self.user_2,
+            event_type=WebhookEventType.DOCKET_ALERT,
+            url="https://example.com/",
+            version=WebhookVersions.v1,
+            enabled=True,
+        )
+
+        available_versions_path = reverse(
+            "webhooks-get-available-versions",
+            kwargs={"format": "html"},
+        )
+        webhooks = Webhook.objects.all()
+        self.assertEqual(await webhooks.acount(), 1)
+
+        # Test without event_type parameter
+        response = await self.client.get(available_versions_path)
+        self.assertEqual(response.status_code, HTTPStatus.OK)
+        # No version choices
+        self.assertIn("Select an event type first", response.content.decode())
+
+        # Test with event_type parameter for user_1 (no existing webhooks)
+        response = await self.client.get(
+            available_versions_path,
+            {"event_type": WebhookEventType.DOCKET_ALERT},
+        )
+        self.assertEqual(response.status_code, HTTPStatus.OK)
+        # Should return all versions available (1,2)
+        self.assertIn('value="1"', response.content.decode())
+        self.assertIn('value="2"', response.content.decode())
+
+        # Create a webhook with version 1 for user_1
+        await sync_to_async(WebhookFactory)(
+            user=self.user_1,
+            event_type=WebhookEventType.DOCKET_ALERT,
+            url="https://example.com/",
+            version=WebhookVersions.v1,
+            enabled=True,
+        )
+        self.assertEqual(await webhooks.acount(), 2)
+
+        # Test with event_type parameter for user_1 (has webhook with version 1)
+        response = await self.client.get(
+            available_versions_path,
+            {"event_type": WebhookEventType.DOCKET_ALERT},
+        )
+        self.assertEqual(response.status_code, HTTPStatus.OK)
+        # Should return  only version 2 available
+        self.assertNotIn('value="1"', response.content.decode())
+        self.assertIn('value="2"', response.content.decode())
+
+        # Test with a different event_type
+        response = await self.client.get(
+            available_versions_path,
+            {"event_type": WebhookEventType.SEARCH_ALERT},
+        )
+        self.assertEqual(response.status_code, HTTPStatus.OK)
+        # Should return all versions available for SEARCH_ALERT event type
+        self.assertIn('value="1"', response.content.decode())
+        self.assertIn('value="2"', response.content.decode())
+
+
+@override_settings(DEVELOPMENT=False)
+@patch("cl.users.tasks.NeonClient")
+class NeonAccountCreationTest(TestCase):
+    async def test_can_send_email_for_multiple_neon_accounts(
+        self, mock_neon_client
+    ) -> None:
+        """Tests whether we can send the email notification when multiple
+        neon accounts are found
+        """
+        # mock the search_account_by_email method to return array with two elements
+        mock_neon_client.return_value.search_account_by_email.return_value = [
+            {},
+            {},
+        ]
+
+        # Update the expiration since the fixture has one some time ago.
+        up = await sync_to_async(UserProfileWithParentsFactory.create)(
+            email_confirmed=False
+        )
+
+        r = await self.async_client.get(
+            reverse("email_confirm", args=[up.activation_key])
+        )
+        self.assertEqual(
+            200,
+            r.status_code,
+            msg="Did not get 200 code when activating account. "
+            f"Instead got {r.status_code}",
+        )
+
+        self.assertIn("[Action Needed]:", mail.outbox[-1].subject)
+        self.assertIn(up.user.email, mail.outbox[-1].subject)
+
+        self.assertIn(f"'{up.user.email}'", mail.outbox[-1].body)
+        self.assertIn(
+            f"https://www.courtlistener.com/admin/auth/user/{up.user.pk}/change/",
+            mail.outbox[-1].body,
+        )
+        self.assertIn(
+            "https://support.neonone.com/hc/en-us/articles/4407408776717-Account-Match-Queue",
+            mail.outbox[-1].body,
+        )
+
+    async def test_can_update_profile_with_neon_data(
+        self, mock_neon_client
+    ) -> None:
+        """Tests whether we can use the existing neon account to set
+        the neon_account_id in the user's profile.
+        """
+
+        # mock the search_account_by_email method to return array with one element
+        mock_neon_client.return_value.search_account_by_email.return_value = [
+            {"Account ID": "1256"}
+        ]
+
+        # Update the expiration since the fixture has one some time ago.
+        up = await sync_to_async(UserProfileWithParentsFactory.create)(
+            email_confirmed=False
+        )
+
+        r = await self.async_client.get(
+            reverse("email_confirm", args=[up.activation_key])
+        )
+        self.assertEqual(
+            200,
+            r.status_code,
+            msg="Did not get 200 code when activating account. "
+            f"Instead got {r.status_code}",
+        )
+
+        await up.arefresh_from_db()
+        self.assertEqual(up.neon_account_id, "1256")
+
+    async def test_can_create_neon_account(self, mock_neon_client) -> None:
+        """Tests whether we can create a new neon account after we
+        confirm the email address
+        """
+
+        # mock the search_account_by_email method to return am empty array
+        mock_neon_client.return_value.search_account_by_email.return_value = []
+
+        # mock the method to create a new user
+        mock_neon_client.return_value.create_account.return_value = 9876
+
+        # Update the expiration since the fixture has one some time ago.
+        up = await sync_to_async(UserProfileWithParentsFactory.create)(
+            email_confirmed=False
+        )
+
+        r = await self.async_client.get(
+            reverse("email_confirm", args=[up.activation_key])
+        )
+        self.assertEqual(
+            200,
+            r.status_code,
+            msg="Did not get 200 code when activating account. "
+            f"Instead got {r.status_code}",
+        )
+
+        await up.arefresh_from_db()
+        self.assertEqual(up.neon_account_id, "9876")
+
+
+@override_settings(DEVELOPMENT=False)
+@patch("cl.users.views.create_neon_account")
+@patch("cl.users.views.update_neon_account")
+class NeonAccountUpdateTest(TestCase):
+    def setUp(self) -> None:
+        self.client = AsyncClient()
+        self.up = UserProfileWithParentsFactory.create(
+            user__username="pandora",
+            user__password=make_password("password"),
+        )
+
+    async def test_can_call_update_task_when_account_id_found(
+        self, update_account_mock, create_account_mock
+    ) -> None:
+        """Tests whether we use the update task when the account has a neon_account_id"""
+        self.up.neon_account_id = "12345"
+        await self.up.asave()
+
+        await self.client.alogin(username="pandora", password="password")
+        r = await self.client.post(
+            reverse("view_settings"),
+            {
+                "first_name": "test_name",
+                "last_name": "test_last_name",
+                "email": self.up.user.email,
+            },
+            follow=True,
+        )
+
+        self.assertEqual(r.status_code, HTTPStatus.OK)
+        update_account_mock.delay.assert_called_once_with(self.up.user.pk)
+        create_account_mock.delay.assert_not_called()
+
+    async def test_can_call_create_task_when_no_account_id_found(
+        self, update_account_mock, create_account_mock
+    ) -> None:
+        """Tests whether we use the create task when the account does not have a neon_account_id"""
+        await self.client.alogin(username="pandora", password="password")
+        r = await self.client.post(
+            reverse("view_settings"),
+            {
+                "first_name": "test_name",
+                "last_name": "test_last_name",
+                "email": self.up.user.email,
+            },
+            follow=True,
+        )
+
+        self.assertEqual(r.status_code, HTTPStatus.OK)
+        create_account_mock.delay.assert_called_once_with(self.up.user.pk)
+        update_account_mock.delay.assert_not_called()
+
+
+@patch("cl.users.views.OptInConsentForm.is_valid", new=lambda self: True)
+@patch(
+    "cl.custom_filters.decorators.verify_honeypot_value",
+    new=lambda request, field_name: None,
+)
+class RegisterViewTest(TestCase):
+    async def test_register_with_valid_ascii_username(self) -> None:
+        """Register a user with a valid username."""
+        data = {
+            "username": "admin1",
+            "email": "admin1@example.com",
+            "first_name": "User",
+            "last_name": "Admin",
+            "password1": "TestPassw0rd!",
+            "password2": "TestPassw0rd!",
+            "consent": True,
+        }
+
+        response = await self.async_client.post(
+            reverse("register"), data, follow=True
+        )
+        self.assertEqual(response.status_code, HTTPStatus.OK)
+        self.assertTrue(await User.objects.filter(username="admin1").aexists())
+
+    async def test_register_rejects_homoglyph_username(self) -> None:
+        """Register a user with an invalid username containing a homoglyph.
+        It must be rejected:
+        """
+
+        invalid_username = "adm" + "\u0456" + "n2"
+        data = {
+            "username": invalid_username,
+            "email": "admin2@example.com",
+            "first_name": "User",
+            "last_name": "Admin",
+            "password1": "TestPassw0rd!",
+            "password2": "TestPassw0rd!",
+            "consent": True,
+        }
+
+        response = await self.async_client.post(
+            reverse("register"), data, follow=True
+        )
+        self.assertEqual(response.status_code, HTTPStatus.OK)
+        # The user must not be registered.
+        self.assertFalse(
+            await User.objects.filter(username=invalid_username).aexists()
+        )
+
+        form = response.context.get("form")
+        self.assertIsNotNone(form, "Expected 'form' in template context")
+        # The username field should display an error.
+        self.assertIn("username", form.errors)
+
+
+class UserAdminApiCallsCountTest(TestCase):
+    """Tests for UserAdmin.api_calls_count.
+
+    Fixes COURTLISTENER-C5S: DataError when visiting /admin/auth/user/add/
+    because obj.id is None for unsaved users.
+    """
+
+    @classmethod
+    def setUpTestData(cls) -> None:
+        cls.user = UserProfileWithParentsFactory.create().user
+
+    def setUp(self) -> None:
+        self.user_admin = UserAdmin(model=User, admin_site=admin.site)
+
+    def test_api_calls_count_returns_zero_for_unsaved_user(self) -> None:
+        """api_calls_count should return 0 when obj.id is None."""
+        unsaved_user = User()
+        result = self.user_admin.api_calls_count(unsaved_user)
+        self.assertEqual(result, 0)
+
+    @patch("cl.users.admin.get_redis_interface")
+    def test_api_calls_count_sums_v3_and_v4(
+        self, mock_get_redis: MagicMock
+    ) -> None:
+        """api_calls_count should sum scores from both v3 and v4 keys."""
+        mock_redis = MagicMock()
+        mock_redis.zscore.side_effect = lambda key, _: (
+            5.0 if "v3" in key else 10.0
+        )
+        mock_get_redis.return_value = mock_redis
+        result = self.user_admin.api_calls_count(self.user)
+        self.assertEqual(result, 15)
+
+    @patch("cl.users.admin.get_redis_interface")
+    def test_api_calls_count_handles_no_redis_data(
+        self, mock_get_redis: MagicMock
+    ) -> None:
+        """api_calls_count should return 0 when Redis has no data."""
+        mock_redis = MagicMock()
+        mock_redis.zscore.return_value = None
+        mock_get_redis.return_value = mock_redis
+        result = self.user_admin.api_calls_count(self.user)
+        self.assertEqual(result, 0)

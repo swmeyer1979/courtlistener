@@ -3,6 +3,7 @@
 Test Issue 412: Add admin-visible notice to various pages showing if they are
 blocked from search engines
 """
+
 from django.contrib.auth.hashers import make_password
 from django.urls import reverse
 from selenium.webdriver.common.by import By
@@ -75,7 +76,9 @@ class OpinionBlockedFromSearchEnginesTest(Base412Test):
 
         # She does NOT see a widget telling her the page is blocked
         sidebar = self.browser.find_element(By.ID, "sidebar")
-        self.assertNotIn(BLOCKED_MSG, sidebar.text)
+        self.assertNotIn("Admin", sidebar.text)
+        results = self.browser.find_elements(By.CSS_SELECTOR, "div.btn-danger")
+        self.assertEqual(len(results), 0)
 
     @timeout_decorator.timeout(SELENIUM_TIMEOUT)
     def test_admin_viewing_not_blocked_opinion(self) -> None:
@@ -91,7 +94,9 @@ class OpinionBlockedFromSearchEnginesTest(Base412Test):
 
         # She does NOT see a widget telling her the page is blocked
         sidebar = self.browser.find_element(By.ID, "sidebar")
-        self.assertNotIn(BLOCKED_MSG, sidebar.text)
+        self.assertIn("Admin", sidebar.text)
+        results = self.browser.find_elements(By.CSS_SELECTOR, "div.btn-danger")
+        self.assertEqual(len(results), 0)
 
 
 class DocketBlockedFromSearchEnginesTest(Base412Test):
@@ -141,9 +146,9 @@ class DocketBlockedFromSearchEnginesTest(Base412Test):
         self.assertEqual(
             actual_btn_count,
             expected_btn_count,
-            msg="Found %s button(s), but expected %s. Does the user have "
+            msg=f"Found {actual_btn_count} button(s), but expected {expected_btn_count}. Does the user have "
             "access to the blocked button they shouldn't or maybe the "
-            "page crashed?" % (actual_btn_count, expected_btn_count),
+            "page crashed?",
         )
 
     @timeout_decorator.timeout(SELENIUM_TIMEOUT)
@@ -182,8 +187,13 @@ class AudioBlockedFromSearchEnginesTest(Base412Test):
         self.browser.get(self.live_server_url)
         self.attempt_sign_in("admin", "password")
 
-        # She selects Oral Arguments to toggle the results to audio
+        # She selects the oral arguments dropdown
         self.browser.find_element(By.CSS_SELECTOR, "#navbar-oa a").click()
+
+        # And selects the search oral arguments link
+        self.browser.find_element(
+            By.LINK_TEXT, "Search Oral Arguments"
+        ).click()
 
         # She lands on the advanced search screen for OA, and does a wildcard
         # search.
@@ -207,8 +217,13 @@ class AudioBlockedFromSearchEnginesTest(Base412Test):
         self.browser.get(self.live_server_url)
         self.attempt_sign_in("pandora", "password")
 
-        # She selects Oral Arguments to toggle the results to audio
+        # She selects the oral arguments dropdown
         self.browser.find_element(By.CSS_SELECTOR, "#navbar-oa a").click()
+
+        # And selects the search oral arguments link
+        self.browser.find_element(
+            By.LINK_TEXT, "Search Oral Arguments"
+        ).click()
 
         # She lands on the advanced search screen for OA, and does a wildcard
         # search.
@@ -229,8 +244,13 @@ class AudioBlockedFromSearchEnginesTest(Base412Test):
         self.browser.get(self.live_server_url)
         self.attempt_sign_in("admin", "password")
 
-        # She selects Oral Arguments to toggle the results to audio
+        # She selects the oral arguments dropdown
         self.browser.find_element(By.CSS_SELECTOR, "#navbar-oa a").click()
+
+        # And selects the search oral arguments link
+        self.browser.find_element(
+            By.LINK_TEXT, "Search Oral Arguments"
+        ).click()
 
         # She lands on the advanced search screen for OA, and does a wildcard
         # search.

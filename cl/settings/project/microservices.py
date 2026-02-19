@@ -4,6 +4,23 @@ env = environ.FileAwareEnv()
 
 DISCLOSURE_HOST = env("DISCLOSURE_HOST", default="http://cl-disclosures:5050")
 DOCTOR_HOST = env("DOCTOR_HOST", default="http://cl-doctor:5050")
+INCEPTION_CPU_HOST = env(
+    "INCEPTION_CPU_HOST", default="http://host.docker.internal:8005"
+)
+INCEPTION_GPU_HOST = env(
+    "INCEPTION_GPU_HOST", default="http://host.docker.internal:8005"
+)
+INCEPTION_CPU_EMBEDDINGS_HOST = env(
+    "INCEPTION_CPU_EMBEDDINGS_HOST",
+    default="http://host.docker.internal:8005",
+)
+INCEPTION_TIMEOUT = env.int("INCEPTION_TIMEOUT", default=60)
+INCEPTION_TEXT_TIMEOUT_MULTIPLIER = env.int(
+    "INCEPTION_TEXT_TIMEOUT_MULTIPLIER", default=1
+)
+INCEPTION_BATCH_TIMEOUT_MULTIPLIER = env.int(
+    "INCEPTION_BATCH_TIMEOUT_MULTIPLIER", default=1
+)
 
 MICROSERVICE_URLS = {
     # DOCTOR Endpoints
@@ -18,6 +35,10 @@ MICROSERVICE_URLS = {
     },
     "document-extract-ocr": {
         "url": f"{DOCTOR_HOST}/extract/doc/text/",
+        "timeout": 60 * 90,
+    },
+    "recap-extract": {
+        "url": f"{DOCTOR_HOST}/extract/recap/text/",
         "timeout": 60 * 90,
     },
     # Utils Endpoints
@@ -54,6 +75,10 @@ MICROSERVICE_URLS = {
         "url": f"{DOCTOR_HOST}/convert/audio/mp3/",
         "timeout": 60 * 60,
     },
+    "downsize-audio": {
+        "url": f"{DOCTOR_HOST}/convert/audio/ogg/",
+        "timeout": 60 * 60,
+    },
     # Disclosure Microservices
     "disclosure-heartbeat": {
         "url": f"{DISCLOSURE_HOST}",
@@ -62,5 +87,21 @@ MICROSERVICE_URLS = {
     "extract-disclosure": {
         "url": f"{DISCLOSURE_HOST}/extract/disclosure/",
         "timeout": 60 * 60 * 2,
+    },
+    "inception-batch": {
+        "url": f"{INCEPTION_GPU_HOST}/api/v1/embed/batch",
+        "timeout": INCEPTION_TIMEOUT,
+    },
+    "inception-cpu-batch": {
+        "url": f"{INCEPTION_CPU_EMBEDDINGS_HOST}/api/v1/embed/batch",
+        "timeout": INCEPTION_TIMEOUT * INCEPTION_BATCH_TIMEOUT_MULTIPLIER,
+    },
+    "inception-query": {
+        "url": f"{INCEPTION_CPU_HOST}/api/v1/embed/query",
+        "timeout": INCEPTION_TIMEOUT,
+    },
+    "inception-text": {
+        "url": f"{INCEPTION_CPU_EMBEDDINGS_HOST}/api/v1/embed/text",
+        "timeout": INCEPTION_TIMEOUT * INCEPTION_TEXT_TIMEOUT_MULTIPLIER,
     },
 }

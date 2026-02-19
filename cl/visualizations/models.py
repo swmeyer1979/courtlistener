@@ -89,7 +89,7 @@ class SCOTUSMap(AbstractDateTimeModel):
     __original_deleted = None
 
     def __init__(self, *args, **kwargs):
-        super(SCOTUSMap, self).__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs)
         self.__original_deleted = self.deleted
 
     @property
@@ -104,12 +104,7 @@ class SCOTUSMap(AbstractDateTimeModel):
         except IndexError:
             return None
 
-    @property
-    def referers_displayed(self):
-        """Return good referers"""
-        return self.referers.filter(display=True).order_by("date_created")
-
-    def build_nx_digraph(
+    async def build_nx_digraph(
         self,
         parent_authority,
         visited_nodes,
@@ -201,7 +196,8 @@ class SCOTUSMap(AbstractDateTimeModel):
         if not any(blocking_conditions):
             visited_nodes[parent_authority.pk] = {"hops_taken": hops_taken}
             hops_taken += 1
-            for child_authority in parent_authority.authorities.filter(
+            authorities = await parent_authority.aauthorities()
+            async for child_authority in authorities.filter(
                 docket__court="scotus",
                 date_filed__gte=self.cluster_start.date_filed,
             ).order_by("date_filed"):
@@ -234,7 +230,7 @@ class SCOTUSMap(AbstractDateTimeModel):
                         if is_shorter:
                             # New route to a node that's shorter than the old
                             # route. Thus, we must re-recurse its children.
-                            sub_graph = self.build_nx_digraph(
+                            sub_graph = await self.build_nx_digraph(
                                 parent_authority=child_authority,
                                 visited_nodes=visited_nodes,
                                 good_nodes=good_nodes,
@@ -244,7 +240,7 @@ class SCOTUSMap(AbstractDateTimeModel):
                             )
                 else:
                     # No easy shortcuts. Recurse.
-                    sub_graph = self.build_nx_digraph(
+                    sub_graph = await self.build_nx_digraph(
                         parent_authority=child_authority,
                         visited_nodes=visited_nodes,
                         good_nodes=good_nodes,
@@ -268,12 +264,12 @@ class SCOTUSMap(AbstractDateTimeModel):
 
         return g
 
-    def add_clusters(self, g):
+    async def add_clusters(self, g):
         """Add clusters to the model using an existing nx graph."""
-        self.clusters.add(*g.nodes())
-        self.save()
+        await self.clusters.aadd(*g.nodes())
+        await self.asave()
 
-    def to_json(self, g):
+    async def to_json(self, g):
         """Make a JSON representation of a NetworkX graph of the data."""
         j = {
             "meta": {
@@ -284,7 +280,7 @@ class SCOTUSMap(AbstractDateTimeModel):
         }
 
         opinion_clusters = []
-        for cluster in self.clusters.all():
+        async for cluster in self.clusters.all():
             opinions_cited = {}
             for node in g.neighbors(cluster.pk):
                 opinions_cited[node] = {"opacitiy": 1}
@@ -315,9 +311,7 @@ class SCOTUSMap(AbstractDateTimeModel):
         return f"{getattr(self, 'pk', None)}: {self.title}"
 
     def get_absolute_url(self) -> str:
-        return reverse(
-            "view_visualization", kwargs={"pk": self.pk, "slug": self.slug}
-        )
+        return reverse("view_embedded_visualization", kwargs={"pk": self.pk})
 
     def make_title(self):
         """Make a title for the network
@@ -334,12 +328,7 @@ class SCOTUSMap(AbstractDateTimeModel):
             ]
             return next((_ for _ in case_name_preference if _), "Unknown")
 
-        return "{start} ({start_year}) to {end} ({end_year})".format(
-            start=get_best_case_name(self.cluster_start),
-            start_year=self.cluster_start.date_filed.year,
-            end=get_best_case_name(self.cluster_end),
-            end_year=self.cluster_end.date_filed.year,
-        )
+        return f"{get_best_case_name(self.cluster_start)} ({self.cluster_start.date_filed.year}) to {get_best_case_name(self.cluster_end)} ({self.cluster_end.date_filed.year})"
 
     def save(self, update_fields=None, *args, **kwargs):
         # Note that the title needs to be made first, so that the slug can be
@@ -364,43 +353,8 @@ class SCOTUSMap(AbstractDateTimeModel):
         if update_fields is not None:
             changeable_fields = {"title", "date_published", "date_created"}
             update_fields = changeable_fields.union(update_fields)
-        super(SCOTUSMap, self).save(
-            update_fields=update_fields, *args, **kwargs
-        )
+        super().save(update_fields=update_fields, *args, **kwargs)
         self.__original_deleted = self.deleted
-
-
-class Referer(AbstractDateTimeModel):
-    """Holds the referer domains where embedded maps are placed"""
-
-    map = models.ForeignKey(
-        SCOTUSMap,
-        help_text="The visualization that was embedded and which generated a "
-        "referer",
-        related_name="referers",
-        on_delete=models.CASCADE,
-    )
-    url = models.URLField(
-        help_text="The URL where this item was embedded.",
-        max_length=3000,
-        db_index=True,
-    )
-    page_title = models.CharField(
-        help_text="The title of the page where the item was embedded",
-        max_length=500,
-        blank=True,
-    )
-    display = models.BooleanField(
-        help_text="Should this item be displayed?",
-        default=False,
-    )
-
-    def __str__(self) -> str:
-        return f"{getattr(self, 'pk', None)}: Refers to {self.map}"
-
-    class Meta:
-        # Ensure that we don't have dups in the DB for a given map.
-        unique_together = (("map", "url"),)
 
 
 class JSONVersion(AbstractDateTimeModel):

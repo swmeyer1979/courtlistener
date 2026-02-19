@@ -15,7 +15,7 @@ class ConfirmedEmailAuthenticationForm(AuthenticationForm):
     """
 
     def __init__(self, *args, **kwargs) -> None:
-        super(ConfirmedEmailAuthenticationForm, self).__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs)
 
     def confirm_login_allowed(self, user: AbstractBaseUser) -> None:
         """Make sure the user is active and has a confirmed email address
@@ -33,6 +33,6 @@ class ConfirmedEmailAuthenticationForm(AuthenticationForm):
 
         if not user.profile.email_confirmed:  # type: ignore
             raise forms.ValidationError(
-                'Please <a href="%s">validate your email address</a> to '
-                "log in." % reverse("email_confirmation_request")
+                'Please <a href="{}">validate your email address</a> to '
+                "log in.".format(reverse("email_confirmation_request"))
             )

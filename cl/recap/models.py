@@ -9,6 +9,10 @@ from cl.search.models import Court, Docket, DocketEntry, RECAPDocument
 
 
 class UPLOAD_TYPE:
+    """This enumeration of upload types should be in sync with
+    recap-chrome/src/pacer.js: UPLOAD_TYPES [plural, sic]
+    """
+
     DOCKET = 1
     ATTACHMENT_PAGE = 2
     PDF = 3
@@ -24,6 +28,9 @@ class UPLOAD_TYPE:
     APPELLATE_CASE_QUERY_PAGE = 13
     CASE_QUERY_RESULT_PAGE = 14
     APPELLATE_CASE_QUERY_RESULT_PAGE = 15
+    ACMS_DOCKET_JSON = 16
+    ACMS_ATTACHMENT_PAGE = 17
+    FREE_OPINIONS_REPORT = 18
     NAMES = (
         (DOCKET, "HTML Docket"),
         (ATTACHMENT_PAGE, "HTML attachment page"),
@@ -40,6 +47,9 @@ class UPLOAD_TYPE:
         (APPELLATE_CASE_QUERY_PAGE, "Appellate Case query page"),
         (CASE_QUERY_RESULT_PAGE, "Case query result page"),
         (APPELLATE_CASE_QUERY_RESULT_PAGE, "Appellate Case query result page"),
+        (ACMS_DOCKET_JSON, "ACMS docket JSON object"),
+        (ACMS_ATTACHMENT_PAGE, "ACMS attachmente page JSON object"),
+        (FREE_OPINIONS_REPORT, "Free opinions report"),
     )
 
 
@@ -113,16 +123,21 @@ class ProcessingQueue(AbstractDateTimeModel):
         on_delete=models.RESTRICT,
     )
     pacer_case_id = models.CharField(
-        help_text="The cased ID provided by PACER.",
+        help_text="The case ID provided by PACER.",
         max_length=100,
         db_index=True,
         blank=True,
     )
     pacer_doc_id = models.CharField(
         help_text="The ID of the document in PACER.",
-        max_length=32,  # Same as in RECAP
+        max_length=64,  # Increased to support storing docketEntryId from ACMS.
         blank=True,
         db_index=True,
+    )
+    acms_document_guid = models.CharField(
+        help_text="The GUID of the document in ACMS.",
+        max_length=64,
+        blank=True,
     )
     document_number = models.BigIntegerField(
         help_text="The docket entry number for the document.",
@@ -143,9 +158,8 @@ class ProcessingQueue(AbstractDateTimeModel):
     )
     status = models.SmallIntegerField(
         help_text="The current status of this upload. Possible values "
-        "are: %s"
-        % ", ".join(
-            ["(%s): %s" % (t[0], t[1]) for t in PROCESSING_STATUS.NAMES]
+        "are: {}".format(
+            ", ".join(f"({t[0]}): {t[1]}" for t in PROCESSING_STATUS.NAMES)
         ),
         default=PROCESSING_STATUS.ENQUEUED,
         choices=PROCESSING_STATUS.NAMES,
@@ -193,22 +207,12 @@ class ProcessingQueue(AbstractDateTimeModel):
             UPLOAD_TYPE.DOCKET_HISTORY_REPORT,
             UPLOAD_TYPE.APPELLATE_DOCKET,
             UPLOAD_TYPE.DOCUMENT_ZIP,
+            UPLOAD_TYPE.ACMS_DOCKET_JSON,
+            UPLOAD_TYPE.ACMS_ATTACHMENT_PAGE,
         ]:
-            return "ProcessingQueue %s: %s case #%s (%s)" % (
-                self.pk,
-                self.court_id,
-                self.pacer_case_id,
-                self.get_upload_type_display(),
-            )
+            return f"ProcessingQueue {self.pk}: {self.court_id} case #{self.pacer_case_id} ({self.get_upload_type_display()})"
         elif self.upload_type == UPLOAD_TYPE.PDF:
-            return "ProcessingQueue: %s: %s.%s.%s.%s (%s)" % (
-                self.pk,
-                self.court_id,
-                self.pacer_case_id or None,
-                self.document_number or None,
-                self.attachment_number or 0,
-                self.get_upload_type_display(),
-            )
+            return f"ProcessingQueue: {self.pk}: {self.court_id}.{self.pacer_case_id or None}.{self.document_number or None}.{self.attachment_number or 0} ({self.get_upload_type_display()})"
         else:
             return f"ProcessingQueue: {self.pk} ({self.get_upload_type_display()})"
 
@@ -219,7 +223,7 @@ class ProcessingQueue(AbstractDateTimeModel):
 
     @property
     def file_contents(self) -> str:
-        with open(self.filepath_local.path, "r") as f:
+        with open(self.filepath_local.path) as f:
             return f.read()
 
     def print_file_contents(self) -> None:
@@ -259,9 +263,8 @@ class EmailProcessingQueue(AbstractDateTimeModel):
     )
     status = models.SmallIntegerField(
         help_text="The current status of this upload. Possible values "
-        "are: %s"
-        % ", ".join(
-            ["(%s): %s" % (t[0], t[1]) for t in PROCESSING_STATUS.NAMES]
+        "are: {}".format(
+            ", ".join(f"({t[0]}): {t[1]}" for t in PROCESSING_STATUS.NAMES)
         ),
         default=PROCESSING_STATUS.ENQUEUED,
         choices=PROCESSING_STATUS.NAMES,
@@ -312,9 +315,8 @@ class PacerFetchQueue(AbstractDateTimeModel):
     )
     status = models.SmallIntegerField(
         help_text="The current status of this request. Possible values "
-        "are: %s"
-        % ", ".join(
-            ["(%s): %s" % (t[0], t[1]) for t in PROCESSING_STATUS.NAMES]
+        "are: {}".format(
+            ", ".join(f"({t[0]}): {t[1]}" for t in PROCESSING_STATUS.NAMES)
         ),
         default=PROCESSING_STATUS.ENQUEUED,
         choices=PROCESSING_STATUS.NAMES,
@@ -895,4 +897,9 @@ class FjcIntegratedDatabase(AbstractDateTimeModel):
 
     class Meta:
         verbose_name_plural = "FJC Integrated Database Entries"
-        indexes = [models.Index(fields=["district", "docket_number"])]
+        indexes = [
+            models.Index(
+                fields=["district", "docket_number"],
+                name="recap_fjcintegrateddatabase_district_id_455568623a9da568_idx",
+            )
+        ]

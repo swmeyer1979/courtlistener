@@ -1,34 +1,35 @@
 from http import HTTPStatus
 
+from django.conf import settings
 from django.http import HttpRequest, HttpResponse, JsonResponse
 from django.shortcuts import render
 
 from cl.celery_init import fail_task
-from cl.lib.redis_utils import make_redis_interface
+from cl.lib.celery_utils import get_queue_length
+from cl.lib.redis_utils import get_redis_interface
 from cl.stats.utils import (
+    check_elasticsearch,
     check_postgresql,
     check_redis,
-    check_solr,
     get_replication_statuses,
 )
+
+
+def heartbeat(request: HttpRequest) -> HttpResponse:
+    return HttpResponse("OK", content_type="text/plain")
 
 
 def health_check(request: HttpRequest) -> JsonResponse:
     """Check if we can connect to various services."""
     is_redis_up = check_redis()
     is_postgresql_up = check_postgresql()
-    is_solr_up = check_solr()
 
     status = HTTPStatus.OK
-    if not all([is_redis_up, is_postgresql_up, is_solr_up]):
+    if not all([is_redis_up, is_postgresql_up]):
         status = HTTPStatus.INTERNAL_SERVER_ERROR
 
     return JsonResponse(
-        {
-            "is_solr_up": is_solr_up,
-            "is_postgresql_up": is_postgresql_up,
-            "is_redis_up": is_redis_up,
-        },
+        {"is_postgresql_up": is_postgresql_up, "is_redis_up": is_redis_up},
         status=status,
     )
 
@@ -42,9 +43,22 @@ def replication_status(request: HttpRequest) -> HttpResponse:
     )
 
 
+def elasticsearch_status(request: HttpRequest) -> JsonResponse:
+    """Checks the health of the Elasticsearch cluster."""
+    is_elastic_up = check_elasticsearch()
+    return JsonResponse(
+        {"is_elastic_up": is_elastic_up},
+        status=(
+            HTTPStatus.OK
+            if is_elastic_up
+            else HTTPStatus.INTERNAL_SERVER_ERROR
+        ),
+    )
+
+
 def redis_writes(request: HttpRequest) -> HttpResponse:
     """Just return 200 OK if we can write to redis. Else return 500 Error."""
-    r = make_redis_interface("STATS")
+    r = get_redis_interface("STATS")
 
     # Increment a counter. If it's "high" reset it. No need to do fancy try/
     # except work here to log or display the error. If there's an error, it'll
@@ -54,7 +68,7 @@ def redis_writes(request: HttpRequest) -> HttpResponse:
     if v > 100:
         r.set(key, 0)
 
-    return HttpResponse("Successful Redis write.")
+    return HttpResponse("Successful Redis write.", content_type="text/plain")
 
 
 def sentry_fail(request: HttpRequest) -> HttpResponse:
@@ -64,3 +78,11 @@ def sentry_fail(request: HttpRequest) -> HttpResponse:
 def celery_fail(request: HttpRequest) -> HttpResponse:
     fail_task.delay()
     return HttpResponse("Successfully failed Celery.")
+
+
+def celery_queue_lengths(request: HttpRequest) -> HttpResponse:
+    queue_lengths = {}
+    for q in settings.CELERY_QUEUES:
+        queue_lengths[q] = get_queue_length(q)
+
+    return JsonResponse(queue_lengths)

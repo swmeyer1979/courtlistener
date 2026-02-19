@@ -1,8 +1,23 @@
+{% comment %}
+╔═════════════════════════════════════════════════════════════════════════╗
+║                               ATTENTION!                                ║
+║ This template has a new version behind the use_new_design waffle flag.  ║
+║                                                                         ║
+║ When modifying this template, please also update the new version at:    ║
+║ cl/simple_pages/templates/cotton/terms_history.html                     ║
+║                                                                         ║
+║ Once the new design is fully implemented, all legacy templates          ║
+║ (including this one) and the waffle flag will be removed.               ║
+╚═════════════════════════════════════════════════════════════════════════╝
+{% endcomment %}
+
 <div id="versions">
   <h3>Other Versions</h3>
 
   <p>Earlier versions of these policies can be found in the following locations:</p>
   <ul>
+    <li><a href="{% url 'old_terms' '20' %}" rel="nofollow">Between September 10, 2024 and October 7, 2025</a></li>
+    <li><a href="{% url 'old_terms' '19' %}" rel="nofollow">Between October 7, 2023 and September 10, 2024</a></li>
     <li><a href="{% url 'old_terms' '18' %}" rel="nofollow">Between February 8, 2023 and October 6, 2023</a></li>
     <li><a href="{% url 'old_terms' '17' %}" rel="nofollow">Between July 7, 2022 and February 8, 2023</a></li>
     <li><a href="{% url 'old_terms' '16' %}" rel="nofollow">Between June 15, 2022 and July 7, 2022</a></li>

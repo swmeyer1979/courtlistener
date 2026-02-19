@@ -1,5 +1,18 @@
 {% extends "base.html" %}
 
+{% comment %}
+╔═════════════════════════════════════════════════════════════════════════╗
+║                               ATTENTION!                                ║
+║ This template has a new version behind the use_new_design waffle flag.  ║
+║                                                                         ║
+║ When modifying this template, please also update the new version at:    ║
+║ cl/api/templates/v2_replication.html                                    ║
+║                                                                         ║
+║ Once the new design is fully implemented, all legacy templates          ║
+║ (including this one) and the waffle flag will be removed.               ║
+╚═════════════════════════════════════════════════════════════════════════╝
+{% endcomment %}
+
 {% block title %}Database Replication for Organizations and Researchers – CourtListener.com{% endblock %}
 {% block footer-scripts %}
   {% include "includes/anchors.html" %}
@@ -28,7 +41,7 @@
     </p>
     <p>The following types of data are currently available as part of this service:</p>
     <ul>
-      <li><p><a href="{% url "advanced_o" %}">Opinions</a></p></li>
+      <li><p><a href="{% url "advanced_o" %}">Case Law</a></p></li>
       <li><p><a href="{% url "advanced_r" %}">RECAP Archive of PACER data</a></p></li>
       <li><p>The <a href="https://www.fjc.gov/research/idb">FJC Integrated Database</a> civil data</p></li>
       <li><p><a href="{% url "advanced_oa" %}">Oral Arguments</a></p></li>

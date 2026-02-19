@@ -5,11 +5,24 @@ from factory.fuzzy import FuzzyChoice
 
 from cl.api.models import (
     WEBHOOK_EVENT_STATUS,
+    APIThrottle,
+    ThrottleType,
     Webhook,
     WebhookEvent,
     WebhookEventType,
 )
 from cl.users.factories import UserFactory
+
+
+class APIThrottleFactory(DjangoModelFactory):
+    class Meta:
+        model = APIThrottle
+
+    user = SubFactory(UserFactory)
+    throttle_type = ThrottleType.API
+    blocked = False
+    rate = "100/hour"
+    notes = Faker("sentence")
 
 
 class WebhookFactory(DjangoModelFactory):
@@ -32,13 +45,7 @@ class WebhookEventFactory(DjangoModelFactory):
     )
 
 
-class WebhookParentMixin(DjangoModelFactory):
-    webhook = SubFactory(
-        "cl.api.factories.WebhookFactory",
-    )
-
-
-class WebhookEventWithParentsFactory(WebhookEventFactory, WebhookParentMixin):
+class WebhookEventWithParentsFactory(WebhookEventFactory):
     """Make a WebhookEvent with a parent Webhook"""
 
-    pass
+    webhook = SubFactory(WebhookFactory)

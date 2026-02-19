@@ -1,18 +1,35 @@
+from asgiref.sync import sync_to_async
 from django.conf import settings
 from django.http import HttpResponseRedirect
-from django.shortcuts import get_object_or_404
+from django.shortcuts import aget_object_or_404
 from django.template.response import TemplateResponse
 from django.urls import reverse
+from elasticsearch.exceptions import RequestError, TransportError
+from elasticsearch_dsl import MultiSearch
+from elasticsearch_dsl.response import Response
 from judge_pics.search import ImageSizes, portrait
-from requests import Session
 
-from cl.lib.scorched_utils import ExtraSolrInterface
+from cl.favorites.decorators import track_view_counter
 from cl.people_db.models import Person
-from cl.people_db.utils import make_title_str
+from cl.people_db.utils import (
+    build_authored_opinions_query,
+    build_oral_arguments_heard,
+    build_recap_cases_assigned_query,
+    make_title_str,
+)
+from cl.search.documents import (
+    AudioDocument,
+    DocketDocument,
+    OpinionClusterDocument,
+)
 
 
-def view_person(request, pk, slug):
-    person = get_object_or_404(Person, pk=pk)
+@track_view_counter(tracks="person", label_format="p.%s:view")
+async def view_person(request, pk, slug):
+    queryset = Person.objects.select_related("is_alias_of").prefetch_related(
+        "positions__court"
+    )
+    person = await aget_object_or_404(queryset, pk=pk)
     # Redirect the user if they're trying to check out an alias.
     if person.is_alias:
         return HttpResponseRedirect(
@@ -22,7 +39,7 @@ def view_person(request, pk, slug):
             )
         )
 
-    title = make_title_str(person)
+    title = await make_title_str(person)
 
     img_path = portrait(person.id, ImageSizes.LARGE)
 
@@ -31,86 +48,50 @@ def view_person(request, pk, slug):
     # template.
     judicial_positions = []
     other_positions = []
-    for p in person.positions.all().order_by("-date_start"):
+    async for p in person.positions.all().order_by("-date_start"):
         if p.is_judicial_position:
             judicial_positions.append(p)
         else:
             other_positions.append(p)
     positions = judicial_positions + other_positions
 
-    # Use Solr to get relevant opinions that the person wrote
-    with Session() as session:
-        conn = ExtraSolrInterface(
-            settings.SOLR_OPINION_URL, http_connection=session, mode="r"
+    # Use Elasticsearch to get relevant opinions that the person wrote, related
+    # RECAP cases or related Oral arguments.
+    @sync_to_async
+    def get_related_content_from_es(person_id: int) -> Response | None:
+        """Use a single ES request to retrieve content related to a person."""
+        authored_opinions_query = build_authored_opinions_query(
+            OpinionClusterDocument.search(), person_id
         )
-        q = {
-            "q": f"author_id:{person.pk} OR panel_ids:{person.pk}",
-            "fl": [
-                "id",
-                "court_id",
-                "caseName",
-                "absolute_url",
-                "court",
-                "court_citation_string",
-                "dateFiled",
-                "docketNumber",
-                "citeCount",
-                "status",
-                "citation",
-            ],
-            "rows": 5,
-            "start": 0,
-            "sort": "dateFiled desc",
-            "caller": "view_person",
-        }
-        authored_opinions = conn.query().add_extra(**q).execute()
-    # Use Solr to get the oral arguments for the judge
-    with Session() as session:
-        conn = ExtraSolrInterface(
-            settings.SOLR_AUDIO_URL, http_connection=session, mode="r"
+        oral_arguments_heard_query = build_oral_arguments_heard(
+            AudioDocument.search(), person_id
         )
-        q = {
-            "q": f"panel_ids:{person.pk}",
-            "fl": [
-                "id",
-                "absolute_url",
-                "caseName",
-                "court_id",
-                "dateArgued",
-                "docketNumber",
-                "court_citation_string",
-            ],
-            "rows": 5,
-            "start": 0,
-            "sort": "dateArgued desc",
-            "caller": "view_person",
-        }
-        oral_arguments_heard = conn.query().add_extra(**q).execute()
-    with Session() as session:
-        conn = ExtraSolrInterface(
-            settings.SOLR_RECAP_URL, http_connection=session, mode="r"
+        recap_cases_assigned_query = build_recap_cases_assigned_query(
+            DocketDocument.search(), person_id
         )
-        q = {
-            "q": f"assigned_to_id:{person.pk} OR referred_to_id:{person.pk}",
-            "fl": [
-                "id",
-                "docket_absolute_url",
-                "caseName",
-                "court_citation_string",
-                "dateFiled",
-                "docketNumber",
-            ],
-            "group": "true",
-            "group.ngroups": "true",
-            "group.limit": 1,
-            "group.field": "docket_id",
-            "group.sort": "dateFiled desc",
-            "rows": 5,
-            "start": 0,
-            "sort": "dateFiled desc",
-            "caller": "view_person",
-        }
-        recap_cases_assigned = conn.query().add_extra(**q).execute()
+        multi_search = MultiSearch()
+        multi_search = (
+            multi_search.add(authored_opinions_query)
+            .add(oral_arguments_heard_query)
+            .add(recap_cases_assigned_query)
+        )
+
+        try:
+            return multi_search.execute()
+        except (TransportError, ConnectionError, RequestError):
+            return None
+
+    people_content_response = await get_related_content_from_es(person.id)
+    authored_opinions = (
+        people_content_response[0] if people_content_response else []
+    )
+    oral_arguments_heard = (
+        people_content_response[1] if people_content_response else []
+    )
+    recap_cases_assigned = (
+        people_content_response[2] if people_content_response else []
+    )
+
     return TemplateResponse(
         request,
         "view_person.html",

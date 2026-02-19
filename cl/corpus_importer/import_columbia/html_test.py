@@ -1,7 +1,8 @@
 import fnmatch
 import os
 import re
-import xml.etree.cElementTree as ET
+import xml.etree.ElementTree as ET
+from collections import Counter
 from glob import glob
 from random import shuffle
 
@@ -107,8 +108,8 @@ def clean_string(s):
     # We split on the v., and handle fixes at either end of plaintiff or
     # appellant.
     bad_punctuation = r"(-|–|_|/|;|,|\s)*"
-    bad_endings = re.compile(r"%s$" % bad_punctuation)
-    bad_beginnings = re.compile(r"^%s" % bad_punctuation)
+    bad_endings = re.compile(rf"{bad_punctuation}$")
+    bad_beginnings = re.compile(rf"^{bad_punctuation}")
 
     s = s.split(" v. ")
     cleaned_string = []
@@ -125,9 +126,9 @@ def clean_string(s):
 
 
 # For use in harmonize function
-# More details: http://www.law.cornell.edu/citation/4-300.htm
+# More details: https://www.law.cornell.edu/citation/4-300.htm
 US = r"USA|U\.S\.A\.|U\.S\.?|U\. S\.?|(The )?United States of America|The United States"
-UNITED_STATES = re.compile(r"^(%s)(,|\.)?$" % US, re.I)
+UNITED_STATES = re.compile(rf"^({US})(,|\.)?$", re.I)
 THE_STATE = re.compile(r"the state", re.I)
 ET_AL = re.compile(r",?\set\.?\sal\.?", re.I)
 BW = (
@@ -137,7 +138,7 @@ BW = (
     + r"|respond(e|a)nts?(--?|/)appell(ee|ant)s?|cross(--?|/)respondents?|crosss?(--?|/)petitioners?"
     + r"|cross(--?|/)appell(ees|ant)s?|deceased"
 )
-BAD_WORDS = re.compile(r"^(%s)(,|\.)?$" % BW, re.I)
+BAD_WORDS = re.compile(rf"^({BW})(,|\.)?$", re.I)
 BIG = (
     "3D|AFL|AKA|A/K/A|BMG|CBS|CDC|CDT|CEO|CIO|CNMI|D/B/A|DOJ|DVA|EFF|FCC|"
     "FTC|HSBC|IBM|II|III|IV|JJ|LLC|LLP|MCI|MJL|MSPB|ND|NLRB|PTO|SD|UPS|RSS|SEC|UMG|US|USA|USC|"
@@ -147,19 +148,19 @@ SMALL = r"a|an|and|as|at|but|by|en|for|if|in|is|of|on|or|the|to|v\.?|via|vs\.?"
 NUMS = "0123456789"
 PUNCT = r"""!"#$¢%&'‘()*+,\-./:;?@[\\\]_—`{|}~"""
 WEIRD_CHARS = r"¼½¾§ÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÑÒÓÔÕÖØÙÚÛÜßàáâãäåæçèéêëìíîïñòóôœõöøùúûüÿ"
-BIG_WORDS = re.compile(r"^(%s)[%s]?$" % (BIG, PUNCT), re.I)
-SMALL_WORDS = re.compile(r"^(%s)$" % SMALL, re.I)
-SMALL_WORD_INLINE = re.compile(r"(^|\s)(%s)(\s|$)" % SMALL, re.I)
+BIG_WORDS = re.compile(rf"^({BIG})[{PUNCT}]?$", re.I)
+SMALL_WORDS = re.compile(rf"^({SMALL})$", re.I)
+SMALL_WORD_INLINE = re.compile(rf"(^|\s)({SMALL})(\s|$)", re.I)
 INLINE_PERIOD = re.compile(r"[a-z][.][a-z]", re.I)
 INLINE_SLASH = re.compile(r"[a-z][/][a-z]", re.I)
 INLINE_AMPERSAND = re.compile(r"([a-z][&][a-z])(.*)", re.I)
-UC_ELSEWHERE = re.compile(r"[%s]*?[a-zA-Z]+[A-Z]+?" % PUNCT)
-CAPFIRST = re.compile(r"^[%s]*?([A-Za-z])" % PUNCT)
-SMALL_FIRST = re.compile(r"^([%s]*)(%s)\b" % (PUNCT, SMALL), re.I)
-SMALL_LAST = re.compile(r"\b(%s)[%s]?$" % (SMALL, PUNCT), re.I)
-SUBPHRASE = re.compile(r"([:;?!][ ])(%s)" % SMALL)
+UC_ELSEWHERE = re.compile(rf"[{PUNCT}]*?[a-zA-Z]+[A-Z]+?")
+CAPFIRST = re.compile(rf"^[{PUNCT}]*?([A-Za-z])")
+SMALL_FIRST = re.compile(rf"^([{PUNCT}]*)({SMALL})\b", re.I)
+SMALL_LAST = re.compile(rf"\b({SMALL})[{PUNCT}]?$", re.I)
+SUBPHRASE = re.compile(rf"([:;?!][ ])({SMALL})")
 APOS_SECOND = re.compile(r"^[dol]{1}['‘]{1}[a-z]+$", re.I)
-ALL_CAPS = re.compile(r"^[A-Z\s%s%s%s]+$" % (PUNCT, WEIRD_CHARS, NUMS))
+ALL_CAPS = re.compile(rf"^[A-Z\s{PUNCT}{WEIRD_CHARS}{NUMS}]+$")
 UC_INITIALS = re.compile(r"^(?:[A-Z]{1}\.{1}|[A-Z]{1}\.{1}[A-Z]{1})+,?$")
 MAC_MC = re.compile(r"^([Mm]a?c)(\w+.*)")
 
@@ -504,8 +505,8 @@ def parse_file(file_path, court_fallback=""):
                 o for o in info["opinions"] if o["type"] == current_type
             ]
             if relevant_opinions:
-                relevant_opinions[-1]["opinion"] += "\n%s" % "\n".join(
-                    last_texts
+                relevant_opinions[-1]["opinion"] += "\n{}".format(
+                    "\n".join(last_texts)
                 )
                 relevant_opinions[-1]["opinion_texts"].extend(last_texts)
             else:
@@ -545,7 +546,7 @@ def get_text(file_path):
 
     :param file_path: A path the file to be parsed.
     """
-    with open(file_path, "r") as f:
+    with open(file_path) as f:
         file_string = f.read()
     raw_info = {}
     # used when associating a byline of an opinion with the opinion's text
@@ -595,9 +596,11 @@ def get_text(file_path):
                 raw_info.setdefault("opinions", []).append(
                     {
                         "type": opinion_type,
-                        "byline": current_byline["name"]
-                        if current_byline["type"] == opinion_type
-                        else None,
+                        "byline": (
+                            current_byline["name"]
+                            if current_byline["type"] == opinion_type
+                            else None
+                        ),
                         "opinion": get_xml_string(child),
                     }
                 )
@@ -640,10 +643,6 @@ def parse_dates(raw_dates, caseyear):
                 date = dparser.parse(raw_part, fuzzy=True).date()
             except:
                 continue
-            #            if caseyear is not None:
-            #                if date.year > caseyear + 1 or date.year < caseyear - 2:
-            #                    print(('Year problem:',date.year,raw_date,caseyear))
-            #                    date = datetime(caseyear, date.month, date.day)
 
             if date.year < 1600 or date.year > 2020:
                 continue
@@ -673,7 +672,7 @@ def get_xml_string(e):
     """
 
     inner_string = re.sub(
-        r"(^<%s\b.*?>|</%s\b.*?>$)" % (e.tag, e.tag),
+        rf"(^<{e.tag}\b.*?>|</{e.tag}\b.*?>$)",
         "",
         ET.tostring(e).decode(),
     )
@@ -687,7 +686,6 @@ os.chdir("/home/elliott/freelawmachine/flp/columbia_data/opinions")
 folders = glob("*")
 folders.sort()
 
-from collections import Counter
 
 html_tab: Counter = Counter()
 
@@ -696,35 +694,14 @@ for folder in folders:
         continue
     print(folder)
     for path in file_generator(folder):
-        # f = open(path).read()
-        # x = f.count('<date>')
-        # if x > 1:
-        #    print(path)
-        # break
-
         parsed = parse_file(path)
         if parsed is None:
             continue
-        # print(parsed['dates'])
         newname = path.replace("/", "_")
         if len(parsed["dates"]) == 0:
             print(path)
-            print(open(path).read(), file=open(f"_nodate/{newname}", "wt"))
+            print(open(path).read(), file=open(f"_nodate/{newname}", "w"))
             continue
 
         if len(parsed["dates"][0]) == 0:
             print(path)
-#
-#            print(open(path).read(), file=open('_failparse/'+newname,'wt'))
-#
-
-#        numops = len(parsed['opinions'])
-#        if numops > 0:
-#            for op in parsed['opinions']:
-#                optext = op['opinion']
-#                tags = re.findall('<.*?>',optext)
-#                html_tab.update(tags)
-#                #if '<block_quote>' in tags:
-#                #    print(optext)
-#                #    exit()
-#

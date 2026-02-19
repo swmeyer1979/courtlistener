@@ -9,6 +9,8 @@ from cl.lib.ratelimiter import ratelimiter_unsafe_10_per_m
 from cl.users import api_views as user_views
 from cl.users import views
 from cl.users.forms import CustomSetPasswordForm
+from cl.users.views import view_donations
+from cl.visualizations.views import VisualizationDeprecationRedirectView
 
 router = DefaultRouter()
 
@@ -25,7 +27,7 @@ urlpatterns = [
     path(
         "sign-in/",
         ratelimiter_unsafe_10_per_m(
-            auth_views.LoginView.as_view(
+            views.SafeRedirectLoginView.as_view(
                 **{
                     "template_name": "register/login.html",
                     "authentication_form": ConfirmedEmailAuthenticationForm,
@@ -91,7 +93,12 @@ urlpatterns = [
         "profile/favorites/",
         RedirectView.as_view(pattern_name="profile_notes", permanent=True),
     ),
-    path("profile/alerts/", views.view_search_alerts, name="profile_alerts"),
+    path("profile/alerts/", views.view_alerts, name="profile_alerts"),
+    path(
+        "profile/search-alerts/",
+        views.view_search_alerts,
+        name="profile_search_alerts",
+    ),
     path(
         "profile/docket-alerts/",
         views.view_docket_alerts,
@@ -99,18 +106,20 @@ urlpatterns = [
     ),
     path(
         "profile/visualizations/",
-        views.view_visualizations,
+        VisualizationDeprecationRedirectView.as_view(),
         name="view_visualizations",
     ),
     path(
         "profile/visualizations/deleted/",
-        views.view_deleted_visualizations,
+        VisualizationDeprecationRedirectView.as_view(),
         name="view_deleted_visualizations",
     ),
+    path("profile/id/", views.view_user_id, name="view_user_id"),
     path("profile/api/", views.view_api, name="view_api"),
     path("profile/api-token/", views.view_api_token, name="view_api_token"),
     path("profile/api-usage/", views.view_api_usage, name="view_api_usage"),
     path("profile/webhooks/", views.view_webhooks, name="view_webhooks"),
+    path("profile/your-support/", view_donations, name="profile_your_support"),
     re_path(
         "profile/webhooks/(logs|test-logs)/",
         views.view_webhook_logs,
@@ -172,13 +181,9 @@ urlpatterns = [
     ),
     # Webhooks
     path(
-        f"webhook/moosend/",
-        views.moosend_webhook,
-    ),
-    path(
         "webhook/ses/",
         SESEventWebhookView.as_view(),
         name="handle_ses_webhook",
     ),
-    re_path(r"^api/htmx/", include(router.urls)),
+    path("api/htmx/", include(router.urls)),
 ]

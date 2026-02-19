@@ -2,6 +2,12 @@ import logging
 import random
 from collections.abc import Sequence
 from datetime import datetime, timedelta
+from email import message
+from email.contentmanager import (  # type: ignore[attr-defined]
+    raw_data_manager,
+    set_text_content,
+)
+from email.policy import SMTPUTF8
 from email.utils import parseaddr
 
 from django.conf import settings
@@ -9,8 +15,6 @@ from django.contrib.auth.models import User
 from django.core.mail import (
     EmailMessage,
     EmailMultiAlternatives,
-    SafeMIMEMultipart,
-    SafeMIMEText,
 )
 from django.db import transaction
 from django.utils.timezone import now
@@ -52,7 +56,7 @@ def handle_hard_bounce(
         if notification_subtype in unexpected_events:
             # Handle unexpected notification_subtype events, log a warning
             logging.warning(
-                f"Unexpected {notification_subtype} hard bounce for {email}"
+                "Unexpected %s hard bounce for %s", notification_subtype, email
             )
         # After log the event ban the email address
         # Only ban email address if it hasn't been previously banned
@@ -192,8 +196,10 @@ def handle_soft_bounce(
             # Handle other unexpected notification_subtype events, like:
             # ContentRejected, log a warning
             logging.warning(
-                f"Unexpected {notification_subtype} soft bounce for {email}, "
-                f"message_id: {message_id}"
+                "Unexpected %s soft bounce for %s, message_id: %s",
+                notification_subtype,
+                email,
+                message_id,
             )
 
 
@@ -218,7 +224,7 @@ def handle_complaint(recipient_emails: list[str]) -> None:
 
 
 def get_email_body(
-    message: SafeMIMEText | SafeMIMEMultipart,
+    message: message.EmailMessage,
 ) -> tuple[str, str]:
     """Function to retrieve html and plain body content of an email
 
@@ -230,13 +236,17 @@ def get_email_body(
     html_body = ""
     for part in message.walk():
         if part.get_content_type() == "text/plain":
-            plaintext_body = part.get_payload()
-            break
+            payload = part.get_payload()
+            if isinstance(payload, str):
+                plaintext_body = payload
+                break
 
     for part in message.walk():
         if part.get_content_type() == "text/html":
-            html_body = part.get_payload()
-            break
+            payload = part.get_payload()
+            if isinstance(payload, str):
+                html_body = payload
+                break
 
     return plaintext_body, html_body
 
@@ -260,6 +270,46 @@ def normalize_addresses(email_list: Sequence[str]) -> list[str]:
     return normalized_addresses
 
 
+def set_surrogateescape_clean_text_content(
+    msg,
+    string,
+    subtype="plain",
+    charset="utf-8",
+    cte=None,
+    disposition=None,
+    filename=None,
+    cid=None,
+    params=None,
+    headers=None,
+):
+    """Modifies set_text_content behavior to clean surrogateescape
+    from any strings by doing a round trip encode/decode of the string.
+
+    :param msg: The EmailMessage object
+    :param string: The string content to set
+    :param subtype: The EmailMessage content type
+    :param charset: The EmailMessage charset
+    :param cte: The EmailMessage cte encoding
+    :param disposition: The EmailMessage Content-Disposition
+    :param filename: The EmailMessage filename parameter
+    :param cid: The EmailMessage Content-ID
+    :param params: The EmailMessage params
+    :param headers: The EmailMessage headers
+    """
+    set_text_content(
+        msg,
+        string.encode(charset, "surrogateescape").decode(charset),
+        subtype,
+        charset,
+        cte,
+        disposition,
+        filename,
+        cid,
+        params,
+        headers,
+    )
+
+
 def store_message(message: EmailMessage | EmailMultiAlternatives) -> str:
     """Stores an email message and returns its message_id
 
@@ -274,7 +324,12 @@ def store_message(message: EmailMessage | EmailMultiAlternatives) -> str:
     cc = normalize_addresses(message.cc)
     reply_to = normalize_addresses(message.reply_to)
     headers = message.extra_headers
-    body_message = message.message()
+    content_manager = raw_data_manager
+    content_manager.add_set_handler(
+        str, set_surrogateescape_clean_text_content
+    )
+    policy = SMTPUTF8.clone(content_manager=content_manager)
+    body_message = message.message(policy=policy)  # type: ignore[call-arg]
     plain_body, html_body = get_email_body(body_message)
 
     # Look for the CL user by email address to assign it.
@@ -430,8 +485,9 @@ def enqueue_email(recipients: list[str], message_id: str) -> None:
 
     if not stored:
         logging.warning(
-            f"The message: {message_id} can't be enqueued because it "
-            "doesn't exist anymore."
+            "The message: %s can't be enqueued because it "
+            "doesn't exist anymore.",
+            message_id,
         )
         return
     for recipient in recipients:

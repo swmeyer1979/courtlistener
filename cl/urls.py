@@ -3,8 +3,8 @@ from django.conf.urls.static import static
 from django.contrib import admin
 from django.contrib.sitemaps import views as sitemaps_views
 from django.urls import include, path, register_converter
-from django.views.decorators.cache import cache_page
 from django.views.generic import RedirectView
+from django_s3_express_cache.decorators import cache_page
 
 from cl.audio.sitemap import AudioSitemap, BlockedAudioSitemap
 from cl.disclosures.sitemap import DisclosureSitemap
@@ -12,24 +12,20 @@ from cl.lib.converters import BlankSlugConverter
 from cl.opinion_page.sitemap import (
     BlockedDocketSitemap,
     BlockedOpinionSitemap,
-    DocketSitemap,
     OpinionSitemap,
 )
 from cl.people_db.sitemap import PersonSitemap
 from cl.search.models import SEARCH_TYPES
 from cl.simple_pages.sitemap import SimpleSitemap
 from cl.sitemap import cached_sitemap
-from cl.visualizations.sitemap import VizSitemap
 
 register_converter(BlankSlugConverter, "blank-slug")
 
 sitemaps = {
     SEARCH_TYPES.ORAL_ARGUMENT: AudioSitemap,
     SEARCH_TYPES.OPINION: OpinionSitemap,
-    SEARCH_TYPES.RECAP: DocketSitemap,
     SEARCH_TYPES.PEOPLE: PersonSitemap,
     "disclosures": DisclosureSitemap,
-    "visualizations": VizSitemap,
     "simple": SimpleSitemap,
     "blocked-audio": BlockedAudioSitemap,
     "blocked-dockets": BlockedDocketSitemap,
@@ -57,13 +53,17 @@ urlpatterns = [
     path("", include("cl.search.urls")),
     path("", include("cl.alerts.urls")),
     path("", include("cl.api.urls")),
-    path("", include("cl.donate.urls")),
     path("", include("cl.visualizations.urls")),
     path("", include("cl.stats.urls")),
     # Sitemaps
     path(
         "sitemap.xml",
-        cache_page(60 * 60 * 24 * 14, cache="db_cache")(sitemaps_views.index),
+        cache_page(
+            60 * 60 * 24 * 14,
+            cache="db_cache"
+            if settings.DEVELOPMENT or settings.TESTING
+            else "s3",
+        )(sitemaps_views.index),
         {"sitemaps": sitemaps, "sitemap_url_name": "sitemaps"},
     ),
     path(
@@ -72,7 +72,18 @@ urlpatterns = [
         {"sitemaps": sitemaps},
         name="sitemaps",
     ),
+    # Pregenerated sitemaps
+    path("", include("cl.sitemaps_infinite.urls")),
     # Redirects
+    path(
+        "donate/",
+        RedirectView.as_view(url="https://free.law/donate/"),
+    ),
+    path(
+        "help/donations/",
+        RedirectView.as_view(url="https://free.law/donate/help/"),
+        name="donation_help",
+    ),
     path(
         "privacy/",
         RedirectView.as_view(url="/terms/#privacy", permanent=True),
@@ -81,11 +92,23 @@ urlpatterns = [
         "removal/",
         RedirectView.as_view(url="/terms/#removal", permanent=True),
     ),
+    path(
+        "opinion/<int:pk>/<blank-slug:slug>/visualizations/",
+        RedirectView.as_view(
+            url="/help/api/rest/visualizations/#deprecation-notice",
+            permanent=True,
+        ),
+        name="cluster_visualizations",
+    ),
 ]
 
 if settings.DEVELOPMENT:
     urlpatterns.append(
-        path("__debug__/", include("debug_toolbar.urls")),
+        path("__reload__/", include("django_browser_reload.urls")),
     )
+    if not settings.TESTING:
+        urlpatterns.append(
+            path("__debug__/", include("debug_toolbar.urls")),
+        )
 
 urlpatterns += static("/", document_root=settings.MEDIA_ROOT)  # type: ignore

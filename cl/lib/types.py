@@ -1,29 +1,17 @@
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Callable, Dict, List, Tuple, TypedDict, Union
+from typing import Any, NotRequired, TypedDict
 
 from django.http import HttpRequest
-from eyecite.models import (
-    FullCaseCitation,
-    IdCitation,
-    Resource,
-    ShortCaseCitation,
-    SupraCitation,
-)
+from django_elasticsearch_dsl.search import Search
+from elasticsearch_dsl.query import QueryString
 
-from cl.search.models import Opinion
 from cl.users.models import User
 
-CleanData = Dict[str, Any]
-TaskData = Dict[str, Any]
-
-SupportedCitationType = Union[
-    FullCaseCitation, ShortCaseCitation, SupraCitation, IdCitation
-]
-MatchedResourceType = Union[Opinion, Resource]
-ResolvedFullCite = Tuple[FullCaseCitation, MatchedResourceType]
-ResolvedFullCites = List[ResolvedFullCite]
+CleanData = dict[str, Any]
+TaskData = dict[str, Any]
 
 
 class AuthenticatedHttpRequest(HttpRequest):
@@ -34,7 +22,13 @@ class EmailType(TypedDict, total=False):
     subject: str
     body: str
     from_email: str
-    to: List[str]
+    to: list[str]
+
+
+class ESRangeQueryParams(TypedDict):
+    gte: str | int | float
+    lte: str | int | float
+    relation: NotRequired[str]
 
 
 # fmt: off
@@ -42,7 +36,7 @@ SearchParam = TypedDict(
     "SearchParam",
     {
         "q": str,
-        "fq": List[str],
+        "fq": list[str],
         "mm": int,
 
         # Pagination & ordering
@@ -77,7 +71,7 @@ SearchParam = TypedDict(
         "boost": str,
         "qf": str,
         "pf": str,
-        "ps": Union[float, str],
+        "ps": float | str,
 
         # More Like This
         "mlt": str,
@@ -95,7 +89,7 @@ SearchParam = TypedDict(
 # fmt: on
 
 
-OptionsType = Dict[str, Union[str, Callable]]
+OptionsType = dict[str, str | Callable]
 
 
 """
@@ -200,6 +194,22 @@ class BasePositionMapping:
 
 
 @dataclass
+class EsMainQueries:
+    search_query: Search
+    boost_mode: str
+    parent_query: QueryString | None = None
+    child_query: QueryString | None = None
+
+
+@dataclass
+class EsJoinQueries:
+    main_query: QueryString | list
+    parent_query: QueryString | None
+    child_query: QueryString | None
+    has_text_query: bool
+
+
+@dataclass
 class ApiPositionMapping(BasePositionMapping):
     position_type_dict: defaultdict[int, list[str]] = field(
         default_factory=lambda: defaultdict(list)
@@ -216,9 +226,9 @@ class ApiPositionMapping(BasePositionMapping):
     date_referred_to_judicial_committee_dict: defaultdict[
         int, list[datetime]
     ] = field(default_factory=lambda: defaultdict(list))
-    date_judicial_committee_action_dict: defaultdict[
-        int, list[datetime]
-    ] = field(default_factory=lambda: defaultdict(list))
+    date_judicial_committee_action_dict: defaultdict[int, list[datetime]] = (
+        field(default_factory=lambda: defaultdict(list))
+    )
     date_hearing_dict: defaultdict[int, list[datetime]] = field(
         default_factory=lambda: defaultdict(list)
     )
@@ -237,9 +247,9 @@ class ApiPositionMapping(BasePositionMapping):
     date_termination_dict: defaultdict[int, list[datetime]] = field(
         default_factory=lambda: defaultdict(list)
     )
-    date_granularity_termination_dict: defaultdict[
-        int, list[datetime]
-    ] = field(default_factory=lambda: defaultdict(list))
+    date_granularity_termination_dict: defaultdict[int, list[datetime]] = (
+        field(default_factory=lambda: defaultdict(list))
+    )
 
     judicial_committee_action_dict: defaultdict[int, list[str]] = field(
         default_factory=lambda: defaultdict(list)

@@ -160,7 +160,9 @@
       "reporter": "state",
       "page": "1",
       "type": 1,
-      "cluster": 1
+      "cluster": 1,
+      "date_created": "2025-08-21T23:52:43.497Z",
+      "date_modified": "2025-08-21T23:52:43.497Z"
     },
     "model": "search.citation",
     "pk": 1
@@ -171,7 +173,9 @@
       "reporter": "AL",
       "page": "339",
       "type": 8,
-      "cluster": 2
+      "cluster": 2,
+      "date_created": "2025-08-21T23:52:43.497Z",
+      "date_modified": "2025-08-21T23:52:43.497Z"
     },
     "model": "search.citation",
     "pk": 2
@@ -182,7 +186,9 @@
       "reporter": "state",
       "page": "1",
       "type": 1,
-      "cluster": 2
+      "cluster": 2,
+      "date_created": "2025-08-21T23:52:43.497Z",
+      "date_modified": "2025-08-21T23:52:43.497Z"
     },
     "model": "search.citation",
     "pk": 3
@@ -193,7 +199,9 @@
       "reporter": "Yeates",
       "page": "1",
       "type": 5,
-      "cluster": 2
+      "cluster": 2,
+      "date_created": "2025-08-21T23:52:43.497Z",
+      "date_modified": "2025-08-21T23:52:43.497Z"
     },
     "model": "search.citation",
     "pk": 4
@@ -204,7 +212,9 @@
       "reporter": "F.2d",
       "page": "9",
       "type": 1,
-      "cluster": 2
+      "cluster": 2,
+      "date_created": "2025-08-21T23:52:43.497Z",
+      "date_modified": "2025-08-21T23:52:43.497Z"
     },
     "model": "search.citation",
     "pk": 5
@@ -215,7 +225,9 @@
       "reporter": "F.2d",
       "page": "11",
       "type": 1,
-      "cluster": 3
+      "cluster": 3,
+      "date_created": "2025-08-21T23:52:43.497Z",
+      "date_modified": "2025-08-21T23:52:43.497Z"
     },
     "model": "search.citation",
     "pk": 6
@@ -239,7 +251,8 @@
       "date_created": "2015-08-15T14:10:56.801Z",
       "html_lawbox": "",
       "per_curiam": false,
-      "type": "020lead"
+      "type": "020lead",
+      "ordering_key": null
     },
     "model": "search.opinion",
     "pk": 1
@@ -261,7 +274,8 @@
       "date_created": "2015-08-15T14:10:56.801Z",
       "html_lawbox": "",
       "per_curiam": false,
-      "type": "010combined"
+      "type": "010combined",
+      "ordering_key": null
     },
     "model": "search.opinion",
     "pk": 2
@@ -283,7 +297,8 @@
       "date_created": "2015-08-15T14:10:56.801Z",
       "html_lawbox": "",
       "per_curiam": false,
-      "type": "010combined"
+      "type": "010combined",
+      "ordering_key": null
     },
     "model": "search.opinion",
     "pk": 3
@@ -305,7 +320,8 @@
       "date_created": "2015-08-15T14:10:56.801Z",
       "html_lawbox": "",
       "per_curiam": false,
-      "type": "010combined"
+      "type": "010combined",
+      "ordering_key": null
     },
     "model": "search.opinion",
     "pk": 4
@@ -327,7 +343,8 @@
       "date_created": "2015-08-15T14:10:56.801Z",
       "html_lawbox": "",
       "per_curiam": false,
-      "type": "010combined"
+      "type": "010combined",
+      "ordering_key": null
     },
     "model": "search.opinion",
     "pk": 5
@@ -349,7 +366,8 @@
       "date_created": "2015-08-15T14:10:56.801Z",
       "html_lawbox": "",
       "per_curiam": false,
-      "type": "010combined"
+      "type": "010combined",
+      "ordering_key": null
     },
     "model": "search.opinion",
     "pk": 6

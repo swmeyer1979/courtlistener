@@ -1,174 +1,213 @@
 import logging
-from datetime import date, timedelta
-from typing import Optional
+import re
+from datetime import date
+from http import HTTPStatus
 
-import waffle
-from asgiref.sync import sync_to_async
+from asgiref.sync import async_to_sync, sync_to_async
 from django.conf import settings
+from django.core.cache import cache
+from django.db.models import QuerySet
 from django.http import HttpRequest, HttpResponse, JsonResponse
-from django.shortcuts import get_object_or_404, render
-from django.template import TemplateDoesNotExist
+from django.shortcuts import aget_object_or_404  # type: ignore[attr-defined]
+from django.template.response import TemplateResponse
 from django.views.decorators.cache import cache_page
-from requests import Session
-from rest_framework import status
-from rest_framework.status import HTTP_400_BAD_REQUEST
+from django.views.generic import TemplateView
 
-from cl.lib.elasticsearch_utils import build_es_base_query
-from cl.lib.scorched_utils import ExtraSolrInterface
-from cl.lib.search_utils import (
-    build_alert_estimation_query,
-    build_court_count_query,
-    build_coverage_query,
-    get_solr_interface,
+from cl.api.models import ThrottleType
+from cl.api.utils import get_all_throttle_overrides
+from cl.lib.elasticsearch_utils import (
+    do_es_alert_estimation_query,
+    get_court_opinions_counts,
+    get_opinions_coverage_over_time,
 )
-from cl.search.documents import AudioDocument
+from cl.search.documents import (
+    AudioDocument,
+    DocketDocument,
+    OpinionClusterDocument,
+)
 from cl.search.forms import SearchForm
-from cl.search.models import SEARCH_TYPES, Court, OpinionCluster
+from cl.search.models import SEARCH_TYPES, Citation, Court, OpinionCluster
 from cl.simple_pages.coverage_utils import build_chart_data
 from cl.simple_pages.views import get_coverage_data_fds
 
 logger = logging.getLogger(__name__)
 
+max_court_id_length = Court._meta.get_field("id").max_length
+VALID_COURT_ID_REGEX = re.compile(rf"^\w{{1,{max_court_id_length}}}$")
 
-def annotate_courts_with_counts(courts, court_count_tuples):
-    """Solr gives us a response like:
 
-        court_count_tuples = [
-            ('ca2', 200),
-            ('ca1', 42),
-            ...
-        ]
-
-    Here we add an attribute to our court objects so they have these values.
+async def get_cached_court_counts(courts_queryset: QuerySet) -> dict[str, int]:
+    """Fetch court counts from cache or ES if not available.
+    :return: A dict mapping court IDs to their respective counts of
+    opinions, or None if no counts are available.
     """
-    # Convert the tuple to a dict
-    court_count_dict = {}
-    for court_str, count in court_count_tuples:
-        court_count_dict[court_str] = count
 
-    for court in courts:
-        court.count = court_count_dict.get(court.pk, 0)
+    cache_key = "court_counts_o"
+    court_counts = cache.get(cache_key)
+    if court_counts:
+        return court_counts
 
-    return courts
-
-
-def make_court_variable():
-    courts = Court.objects.exclude(jurisdiction=Court.TESTING_COURT)
-    with Session() as session:
-        si = ExtraSolrInterface(
-            settings.SOLR_OPINION_URL, http_connection=session, mode="r"
+    courts_count = await courts_queryset.acount()
+    court_counts = await sync_to_async(get_court_opinions_counts)(
+        OpinionClusterDocument.search(), courts_count
+    )
+    if court_counts:
+        cache.set(
+            cache_key,
+            court_counts,
+            timeout=settings.QUERY_RESULTS_CACHE,  # type: ignore
         )
-        response = si.query().add_extra(**build_court_count_query()).execute()
-    court_count_tuples = response.facet_counts.facet_fields["court_exact"]
-    courts = annotate_courts_with_counts(courts, court_count_tuples)
+    return court_counts or {}
+
+
+async def make_court_variable() -> QuerySet:
+    """
+    Create a list of court objects with an added attribute for the count of associated opinions.
+
+    :return: A QuerySet of Court objects with an added `count` attribute reflecting
+             the number of associated opinions.
+    """
+
+    courts = Court.objects.exclude(jurisdiction=Court.TESTING_COURT)
+    courts_counts = await get_cached_court_counts(courts)
+    # Add the count attribute to courts.
+    async for court in courts:
+        court.count = courts_counts.get(court.pk, 0)
     return courts
 
 
-def court_index(request: HttpRequest) -> HttpResponse:
+async def court_index(request: HttpRequest) -> HttpResponse:
     """Shows the information we have available for the courts."""
-    courts = make_court_variable()
-    return render(
+    courts = await make_court_variable()
+    return TemplateResponse(
         request, "jurisdictions.html", {"courts": courts, "private": False}
     )
 
 
-def rest_docs(request, version=None):
-    """Show the correct version of the rest docs"""
-    courts = make_court_variable()
-    court_count = len(courts)
-    context = {"court_count": court_count, "courts": courts, "private": False}
-    try:
-        return render(request, f"rest-docs-{version}.html", context)
-    except TemplateDoesNotExist:
-        return render(request, "rest-docs-vlatest.html", context)
+async def rest_docs(request, version=None):
+    """Show the correct version of the rest docs.
 
-
-def api_index(request: HttpRequest) -> HttpResponse:
-    court_count = Court.objects.exclude(
+    Latest version is shown when not specified in args.
+    """
+    court_count = await Court.objects.exclude(
         jurisdiction=Court.TESTING_COURT
-    ).count()
-    return render(
+    ).acount()
+    latest = version is None
+    context = {"court_count": court_count, "private": not latest}
+    return TemplateResponse(
+        request,
+        [f"rest-docs-{version}.html", "rest-docs-vlatest.html"],
+        context,
+    )
+
+
+async def api_index(request: HttpRequest) -> HttpResponse:
+    court_count = await Court.objects.exclude(
+        jurisdiction=Court.TESTING_COURT
+    ).acount()
+    return TemplateResponse(
         request, "docs.html", {"court_count": court_count, "private": False}
     )
 
 
-def replication_docs(request: HttpRequest) -> HttpResponse:
-    return render(request, "replication.html", {"private": False})
-
-
-def bulk_data_index(request: HttpRequest) -> HttpResponse:
+async def bulk_data_index(request: HttpRequest) -> HttpResponse:
     """Shows an index page for the dumps."""
-    disclosure_coverage = get_coverage_data_fds()
-    return render(
+    disclosure_coverage = await get_coverage_data_fds()
+    return TemplateResponse(
         request,
         "bulk-data.html",
         disclosure_coverage,
     )
 
 
-def strip_zero_years(data):
-    """Removes zeroes from the ends of the court data
-
-    Some courts only have values through to a certain date, but we don't
-    check for that in our queries. Instead, we truncate any zero-values that
-    occur at the end of their stats.
+def parse_throttle_rate_for_template(rate: str) -> tuple[int, str] | None:
     """
-    start = 0
-    end = len(data)
-    # Slice off zeroes at the beginning
-    for i, data_pair in enumerate(data):
-        if data_pair[1] != 0:
-            start = i
-            break
+    Parses a throttle rate string and returns a tuple containing the number of
+    citations allowed and the throttling duration in a format suitable for
+    templates.
 
-    # Slice off zeroes at the end
-    for i, data_pair in reversed(list(enumerate(data))):
-        if data_pair[1] != 0:
-            end = i
-            break
+    Args:
+        rate (str): A string representing the throttle rate
 
-    return data[start : end + 1]
+    Returns:
+        A tuple containing a two elements:
+            - The number of citations allowed (int).
+            - The throttling duration (str).
+    """
+    if not rate:
+        return None
+    duration_as_str = {"s": "second", "m": "minute", "h": "hour", "d": "day"}
+    num, period = rate.split("/")
+    return int(num), duration_as_str[period[0]]
 
 
-def coverage_data(request, version, court):
+async def citation_lookup_api(
+    request: HttpRequest, version=None
+) -> HttpResponse:
+    cite_count = await Citation.objects.acount()
+    rate = settings.REST_FRAMEWORK["DEFAULT_THROTTLE_RATES"]["citations"]  # type: ignore
+    default_throttle_rate = parse_throttle_rate_for_template(rate)
+    custom_throttle_rate = None
+    if request.user and request.user.is_authenticated:
+        overrides = await sync_to_async(get_all_throttle_overrides)(
+            ThrottleType.CITATION_LOOKUP
+        )
+        override = overrides.get(request.user.username)
+        if override is not None:
+            blocked, custom_rate = override
+            if not blocked and custom_rate:
+                custom_throttle_rate = parse_throttle_rate_for_template(
+                    custom_rate
+                )
+
+    return TemplateResponse(
+        request,
+        [
+            f"citation-lookup-api-{version}.html",
+            "citation-lookup-api-vlatest.html",
+        ],
+        {
+            "cite_count": cite_count,
+            "default_throttle_rate": default_throttle_rate,
+            "custom_throttle_rate": custom_throttle_rate,
+            "max_citation_per_request": settings.MAX_CITATIONS_PER_REQUEST,  # type: ignore
+            "private": False,
+            "version": version if version else "v4",
+        },
+    )
+
+
+async def coverage_data(request, version, court):
     """Provides coverage data for a court.
 
     Responds to either AJAX or regular requests.
     """
 
     if court != "all":
-        court_str = get_object_or_404(Court, pk=court).pk
+        court_str = (await aget_object_or_404(Court, pk=court)).pk
     else:
         court_str = "all"
     q = request.GET.get("q")
-    with Session() as session:
-        si = ExtraSolrInterface(
-            settings.SOLR_OPINION_URL, http_connection=session, mode="r"
-        )
-        facet_field = "dateFiled"
-        response = (
-            si.query()
-            .add_extra(**build_coverage_query(court_str, q, facet_field))
-            .execute()
-        )
-    counts = response.facet_counts.facet_ranges[facet_field]["counts"]
-    counts = strip_zero_years(counts)
-
+    opinions_coverage = await sync_to_async(get_opinions_coverage_over_time)(
+        OpinionClusterDocument.search(), court_str, q, "dateFiled"
+    )
     # Calculate the totals
     annual_counts = {}
     total_docs = 0
-    for date_string, count in counts:
-        annual_counts[date_string[:4]] = count
-        total_docs += count
+    for year_coverage in opinions_coverage:
+        annual_counts[year_coverage["key_as_string"]] = year_coverage[
+            "doc_count"
+        ]
+        total_docs += year_coverage["doc_count"]
 
     return JsonResponse(
         {"annual_counts": annual_counts, "total": total_docs}, safe=True
     )
 
 
-def fetch_first_last_date_filed(
+async def fetch_first_last_date_filed(
     court_id: str,
-) -> tuple[Optional[date], Optional[date]]:
+) -> tuple[date | None, date | None]:
     """Fetch first and last date for court
 
     :param court_id: Court object id
@@ -177,14 +216,16 @@ def fetch_first_last_date_filed(
     query = OpinionCluster.objects.filter(docket__court=court_id).order_by(
         "date_filed"
     )
-    first, last = query.first(), query.last()
+    first, last = await query.afirst(), await query.alast()
     if first:
         return first.date_filed, last.date_filed
     return None, None
 
 
+@sync_to_async
 @cache_page(7 * 60 * 60 * 24, key_prefix="coverage")
-def coverage_data_opinions(request: HttpRequest):
+@async_to_sync
+async def coverage_data_opinions(request: HttpRequest):
     """Generate Coverage Chart Data
 
     Accept GET to query court data for timelines-chart on coverage page
@@ -192,10 +233,24 @@ def coverage_data_opinions(request: HttpRequest):
     :param request: The HTTP request
     :return: Timeline data for court(s)
     """
-    chart_data = []
-    if request.method == "GET":
-        court_ids = request.GET.get("court_ids").split(",")  # type: ignore
-        chart_data = build_chart_data(court_ids)
+
+    if request.method != "GET":
+        return JsonResponse([], safe=False)
+
+    court_ids = request.GET.get("court_ids", "").strip()  # type: ignore
+    if not court_ids:
+        return JsonResponse([], safe=False)
+
+    # Clean and validate court_ids
+    valid_court_ids = [
+        court_id.strip()
+        for court_id in court_ids.split(",")
+        if court_id.strip() and VALID_COURT_ID_REGEX.match(court_id.strip())
+    ]
+    if not valid_court_ids:
+        return JsonResponse([], safe=False)
+
+    chart_data = await sync_to_async(build_chart_data)(valid_court_ids)
     return JsonResponse(chart_data, safe=False)
 
 
@@ -217,41 +272,42 @@ async def get_result_count(request, version, day_count):
         return JsonResponse(
             {"error": "Invalid SearchForm"},
             safe=True,
-            status=HTTP_400_BAD_REQUEST,
+            status=HTTPStatus.BAD_REQUEST,
         )
     cd = search_form.cleaned_data
     search_type = cd["type"]
-    es_flag_for_oa = await sync_to_async(waffle.flag_is_active)(
-        request, "oa-es-active"
-    )
-    if (
-        search_type == SEARCH_TYPES.ORAL_ARGUMENT and es_flag_for_oa
-    ):  # Elasticsearch version for OA
-        document_type = AudioDocument
-        cd["argued_after"] = date.today() - timedelta(days=int(day_count))
-        cd["argued_before"] = None
-        search_query = document_type.search()
-        s, _ = build_es_base_query(search_query, cd)
-        total_query_results = s.count()
-    else:
-        with Session() as session:
-            try:
-                si = get_solr_interface(cd, http_connection=session)
-            except NotImplementedError:
-                logger.error(
-                    "Tried getting solr connection for %s, but it's not "
-                    "implemented yet",
-                    cd["type"],
-                )
-                raise
-
-            response = (
-                si.query()
-                .add_extra(**build_alert_estimation_query(cd, int(day_count)))
-                .execute()
+    total_case_only_query_results = 0
+    match search_type:
+        case SEARCH_TYPES.ORAL_ARGUMENT:
+            # Elasticsearch version for OA
+            search_query = AudioDocument.search()
+            total_query_results, _ = await sync_to_async(
+                do_es_alert_estimation_query
+            )(search_query, cd, day_count)
+        case SEARCH_TYPES.OPINION:
+            # Elasticsearch version for O
+            search_query = OpinionClusterDocument.search()
+            total_query_results, _ = await sync_to_async(
+                do_es_alert_estimation_query
+            )(search_query, cd, day_count)
+        case SEARCH_TYPES.RECAP:
+            # Elasticsearch version for RECAP
+            search_query = DocketDocument.search()
+            (
+                total_query_results,
+                total_case_only_query_results,
+            ) = await sync_to_async(do_es_alert_estimation_query)(
+                search_query, cd, day_count
             )
-            total_query_results = response.result.numFound
-    return JsonResponse({"count": total_query_results}, safe=True)
+        case _:
+            total_query_results = 0
+    return JsonResponse(
+        {
+            "count": total_query_results,
+            "count_case_only": total_case_only_query_results,
+        },
+        safe=True,
+    )
 
 
 async def deprecated_api(request, v):
@@ -264,25 +320,32 @@ async def deprecated_api(request, v):
             "objects": [],
         },
         safe=False,
-        status=status.HTTP_410_GONE,
+        status=HTTPStatus.GONE,
     )
 
 
-def rest_change_log(request):
-    context = {"private": False}
-    return render(request, "rest-change-log.html", context)
-
-
-def webhooks_getting_started(request):
-    context = {"private": False}
-    return render(request, "webhooks-getting-started.html", context)
-
-
-def webhooks_docs(request, version=None):
+async def webhooks_docs(request, version=None):
     """Show the correct version of the webhooks docs"""
 
     context = {"private": False}
-    try:
-        return render(request, f"webhooks-docs-{version}.html", context)
-    except TemplateDoesNotExist:
-        return render(request, "webhooks-docs-vlatest.html", context)
+    return TemplateResponse(
+        request,
+        [f"webhooks-docs-{version}.html", "webhooks-docs-vlatest.html"],
+        context,
+    )
+
+
+class VersionedTemplateView(TemplateView):
+    """Custom template view to handle the right template based on the path
+    version requested.
+    """
+
+    def get_template_names(self):
+        version = self.kwargs.get("version", "vlatest")
+        base_template = self.template_name.replace("-vlatest", f"-{version}")
+        return [base_template, self.template_name]
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        context["version"] = self.kwargs.get("version", "v4")
+        return context

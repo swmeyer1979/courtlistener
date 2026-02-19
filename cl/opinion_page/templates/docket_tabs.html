@@ -4,6 +4,7 @@
 {% load static %}
 {% load text_filters %}
 {% load tz %}
+{% load waffle_tags %}
 
 
 {% block canonical %}{% get_canonical_element %}{% endblock %}
@@ -19,6 +20,13 @@
     <script src="{% static "js/jquery.bootstrap-growl.min.js" %}"></script>
     <script defer type="text/javascript"
             src="{% static "js/save-notes.js" %}"></script>
+    {% if DEBUG %}
+      <script src="{% static "js/htmx.js" %}"></script>
+      <script src="{% static "js/fix-toolbar-for-htmx.js" %}"></script>
+    {% else %}
+      <script src="{% static "js/htmx.min.js" %}"></script>
+    {% endif %}
+
     {% if request.user.is_authenticated %}
       <script defer type="text/javascript"
               src="{% static "js/toggle_settings.js" %}"></script>
@@ -46,16 +54,18 @@
     <script type="text/javascript"
             src="{% static "js/react/vendor.js" %}"></script>
 
+    <script type="text/javascript" src="{% static "js/export-csv.js" %}"></script>
+    <script src="{% static "js/pray_and_pay.js" %}"></script>
 {% endblock %}
 
 {% block nav %}
   <div class="col-xs-12">
-    {% if perms.search.change_docket %}
+    {% if perms.search.view_docket or perms.search.change_docket or perms.search.delete_docket %}
       <p class="float-right">
         <a href="{% url 'admin:search_docket_change' docket.id %}"
-           class="btn btn-primary btn-xs">Edit&nbsp;Docket&nbsp;({{ docket.view_count }} views)&nbsp;<i class="fa fa-pencil"></i>
+           class="btn btn-primary btn-xs">Edit&nbsp;Docket&nbsp;(<span id="event_count"><i class="fa fa-spinner fa-spin"></i></span> views)&nbsp;<i class="fa fa-pencil"></i>
         </a>
-        {% if request.user.is_superuser %}
+        {% if perms.search.change_docket %}
           {% if private %}
             &nbsp;<span class="btn btn-danger btn-xs">Blocked <i
               class="fa fa-ban"></i></span>
@@ -69,13 +79,14 @@
       </p>
     {% endif %}
     <h1 class="bottom inline" data-type="search.Docket" data-id="{{ docket.pk }}">
-      {{ docket|best_case_name|safe|v_wrapper }}
+      <span class="select-all">{{ docket|best_case_name|safe|v_wrapper }}</span>
       {% if docket.docket_number %}
         (<span class="select-all">{{ docket.docket_number }}</span>)
       {% endif %}
     </h1>
     {% include "includes/notes_modal.html" %}
     {% include "includes/docket_alerts_modal.html" %}
+    {% include "includes/first_prayer_modal.html" %}
 
     <h2>{{ docket.court }}</h2>
 
@@ -125,8 +136,6 @@
       </p>
     {% endif %}
 
-    {% with og_info=docket.originating_court_information %}
-    {% with bankr_info=docket.bankruptcy_information %}
     {% if docket.panel_str %}
       <p class="bottom">
         <span class="meta-data-header">Panel:</span>
@@ -281,6 +290,7 @@
       </p>
     {% endif %}
 
+    {% with bankr_info=docket.bankruptcy_information %}
     {% if bankr_info %}
       <h3 class="v-offset-above-3">Bankruptcy Information</h3>
       <hr class="top">
@@ -326,7 +336,10 @@
         </p>
       {% endif %}
     {% endif %}
+    {% endwith %}{# No more bankr_info variable #}
 
+
+    {% with og_info=docket.originating_court_information %}
     {% if og_info %}
       <h3 class="v-offset-above-3">Originating Court Information</h3>
       <hr class="top">
@@ -345,7 +358,9 @@
                 rel="nofollow"
                 data-toggle="tooltip"
                 data-placement="right"
-                title="Search for this docket number in the RECAP Archive.">{{ og_info.docket_number }})</a>
+                title="Search for this docket number in the RECAP Archive.">{{ og_info.docket_number }}</a>)
+              {% elif og_info.administrative_link %}
+                (<a href="{{ og_info.administrative_link }}">{{ og_info.docket_number }}</a>)
               {% else %}
                 ({{ og_info.docket_number }})
               {% endif %}
@@ -422,32 +437,9 @@
         <span class="meta-data-value">{{ og_info.date_received_coa }}</span>
       </p>
     {% endif %}
-    {% endwith %}{# No more bankr_info variable #}
     {% endwith %}{# No more og_info variable #}
   </div>
 
-
-  {% if docket.clusters.count %}
-    <div class="col-xs-6">
-      <h3>Opinions Outside of RECAP Collection</h3>
-      <hr class="top">
-      <ul>
-        {% for cluster in docket.clusters.all %}
-          <li>
-            <a href="{{ cluster.get_absolute_url }}?{{ request.META.QUERY_STRING }}">
-                {{ cluster.caption|safe|v_wrapper }}
-            </a>
-            {% if perms.search.change_document %}
-              <a href="{% url 'admin:search_opinioncluster_change' cluster.pk %}"
-                 class="btn btn-primary btn-xs">Edit</a>
-            {% endif %}
-            <br/>
-            {{ cluster.date_filed }}
-          </li>
-        {% endfor %}
-      </ul>
-    </div>
-  {% endif %}
 
   {% if docket.audio_files.count %}
     <div class="col-xs-6">
@@ -456,7 +448,7 @@
       <ul>
         {% for af in docket.audio_files.all %}
           <li>
-            <a href="{{ af.get_absolute_url }}?{{ request.META.QUERY_STRING }}">
+            <a href="{{ af.get_absolute_url }}{% querystring %}">
                 {{ af|best_case_name|safe|v_wrapper }}
             </a>
             {% if perms.audio.change_audio %}
@@ -495,7 +487,15 @@
         {% if docket.idb_data %}
         <li class="{% block nav-idb %}inactive{% endblock %}"
             role="presentation">
-          <a href="{% url "docket_idb_data" docket_id=docket.pk slug=docket.slug %}"><i class="fa fa-info-circle"></i>&nbsp;FJC Integrated Database
+          <a href="{% url "docket_idb_data" docket_id=docket.pk slug=docket.slug %}"><i class="fa fa-info-circle gray"></i>&nbsp;FJC Integrated Database
+          </a>
+        </li>
+        {% endif %}
+
+        {% if docket.authority_count %}
+        <li class="{% block nav-authorities %}inactive{% endblock %}"
+            role="presentation">
+          <a href="{% url "docket_authorities" docket_id=docket.pk slug=docket.slug %}">Authorities
           </a>
         </li>
         {% endif %}

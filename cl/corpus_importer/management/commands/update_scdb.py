@@ -16,6 +16,7 @@ Once located, we update items:
  - votes_majority & votes_minority
  - decision_direction
 """
+
 import csv
 import string
 from datetime import datetime
@@ -24,10 +25,13 @@ from django.core.management import CommandError
 from django.db import IntegrityError
 from django.utils.encoding import force_bytes
 from eyecite.find import get_citations
+from eyecite.tokenizers import HyperscanTokenizer
 
 from cl.lib.command_utils import VerboseCommand, logger
 from cl.lib.string_diff import gen_diff_ratio
 from cl.search.models import Citation, OpinionCluster
+
+HYPERSCAN_TOKENIZER = HyperscanTokenizer(cache_dir=".hyperscan")
 
 # Relevant numbers:
 #  - 7907: After this point we don't seem to have any citations for items.
@@ -64,7 +68,7 @@ class Command(VerboseCommand):
         )
 
     def handle(self, *args, **options):
-        super(Command, self).handle(*args, **options)
+        super().handle(*args, **options)
         self.debug = options["debug"]
         self.file = options["file"]
         self.skip_human_review = options["skip_human_review"]
@@ -82,8 +86,8 @@ class Command(VerboseCommand):
 
         if self.skip_human_review:
             logger.info(
-                "\nSkipped %s items in SCDB which came up for human "
-                "review." % self.skipped_count
+                "\nSkipped %s items in SCDB which came up for human review.",
+                self.skipped_count,
             )
 
     @staticmethod
@@ -129,21 +133,17 @@ class Command(VerboseCommand):
 
             if values_differ:
                 logger.warning(
-                    "WARNING: Didn't set '{attr}' attribute on obj {obj_id} "
+                    f"WARNING: Didn't set '{attribute}' attribute on obj {obj.pk} "
                     "because it already had a value, but the new value "
-                    "('{new}') differs from current value ('{current}')".format(
-                        attr=attribute,
-                        obj_id=obj.pk,
-                        new=new_value,
-                        current=force_bytes(current_value),
-                    )
+                    f"('{new_value}') differs from current value ('{force_bytes(current_value)}')"
                 )
                 ok = False
             else:
                 # The values were the same.
                 logger.info(
-                    "'%s' field unchanged -- old and new values were "
-                    "the same: %s" % (attribute, new_value)
+                    "'%s' field unchanged -- old and new values were the same: %s",
+                    attribute,
+                    new_value,
                 )
         return ok
 
@@ -168,6 +168,7 @@ class Command(VerboseCommand):
                 citation_obj = get_citations(
                     scdb_info[scdb_field],
                     remove_ambiguous=False,
+                    tokenizer=HYPERSCAN_TOKENIZER,
                 )[0]
             except IndexError:
                 logger.warning(
@@ -202,10 +203,8 @@ class Command(VerboseCommand):
         Take that item and enhance it with the SCDB content.
         """
         logger.info(
-            "Enhancing cluster {id} with data from SCDB ("
-            "https://www.courtlistener.com{path}).".format(
-                id=cluster.pk, path=cluster.get_absolute_url()
-            )
+            f"Enhancing cluster {cluster.pk} with data from SCDB ("
+            f"https://www.courtlistener.com{cluster.get_absolute_url()})."
         )
         attribute_tuples = [
             (cluster, "scdb_votes_majority", scdb_info["majVotes"]),
@@ -231,7 +230,7 @@ class Command(VerboseCommand):
         else:
             logger.info(
                 "Item not saved due to collision or error. Please edit by "
-                "hand: scdb_ok: {scdb}".format(scdb=scdb_ok)
+                f"hand: scdb_ok: {scdb_ok}"
             )
 
     @staticmethod
@@ -280,9 +279,9 @@ class Command(VerboseCommand):
                 c for c in cluster.case_name if c not in exclude
             )
             case_name_words = case_name.lower().split()
-            cluster_words = set(
-                [word for word in case_name_words if word not in bad_words]
-            )
+            cluster_words = {
+                word for word in case_name_words if word not in bad_words
+            }
             if scdb_words.issuperset(cluster_words):
                 good_cluster_ids.append(cluster.pk)
 
@@ -295,14 +294,12 @@ class Command(VerboseCommand):
     def get_human_review(self, clusters, d):
         for i, cluster in enumerate(clusters):
             logger.info(
-                "%s: Cluster %s (%0.3f sim):"
-                % (
-                    i,
-                    cluster.pk,
-                    gen_diff_ratio(
-                        cluster.case_name.lower(), d["caseName"].lower()
-                    ),
-                )
+                "%s: Cluster %s (%.3f sim):",
+                i,
+                cluster.pk,
+                gen_diff_ratio(
+                    cluster.case_name.lower(), d["caseName"].lower()
+                ),
             )
             logger.info(
                 f"https://www.courtlistener.com{cluster.get_absolute_url()}"

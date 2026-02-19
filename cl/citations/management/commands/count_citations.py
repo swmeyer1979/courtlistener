@@ -1,10 +1,11 @@
-import sys
+import time
 
-from django.conf import settings
-from django.core.management import call_command
+from django.db import transaction
+from django.db.models import Count, IntegerField, OuterRef, Subquery, Value
+from django.db.models.functions import Coalesce
 
-from cl.lib.command_utils import VerboseCommand
-from cl.search.models import OpinionCluster
+from cl.lib.command_utils import VerboseCommand, logger
+from cl.search.models import OpinionCluster, OpinionsCited
 
 
 class Command(VerboseCommand):
@@ -18,68 +19,114 @@ class Command(VerboseCommand):
             help="ids to process one by one, if desired",
         )
         parser.add_argument(
-            "--index",
-            type=str,
-            default="all-at-end",
-            choices=("all-at-end", "concurrently", "False"),
-            help=(
-                "When/if to save changes to the Solr index. Options are "
-                "all-at-end, concurrently or False. Saving 'concurrently' "
-                "is least efficient, since each document is updated once "
-                "for each citation to it, however this setting will show "
-                "changes in the index in realtime. Saving 'all-at-end' can "
-                "be considerably more efficient, but will not show changes "
-                "until the process has finished and the index has been "
-                "completely regenerated from the database. Setting this to "
-                "False disables changes to Solr, if that is what's desired. "
-                "Finally, only 'concurrently' will avoid reindexing the "
-                "entire collection. If you are only updating a subset of "
-                "the opinions, it is thus generally wise to use "
-                "'concurrently'."
-            ),
+            "--count-from-opinions-cited",
+            action="store_true",
+            default=False,
+            help="Flag to compute the citation_count from the OpinionsCited table",
         )
-
-    @staticmethod
-    def do_solr(options):
-        """Update Solr if requested, or report if not."""
-        if options["index"] == "all-at-end":
-            # fmt: off
-            call_command(
-                'cl_update_index',
-                '--type', 'search.Opinion',
-                '--solr-url', settings.SOLR_OPINION_URL,
-                '--noinput',
-                '--update',
-                '--everything',
-                '--do-commit',
-            )
-            # fmt: on
-        elif options["index"] == "False":
-            sys.stdout.write(
-                "Solr index not updated after running citation "
-                "finder. You may want to do so manually."
-            )
+        parser.add_argument(
+            "--start-cluster-id",
+            type=int,
+            default=None,
+            help="An OpinionCluster.id to start the batch updates from",
+        )
+        parser.add_argument(
+            "--end-cluster-id",
+            type=int,
+            default=None,
+            help="An OpinionCluster.id where the batch updates end",
+        )
+        parser.add_argument(
+            "--step-size",
+            type=int,
+            default=10_000,
+            nargs="*",
+            help="Number of ids to consider in a batch update",
+        )
 
     def handle(self, *args, **options):
         """
         For any item that has a citation count > 0, update the citation
         count based on the DB.
         """
-        super(Command, self).handle(*args, **options)
-        index_during_processing = False
-        if options["index"] == "concurrently":
-            index_during_processing = True
+        super().handle(*args, **options)
 
         clusters = OpinionCluster.objects.filter(citation_count__gt=0)
         if options.get("doc_id"):
             clusters = clusters.filter(pk__in=options["doc_id"])
 
-        for cluster in clusters.iterator():
-            count = 0
-            for sub_opinion in cluster.sub_opinions.all():
-                count += sub_opinion.citing_opinions.all().count()
+            for cluster in clusters.iterator():
+                count = 0
+                for sub_opinion in cluster.sub_opinions.all():
+                    count += sub_opinion.citing_opinions.all().count()
 
-            cluster.citation_count = count
-            cluster.save(index=index_during_processing)
+                cluster.citation_count = count
+                cluster.save()
+            return
 
-        self.do_solr(options)
+        if not options.get("count_from_opinions_cited"):
+            return
+
+        if not (
+            options.get("start_cluster_id") and options.get("end_cluster_id")
+        ):
+            raise ValueError(
+                "Must pass values for start-cluster-id and end-cluster-id"
+            )
+
+        # In 2025, we have a little more than 10.1M clusters
+        step_size = options["step_size"]
+        for start_id in range(
+            options.get("start_cluster_id"),
+            options.get("end_cluster_id"),
+            step_size,
+        ):
+            end_id = start_id + step_size
+
+            logger.info(
+                "Updating citation_count for clusters with ids between %s and %s",
+                start_id,
+                end_id,
+            )
+            self.update_cluster_citation_count_from_opinions_cited(
+                start_id,
+                end_id,
+            )
+            logger.info("Finished citation_count update")
+
+            # Give some time for anything waiting for the clusters' locks
+            time.sleep(10)
+
+    def update_cluster_citation_count_from_opinions_cited(
+        self, start_cluster_id: int, end_cluster_id: int
+    ) -> None:
+        # Group by OpinionCluster.id and count all the OpinionsCited rows for
+        # all of its subopinions
+        count_by_cluster_subquery = Subquery(
+            OpinionsCited.objects.filter(
+                # 'pk' refers to the OpinionCluster.id of the row being updated
+                # OuterRef joins to a key from the query enveloping the Subquery,
+                # in this case, the update statement below
+                cited_opinion__cluster_id=OuterRef("pk"),
+                cited_opinion__cluster_id__gte=start_cluster_id,
+                cited_opinion__cluster_id__lt=end_cluster_id,
+            )
+            # Group by the cluster ID
+            .values("cited_opinion__cluster_id")
+            # Count the number of citation entries for this cluster
+            .annotate(total_count=Count("id"))
+            # bring back only the grouping id and the total_count
+            .values("total_count")
+            .order_by()
+        )
+
+        with transaction.atomic():
+            OpinionCluster.objects.filter(
+                id__gte=start_cluster_id, id__lt=end_cluster_id
+            ).update(
+                citation_count=Coalesce(
+                    count_by_cluster_subquery,
+                    Value(0),
+                    output_field=IntegerField(),
+                )
+            )

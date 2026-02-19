@@ -1,5 +1,8 @@
+import re
+
 from disposable_email_domains import blocklist
 from django import forms
+from django.conf import settings
 from django.contrib.auth import authenticate
 from django.contrib.auth.forms import (
     PasswordChangeForm,
@@ -8,6 +11,7 @@ from django.contrib.auth.forms import (
     UserCreationForm,
 )
 from django.contrib.auth.models import User
+from django.contrib.auth.validators import ASCIIUsernameValidator
 from django.core.exceptions import ValidationError
 from django.core.mail import send_mail
 from django.forms import ModelForm
@@ -16,7 +20,7 @@ from hcaptcha.fields import hCaptchaField
 from localflavor.us.forms import USStateField, USZipCodeField
 from localflavor.us.us_states import STATE_CHOICES
 
-from cl.api.models import Webhook, WebhookEventType
+from cl.api.models import Webhook, WebhookEventType, WebhookVersions
 from cl.lib.types import EmailType
 from cl.users.models import UserProfile
 from cl.users.utils import emails
@@ -51,7 +55,6 @@ class ProfileForm(ModelForm):
             "city",
             "state",
             "zip_code",
-            "wants_newsletter",
             "is_tester",
             "docket_default_order_desc",
             "barmembership",
@@ -88,7 +91,20 @@ class ProfileForm(ModelForm):
         }
 
 
-class UserForm(ModelForm):
+class CleanEmailMixin:
+    def clean_email(self):
+        email = self.cleaned_data.get("email")
+        user_part, domain_part = email.rsplit("@", 1)
+        blocklist.update(settings.BLOCKED_DOMAINS)
+        if domain_part in blocklist:
+            raise forms.ValidationError(
+                f"{domain_part} is a blocked email provider",
+                code="bad_email_domain",
+            )
+        return email
+
+
+class UserForm(ModelForm, CleanEmailMixin):
     email = forms.EmailField(
         required=True,
         widget=forms.TextInput(
@@ -105,25 +121,23 @@ class UserForm(ModelForm):
         )
         widgets = {
             "first_name": forms.TextInput(
-                attrs={"class": "form-control", "autocomplete": "given-name"}
+                attrs={
+                    "class": "form-control",
+                    "autocomplete": "given-name",
+                    "required": True,
+                }
             ),
             "last_name": forms.TextInput(
-                attrs={"class": "form-control", "autocomplete": "family-name"}
+                attrs={
+                    "class": "form-control",
+                    "autocomplete": "family-name",
+                    "required": True,
+                }
             ),
         }
 
-    def clean_email(self):
-        email = self.cleaned_data.get("email")
-        user_part, domain_part = email.rsplit("@", 1)
-        if domain_part in blocklist:
-            raise forms.ValidationError(
-                f"{domain_part} is a blocked email provider",
-                code="bad_email_domain",
-            )
-        return email
 
-
-class UserCreationFormExtended(UserCreationForm):
+class UserCreationFormExtended(UserCreationForm, CleanEmailMixin):
     """A bit of an unusual form because instead of creating it ourselves,
     we are overriding the one from Django. Thus, instead of declaring
     everything explicitly like we normally do, we just override the
@@ -131,14 +145,16 @@ class UserCreationFormExtended(UserCreationForm):
     """
 
     def __init__(self, *args, **kwargs):
-        super(UserCreationFormExtended, self).__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs)
+        # Protect against homoglyph attacks
+        self.fields["username"].validators = [ASCIIUsernameValidator()]
 
         self.fields["username"].label = "User Name*"
         self.fields["email"].label = "Email Address*"
         self.fields["password1"].label = "Password*"
         self.fields["password2"].label = "Confirm Password*"
-        self.fields["first_name"].label = "First Name"
-        self.fields["last_name"].label = "Last Name"
+        self.fields["first_name"].label = "First Name*"
+        self.fields["last_name"].label = "Last Name*"
 
         # Give all fields a form-control class.
         for field in self.fields.values():
@@ -156,10 +172,10 @@ class UserCreationFormExtended(UserCreationForm):
             {"autocomplete": "new-password"}
         )
         self.fields["first_name"].widget.attrs.update(
-            {"autocomplete": "given-name"}
+            {"autocomplete": "given-name", "required": True}
         )
         self.fields["last_name"].widget.attrs.update(
-            {"autocomplete": "family-name"}
+            {"autocomplete": "family-name", "required": True}
         )
 
     class Meta:
@@ -171,15 +187,13 @@ class UserCreationFormExtended(UserCreationForm):
             "last_name",
         )
 
-    def clean_email(self):
-        email = self.cleaned_data.get("email")
-        user_part, domain_part = email.rsplit("@", 1)
-        if domain_part in blocklist:
+    def clean_first_name(self):
+        first_name = self.cleaned_data.get("first_name")
+        if re.search(r"""[!"#$%&()*+,./:;<=>?@[\]_{|}~]+""", first_name):
             raise forms.ValidationError(
-                f"{domain_part} is a blocked email provider",
-                code="bad_email_domain",
+                "First name must not contain any special characters."
             )
-        return email
+        return first_name
 
 
 class EmailConfirmationForm(forms.Form):
@@ -276,7 +290,7 @@ class CustomPasswordResetForm(PasswordResetForm):
     """
 
     def __init__(self, *args, **kwargs):
-        super(CustomPasswordResetForm, self).__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs)
 
         self.fields["email"].widget.attrs.update(
             {
@@ -299,7 +313,7 @@ class CustomPasswordResetForm(PasswordResetForm):
                 email["subject"], body, email["from_email"], [recipient_addr]
             )
         else:
-            super(CustomPasswordResetForm, self).save(*args, **kwargs)
+            super().save(*args, **kwargs)
 
 
 class CustomSetPasswordForm(SetPasswordForm):
@@ -308,7 +322,7 @@ class CustomSetPasswordForm(SetPasswordForm):
     """
 
     def __init__(self, user, *args, **kwargs):
-        super(CustomSetPasswordForm, self).__init__(user, *args, **kwargs)
+        super().__init__(user, *args, **kwargs)
 
         self.fields["new_password1"].widget.attrs.update(
             {
@@ -324,7 +338,7 @@ class CustomSetPasswordForm(SetPasswordForm):
 
 class WebhookForm(ModelForm):
     def __init__(self, update=None, request_user=None, *args, **kwargs):
-        super(WebhookForm, self).__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs)
 
         # Determine the webhook type options to show accordingly.
         if update:
@@ -335,18 +349,31 @@ class WebhookForm(ModelForm):
                 for i in WebhookEventType.choices
                 if i[0] == self.instance.event_type
             ]
+            instance_version = [
+                i
+                for i in WebhookVersions.choices
+                if i[0] == self.instance.version
+            ]
             self.fields["event_type"].choices = instance_type
             self.fields["event_type"].widget.attrs["readonly"] = True
+            self.fields["version"].choices = instance_version
+            self.fields["version"].widget.attrs["readonly"] = True
+
         else:
             # If we're creating a new webhook, show the webhook type options
             # that are available for the user. One webhook for each event type
             # is allowed.
             webhooks = request_user.webhooks.all()
-            used_types = [w.event_type for w in webhooks]
-            available_choices = [
-                i for i in WebhookEventType.choices if i[0] not in used_types
+            used_version_types = [
+                f"{w.event_type}_{w.version}" for w in webhooks
             ]
-            self.fields["event_type"].choices = available_choices
+            available_type_choices = {
+                w_type
+                for w_type in WebhookEventType.choices
+                for w_version in WebhookVersions.choices
+                if f"{w_type[0]}_{w_version[0]}" not in used_version_types
+            }
+            self.fields["event_type"].choices = available_type_choices
 
     class Meta:
         model = Webhook
@@ -354,6 +381,7 @@ class WebhookForm(ModelForm):
             "url",
             "event_type",
             "enabled",
+            "version",
         )
         widgets = {
             "event_type": forms.Select(
@@ -364,5 +392,8 @@ class WebhookForm(ModelForm):
             ),
             "enabled": forms.CheckboxInput(
                 attrs={"class": "webhook-checkbox"},
+            ),
+            "version": forms.Select(
+                attrs={"class": "form-control"},
             ),
         }

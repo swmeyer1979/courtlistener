@@ -1,17 +1,14 @@
 import html
-import operator
 import re
 from datetime import date, timedelta
-from functools import reduce
-from typing import List, Optional, Set, Union
 
 from dateutil.relativedelta import relativedelta
-from django.db.models import Q, QuerySet
+from django.db.models import Q
 from django.utils.html import strip_tags
 from nameparser import HumanName
 from unidecode import unidecode
 
-from cl.corpus_importer.utils import wrap_text
+from cl.lib.utils import wrap_text
 from cl.people_db.models import SUFFIX_LOOKUP, Person
 
 # list of words that aren't judge names
@@ -286,15 +283,16 @@ def find_all_judges(judge_text: str) -> [str]:
         cleaned_text,
     )
     query2 = re.findall(
+        # Compile ahead of time
         r",\sand\s(((Van|VAN|De|DE|Da|DA)\s)?\b[A-Z][\w\-'']{2,}\b(\s(IV|I|II|III|V|Jr\.|Sr\.)[\s|\b])?)",
         cleaned_text,
     )
     query = query1 + query2
     if query:
-        matches = [
+        matches = {
             name[0] for name in query if name[0].lower() not in NOT_JUDGE_WORDS
-        ]
-        return sorted(list(set(matches)))
+        }
+        return sorted(matches)
     return []
 
 
@@ -327,7 +325,8 @@ def find_just_name(text: str) -> str:
 
     # Next up is full names followed by a comma
     match_titles = re.search(
-        "(((Van|VAN|De|DE|Da|DA)\s)?[A-Z][\w\-'']{2,}(\s(IV|I|II|III|V|Jr\.|JR\.|Sr\.|SR\.))?),",
+        # adding 'r' prefix to address python 3.12 strickness around escape sequences in string literals
+        r"(((Van|VAN|De|DE|Da|DA)\s)?[A-Z][\w\-'']{2,}(\s(IV|I|II|III|V|Jr\.|JR\.|Sr\.|SR\.))?),",
         cleaned_text,
     )
     if match_titles:
@@ -359,7 +358,7 @@ def find_just_name(text: str) -> str:
 
 def extract_judge_last_name(
     text: str = "", keep_letter_case=False, require_capital=False
-) -> List[str]:
+) -> list[str]:
     """Find judge last names in a string of text.
 
     :param text: The text you wish to extract names from.
@@ -376,9 +375,9 @@ def extract_judge_last_name(
     line = text
     if "\n" in text:
         line = ""
-        for l in text.split("\n"):
-            if l:
-                line = l
+        for candidate in text.split("\n"):
+            if candidate:
+                line = candidate
             break
 
     # Strip HTML elements and unescape HTML entities.
@@ -415,7 +414,7 @@ def extract_judge_last_name(
         last_names = [names[0]]
         for i in range(len(names))[1:]:
             first_last = f"{names[i - 1]} {names[i]}"
-            first_m_last = r"%s [a-z]\.? %s" % (names[i - 1], names[i])
+            first_m_last = rf"{names[i - 1]} [a-z]\.? {names[i]}"
             if re.search(f"{first_last}|{first_m_last}", text):
                 last_names[-1] = names[i]
                 continue
@@ -424,11 +423,11 @@ def extract_judge_last_name(
 
 
 async def lookup_judge_by_full_name(
-    name: Union[HumanName, str],
+    name: HumanName | str,
     court_id: str,
-    event_date: Optional[date] = None,
+    event_date: date | None = None,
     require_living_judge: bool = True,
-) -> Optional[Person]:
+) -> Person | None:
     """Uniquely identifies a judge by both name and metadata.
 
     :param name: The judge's name, either as a str of the full name or as
@@ -554,7 +553,7 @@ async def lookup_judge_by_full_name(
 async def lookup_judge_by_full_name_and_set_attr(
     item: object,
     target_field: str,
-    full_name: Union[HumanName, str],
+    full_name: HumanName | str,
     court_id: str,
     event_date: date,
 ) -> None:
@@ -570,16 +569,15 @@ async def lookup_judge_by_full_name_and_set_attr(
     if not full_name:
         return None
     judge = await lookup_judge_by_full_name(full_name, court_id, event_date)
-    if judge is not None:
-        setattr(item, target_field, judge)
+    setattr(item, target_field, judge)
 
 
 async def lookup_judge_by_last_name(
     last_name: str,
     court_id: str,
-    event_date: Optional[date] = None,
+    event_date: date | None = None,
     require_living_judge: bool = True,
-) -> Optional[Person]:
+) -> Person | None:
     """Look up the judge using their last name, a date and court"""
     hn = HumanName()
     hn.last = last_name
@@ -589,11 +587,11 @@ async def lookup_judge_by_last_name(
 
 
 async def lookup_judges_by_last_name_list(
-    last_names: List[str],
+    last_names: list[str],
     court_id: str,
-    event_date: Optional[date] = None,
+    event_date: date | None = None,
     require_living_judge: bool = True,
-) -> List[Person]:
+) -> list[Person]:
     """Look up a group of judges by list of last names, a date, and a court"""
     found_people = []
     for last_name in last_names:
@@ -610,8 +608,8 @@ async def lookup_judges_by_last_name_list(
 async def lookup_judges_by_messy_str(
     s: str,
     court_id: str,
-    event_date: Optional[date] = None,
-) -> List[Person]:
+    event_date: date | None = None,
+) -> list[Person]:
     """Look up a group of judges by a messy string that might contain their
     names. (This is the least accurate way to look up judges.)
     """
@@ -619,66 +617,3 @@ async def lookup_judges_by_messy_str(
     return await lookup_judges_by_last_name_list(
         last_names, court_id, event_date
     )
-
-
-def sort_judge_list(judges: QuerySet, search_terms: Set[str]) -> QuerySet:
-    """Filter a list of judges by a set of search terms.
-
-    This method counts exact hits on first middle last suffix and returns
-    an ordered queryset of judges with the most paritial/full matches.
-
-    :param judges: Queryset of judges found with matching names
-    :param search_terms: Set of search terms for looking up judges by name
-    :return: Best queryset of judges ordered by last name
-    """
-    judge_dict = {}
-    highest_match = 0
-    for judge in judges:
-        judge_names = {
-            judge.name_first,
-            judge.name_last,
-            judge.name_middle,
-            judge.name_suffix,
-        }
-
-        count = 0
-        for term in search_terms:
-            for name in judge_names:
-                if term.lower() in name.lower():
-                    count += 1
-
-        if count > highest_match:
-            highest_match = count
-        if count == highest_match:
-            judge_dict[judge.id] = count
-
-    # Create list of Judge IDs that have the highest match count
-    judge_pks = []
-    for k, v in judge_dict.items():
-        if v == highest_match:
-            judge_pks.append(k)
-
-    # Return the filtered queryset and sort by name_last
-    return judges.filter(pk__in=judge_pks).order_by("name_last")
-
-
-def lookup_judge_by_name_components(queryset: QuerySet, s: str) -> QuerySet:
-    """Find judges by first, middle, last name or suffix.
-
-    :param queryset: Queryset to filter
-    :param s: User search terms in financial disclosures lookup by judge
-    :return: Filter Queryset
-    """
-    # Possible DOS attack. Don't hit the DB.
-    search_terms = s.split()[:7]
-    search_args = []
-    for term in search_terms:
-        for query in (
-            "name_first__istartswith",
-            "name_last__istartswith",
-            "name_middle__istartswith",
-            "name_suffix__istartswith",
-        ):
-            search_args.append(Q(**{query: term}))
-    judges = queryset.filter(reduce(operator.or_, search_args))
-    return sort_judge_list(judges, set(search_terms))

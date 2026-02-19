@@ -13,10 +13,9 @@ from cl.recap_rss.tasks import (
     check_if_feed_changed,
     mark_status_successful,
     merge_rss_feed_contents,
-    trim_rss_data,
+    trim_rss_feed_status,
 )
 from cl.search.models import Court
-from cl.search.tasks import add_items_to_solr
 
 
 class Command(VerboseCommand):
@@ -56,7 +55,7 @@ class Command(VerboseCommand):
         )
 
     def handle(self, *args, **options):
-        super(Command, self).handle(*args, **options)
+        super().handle(*args, **options)
 
         if options["sweep"] is False:
             # Only allow one script at a time per court combination.
@@ -66,11 +65,11 @@ class Command(VerboseCommand):
             with open(f"/tmp/rss-scraper-{court_str}.pid", "w") as fp:
                 try:
                     fcntl.lockf(fp, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except IOError:
+                except OSError:
                     print(
                         "Another instance of this program is running with "
                         "this combination of courts. Only one instance "
-                        "can crawl these courts at a time: '%s'" % court_str
+                        f"can crawl these courts at a time: '{court_str}'"
                     )
                     sys.exit(1)
 
@@ -144,6 +143,9 @@ class Command(VerboseCommand):
                 )
 
                 # Check if the item needs crawling, and crawl it if so.
+                # Make the chain expire after RSS_MAX_PROCESSING_DURATION,
+                # which is the threshold time after which a new chain for the
+                # court will be scheduled.
                 chain(
                     check_if_feed_changed.s(
                         court.pk, new_status.pk, feed_status.date_last_build
@@ -155,16 +157,15 @@ class Command(VerboseCommand):
                     # docket information from the RSS feeds. RSS feeds also
                     # have information about hundreds or thousands of
                     # dockets. Updating them all would be very bad.
-                    add_items_to_solr.s("search.RECAPDocument"),
                     mark_status_successful.si(new_status.pk),
-                ).apply_async()
+                ).apply_async(expires=self.RSS_MAX_PROCESSING_DURATION)
 
             # Trim if not too recently trimmed.
             trim_cutoff_date = now() - timedelta(
                 seconds=self.DELAY_BETWEEN_CACHE_TRIMS
             )
             if last_trim_date is None or trim_cutoff_date > last_trim_date:
-                trim_rss_data.delay()
+                trim_rss_feed_status.delay()
                 last_trim_date = now()
 
             # Wait, then attempt the courts again if iterations not exceeded or

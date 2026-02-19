@@ -1,26 +1,131 @@
 import copy
+import datetime
 from collections import OrderedDict
-from datetime import date, datetime
 
+from dateutil import parser
 from django.core.exceptions import ImproperlyConfigured
+from django.utils import timezone
+from django.utils.html import strip_tags
 from django_elasticsearch_dsl import Document, fields
 from rest_framework import serializers
 from rest_framework.fields import empty
 from rest_framework.utils.field_mapping import get_field_kwargs
+
+from cl.custom_filters.templatetags.extras import render_string_or_list
+from cl.lib.date_time import fixed_midnight_pt
+
+
+class TimeStampField(serializers.Field):
+    """Handles a naive timestamp field."""
+
+    def __init__(self, default_timezone=None, **kwargs):
+        self.timezone = None
+        if default_timezone is not None:
+            self.timezone = default_timezone
+        super().__init__(**kwargs)
+
+    def to_representation(self, value):
+        if isinstance(value, datetime.datetime):
+            if self.timezone:
+                return serializers.DateTimeField(
+                    default_timezone=self.timezone
+                ).to_representation(value)
+            else:
+                if timezone.is_naive(value):
+                    value = timezone.make_aware(value, datetime.UTC)
+                return serializers.DateTimeField().to_representation(
+                    timezone.localtime(value)
+                )
+        if isinstance(value, str):
+            parsed_datetime = parser.parse(value)
+            return serializers.DateTimeField(
+                default_timezone=self.timezone
+            ).to_representation(parsed_datetime)
+        else:
+            raise serializers.ValidationError(
+                "Date or DateTime object expected."
+            )
 
 
 class DateOrDateTimeField(serializers.Field):
     """Handles both datetime and date objects."""
 
     def to_representation(self, value):
-        if isinstance(value, datetime):
+        if isinstance(value, datetime.datetime):
             return serializers.DateTimeField().to_representation(value)
-        elif isinstance(value, date):
+        elif isinstance(value, datetime.date):
             return serializers.DateField().to_representation(value)
         else:
-            raise serializers.ValidationError(
-                "Date or DateTime object expected."
+            return value
+
+
+class CoerceDateField(serializers.Field):
+    """Coerces datetime-like inputs into a date representation. If the input
+    is not a datetime, it returns the date directly.
+    """
+
+    def to_representation(self, value):
+        if isinstance(value, datetime.datetime):
+            return serializers.DateField().to_representation(value.date())
+        return serializers.DateField().to_representation(value)
+
+
+class CoerceDateTimeField(serializers.Field):
+    """Coerces date-like inputs into a datetime midnight PT representation.
+    If the input is not a date, it returns the datetime directly.
+    """
+
+    def to_representation(self, value):
+        if isinstance(value, datetime.date):
+            return serializers.DateTimeField().to_representation(
+                fixed_midnight_pt(value)
             )
+        return serializers.DateTimeField().to_representation(
+            fixed_midnight_pt(value.date())
+        )
+
+
+class NullableListField(serializers.ListField):
+    """A custom ListField that returns None when serialized if the list is
+    empty. For API V3 compatibility.
+    """
+
+    def to_representation(self, data):
+        """
+        Return "None" if the list is empty, otherwise return the list.
+        """
+        if not data:
+            return None
+        return super().to_representation(data)
+
+
+class HighlightedField(serializers.Field):
+    """Handles highlighted text fields."""
+
+    def to_representation(self, value):
+        return render_string_or_list(value)
+
+
+class SuppressHighlightsField(serializers.Field):
+    """Supress highlights from text fields."""
+
+    def to_representation(self, value):
+        return strip_tags(render_string_or_list(value))
+
+
+class NoneToListField(serializers.ListField):
+    """A custom ListField that returns an empty list when the original value is
+    None; otherwise, it returns the original value.
+    This can be removed from some fields once a People re-index is done and
+    https://github.com/elastic/elasticsearch-dsl-py/issues/1819 solved.
+    """
+
+    def get_attribute(self, instance):
+        value = super().get_attribute(instance)
+        # Convert None to empty list explicitly here.
+        if value is None:
+            return []
+        return value
 
 
 class DocumentSerializer(serializers.Serializer):
@@ -48,7 +153,7 @@ class DocumentSerializer(serializers.Serializer):
     }
 
     def __init__(self, instance=None, data=empty, **kwargs):
-        super(DocumentSerializer, self).__init__(instance, data, **kwargs)
+        super().__init__(instance, data, **kwargs)
 
         if not hasattr(self, "Meta"):
             raise ImproperlyConfigured(
@@ -61,7 +166,7 @@ class DocumentSerializer(serializers.Serializer):
                 "Meta class."
             )
 
-        if not issubclass(self.Meta.document, (Document,)):
+        if not issubclass(self.Meta.document, Document):
             raise ImproperlyConfigured(
                 "You must subclass the serializer 'document' from the Document"
                 "class."
@@ -93,13 +198,12 @@ class DocumentSerializer(serializers.Serializer):
 
     def get_fields(self):
         """Get the required fields for serializing the result."""
-        fields = getattr(self.Meta, "fields", tuple())
-        exclude = getattr(self.Meta, "exclude", tuple())
-        ignore_fields = getattr(self.Meta, "ignore_fields", tuple())
+        fields = getattr(self.Meta, "fields", ())
+        exclude = getattr(self.Meta, "exclude", ())
+        ignore_fields = getattr(self.Meta, "ignore_fields", ())
         document = getattr(self.Meta, "document")
         model = document.Django.model
         document_fields = document._fields
-
         declared_fields = copy.deepcopy(self._declared_fields)
         field_mapping = OrderedDict()
 

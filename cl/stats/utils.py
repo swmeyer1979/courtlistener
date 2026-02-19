@@ -1,15 +1,20 @@
 from collections import OrderedDict
+from datetime import datetime, timedelta
 
 import redis
-import requests
-from django.conf import settings
 from django.db import OperationalError, connections
-from django.db.models import F
 from django.utils.timezone import now
+from elasticsearch.exceptions import (
+    ConnectionError,
+    ConnectionTimeout,
+    RequestError,
+)
+from elasticsearch_dsl import connections as es_connections
+from waffle import switch_is_active
 
 from cl.lib.db_tools import fetchall_as_dict
-from cl.lib.redis_utils import make_redis_interface
-from cl.stats.models import Stat
+from cl.lib.redis_utils import get_redis_interface
+from cl.stats.metrics import record_prometheus_metric
 
 MILESTONES = OrderedDict(
     (
@@ -25,7 +30,7 @@ MILESTONES = OrderedDict(
 )
 
 MILESTONES_FLAT = sorted(
-    [item for sublist in MILESTONES.values() for item in sublist]
+    item for sublist in MILESTONES.values() for item in sublist
 )
 
 
@@ -47,36 +52,88 @@ def get_milestone_range(start, end):
     return out
 
 
-def tally_stat(name, inc=1, date_logged=None):
-    """Tally an event's occurrence to the database.
+def _update_cached_stat(key, inc, date_logged):
+    r = get_redis_interface("STATS")
+
+    # Compute expiration:
+    # Keys live for 10 full days after the date they represent. For example,
+    # a key for June 1 will expire at June 12 at 00:00:00.
+    midnight_today = datetime.combine(
+        date_logged, datetime.min.time(), tzinfo=now().tzinfo
+    )
+    expire_at_date = midnight_today + timedelta(days=11)
+
+    # Convert to seconds-from-now for Redis EXPIRE
+    ttl_seconds = int((expire_at_date - now()).total_seconds())
+
+    # Increment and apply expiration atomically
+    pipe = r.pipeline()
+    pipe.incrby(key, inc)
+    pipe.expire(key, ttl_seconds)
+    value, _ = pipe.execute()
+
+    return value
+
+
+def tally_stat(
+    name,
+    inc=1,
+    date_logged=None,
+    prometheus_handler_key="",
+) -> int:
+    """Tally an event's occurrence to Redis.
 
     Will assume the following overridable values:
        - the event happened today.
        - the event happened once.
     """
+    if not switch_is_active("increment-stats"):
+        return
+
+    current_dt = now()
     if date_logged is None:
-        date_logged = now()
-    stat, created = Stat.objects.get_or_create(
-        name=name, date_logged=date_logged, defaults={"count": inc}
-    )
-    if created:
-        return stat.count
-    else:
-        count_cache = stat.count
-        stat.count = F("count") + inc
-        stat.save()
-        # stat doesn't have the new value when it's updated with a F object, so
-        # we fake the return value instead of looking it up again for the user.
-        return count_cache + inc
+        date_logged = current_dt.date()
+
+    key = f"{name}.{date_logged.isoformat()}"
+
+    if prometheus_handler_key:
+        record_prometheus_metric(prometheus_handler_key, inc)
+
+    return _update_cached_stat(key, inc, date_logged)
 
 
 def check_redis() -> bool:
-    r = make_redis_interface("STATS")
+    r = get_redis_interface("STATS")
     try:
         r.ping()
     except (redis.exceptions.ConnectionError, ConnectionRefusedError):
         return False
     return True
+
+
+def check_elasticsearch() -> bool:
+    """
+    Checks the health of the connected Elasticsearch cluster.
+
+    it retrieves the cluster health information and returns:
+
+    * True:  if the cluster health status is "green" (healthy).
+    * False: if the cluster health is not "green" or an error occurs
+              during connection or health retrieval.
+    """
+    try:
+        es = es_connections.get_connection()
+        cluster_health = es.cluster.health()
+    except (
+        ConnectionError,
+        ConnectionTimeout,
+        RequestError,
+    ):
+        return False
+
+    if cluster_health["status"] == "green":
+        return True
+    return False
 
 
 def check_postgresql() -> bool:
@@ -88,17 +145,6 @@ def check_postgresql() -> bool:
                 c.fetchone()
     except OperationalError:
         return False
-    return True
-
-
-def check_solr() -> bool:
-    """Check if we can connect to Solr"""
-    s = requests.Session()
-    for domain in {settings.SOLR_HOST, settings.SOLR_RECAP_HOST}:
-        try:
-            s.get(f"{domain}/solr/admin/ping?wt=json", timeout=2)
-        except ConnectionError:
-            return False
     return True
 
 

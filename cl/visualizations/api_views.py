@@ -1,10 +1,12 @@
+from http import HTTPStatus
+
+from asgiref.sync import async_to_sync
 from django.db.models import Q
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
-from rest_framework.status import HTTP_201_CREATED, HTTP_400_BAD_REQUEST
 from rest_framework.viewsets import ModelViewSet
 
-from cl.api.api_permissions import IsOwner
+from cl.api.api_permissions import IsOwner, V3APIPermission
 from cl.api.utils import LoggingMixin
 from cl.visualizations.api_permissions import IsParentVisualizationOwner
 from cl.visualizations.api_serializers import (
@@ -17,9 +19,21 @@ from cl.visualizations.utils import build_visualization
 
 
 class JSONViewSet(LoggingMixin, ModelViewSet):
-    permission_classes = [IsAuthenticated, IsParentVisualizationOwner]
+    permission_classes = [
+        IsAuthenticated,
+        IsParentVisualizationOwner,
+        V3APIPermission,
+    ]
     serializer_class = JSONVersionSerializer
     ordering_fields = ("id", "date_created", "date_modified")
+    # Default cursor ordering key
+    ordering = "-id"
+    # Additional cursor ordering fields
+    cursor_ordering_fields = [
+        "id",
+        "date_created",
+        "date_modified",
+    ]
 
     def get_queryset(self):
         return JSONVersion.objects.filter(
@@ -28,9 +42,17 @@ class JSONViewSet(LoggingMixin, ModelViewSet):
 
 
 class VisualizationViewSet(LoggingMixin, ModelViewSet):
-    permission_classes = [IsAuthenticated, IsOwner]
+    permission_classes = [IsAuthenticated, IsOwner, V3APIPermission]
     serializer_class = VisualizationSerializer
     ordering_fields = ("id", "date_created", "date_modified", "user")
+    # Default cursor ordering key
+    ordering = "-id"
+    # Additional cursor ordering fields
+    cursor_ordering_fields = [
+        "id",
+        "date_created",
+        "date_modified",
+    ]
 
     def get_queryset(self):
         return SCOTUSMap.objects.filter(
@@ -45,11 +67,13 @@ class VisualizationViewSet(LoggingMixin, ModelViewSet):
         headers = self.get_success_headers(serializer.data)
         if status != "success":
             return Response(
-                {"error": status}, status=HTTP_400_BAD_REQUEST, headers=headers
+                {"error": status},
+                status=HTTPStatus.BAD_REQUEST,
+                headers=headers,
             )
         else:
             return Response(
-                serializer.data, status=HTTP_201_CREATED, headers=headers
+                serializer.data, status=HTTPStatus.CREATED, headers=headers
             )
 
     def perform_create(self, serializer):
@@ -60,5 +84,5 @@ class VisualizationViewSet(LoggingMixin, ModelViewSet):
         viz = serializer.save(
             user=self.request.user, cluster_start=start, cluster_end=end
         )
-        status, viz = build_visualization(viz)
+        status, viz = async_to_sync(build_visualization)(viz)
         return status

@@ -1,5 +1,4 @@
 from pathlib import Path
-from typing import List
 
 import environ
 from django.contrib.messages import constants as message_constants
@@ -20,10 +19,8 @@ DATABASES = {
         "NAME": env("DB_NAME", default="courtlistener"),
         "USER": env("DB_USER", default="postgres"),
         "PASSWORD": env("DB_PASSWORD", default="postgres"),
-        "CONN_MAX_AGE": env("DB_CONN_MAX_AGE", default=0),
+        "CONN_MAX_AGE": 0,
         "HOST": env("DB_HOST", default="cl-postgres"),
-        # Disable DB serialization during tests for small speed boost
-        "TEST": {"SERIALIZE": False},
         "OPTIONS": {
             # See: https://www.postgresql.org/docs/current/libpq-ssl.html#LIBPQ-SSL-PROTECTION
             # "prefer" is fine in dev, but poor in prod, where it should be
@@ -40,14 +37,14 @@ if env("DB_REPLICA_HOST", default=""):
         "PASSWORD": env("DB_REPLICA_PASSWORD", default="postgres"),
         "HOST": env("DB_REPLICA_HOST", default=""),
         "PORT": "",
-        "CONN_MAX_AGE": env("DB_REPLICA_CONN_MAX_AGE", default=0),
+        "CONN_MAX_AGE": 0,
         "OPTIONS": {
             "sslmode": env("DB_REPLICA_SSL_MODE", default="prefer"),
         },
     }
 
 MAX_REPLICATION_LAG = env.int("MAX_REPLICATION_LAG", default=1e8)  # 100MB
-API_READ_DATABASES: List[str] = env("API_READ_DATABASES", default="replica")
+API_READ_DATABASES: list[str] = env("API_READ_DATABASES", default="replica")
 
 ####################
 # Cache & Sessions #
@@ -64,6 +61,14 @@ CACHES = {
         "OPTIONS": {"MAX_ENTRIES": 2.5e5},
     },
 }
+
+DEVELOPMENT = env.bool("DEVELOPMENT", default=True)
+if not DEVELOPMENT:
+    CACHES["s3"] = {
+        "BACKEND": "django_s3_express_cache.S3ExpressCacheBackend",
+        "LOCATION": "com-courtlistener-cache--usw2-az1--x-s3",
+    }
+
 # This sets Redis as the session backend. This is often advised against, but we
 # have pretty good persistency in Redis, so it's fairly well backed up.
 SESSION_ENGINE = "django.contrib.sessions.backends.cache"
@@ -74,7 +79,6 @@ SESSION_ENGINE = "django.contrib.sessions.backends.cache"
 INSTALL_ROOT = Path(__file__).resolve().parents[2]
 STATICFILES_DIRS = (INSTALL_ROOT / "cl/assets/static-global/",)
 DEBUG = env.bool("DEBUG", default=True)
-DEVELOPMENT = env.bool("DEVELOPMENT", default=True)
 MEDIA_ROOT = env("MEDIA_ROOT", default=INSTALL_ROOT / "cl/assets/media/")
 STATIC_URL = env.str("STATIC_URL", default="static/")
 STATIC_ROOT = INSTALL_ROOT / "cl/assets/static/"
@@ -118,9 +122,11 @@ TEMPLATES = [
 ]
 
 MIDDLEWARE = [
+    "django_prometheus.middleware.PrometheusBeforeMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",
     "django.middleware.security.SecurityMiddleware",
+    "django_permissions_policy.PermissionsPolicyMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
     "corsheaders.middleware.CorsMiddleware",
     "csp.middleware.CSPMiddleware",
@@ -130,20 +136,24 @@ MIDDLEWARE = [
     "waffle.middleware.WaffleMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "cl.lib.middleware.RobotsHeaderMiddleware",
-    "cl.lib.middleware.MaintenanceModeMiddleware",
+    "cl.lib.middleware.IncrementalNewTemplateMiddleware",
     "pghistory.middleware.HistoryMiddleware",
+    "django_prometheus.middleware.PrometheusAfterMiddleware",
+    "cl.lib.sqlcommenter.SqlCommenter",
 ]
 
 ROOT_URLCONF = "cl.urls"
 
 INSTALLED_APPS = [
     "daphne",
+    "pghistory.admin",
     "django.contrib.admin",
     "django.contrib.admindocs",
     "django.contrib.contenttypes",
     "django.contrib.auth",
     "django.contrib.humanize",
     "django.contrib.messages",
+    "django.contrib.postgres",
     "django.contrib.sessions",
     "django.contrib.sites",
     "django.contrib.sitemaps",
@@ -155,6 +165,7 @@ INSTALLED_APPS = [
     "rest_framework",
     "rest_framework.authtoken",
     "django_filters",
+    "django_prometheus",
     "storages",
     "waffle",
     "admin_cursor_paginator",
@@ -180,17 +191,28 @@ INSTALLED_APPS = [
     "cl.scrapers",
     "cl.search",
     "cl.simple_pages",
+    "cl.sitemaps_infinite",
     "cl.stats",
     "cl.users",
     "cl.visualizations",
+    "tailwind",
+    "django_cotton",
 ]
 
 if DEVELOPMENT:
     INSTALLED_APPS.append("django_extensions")
-    MIDDLEWARE.append("debug_toolbar.middleware.DebugToolbarMiddleware")
+
+    # used to hot reload css changes
+    INSTALLED_APPS.append("django_browser_reload")
+    MIDDLEWARE.append(
+        "django_browser_reload.middleware.BrowserReloadMiddleware"
+    )
+
+# TODO: Shift to a global Tailwind config and pull out of simple_pages app
+TAILWIND_APP_NAME = "cl.simple_pages"
+TAILWIND_CSS_PATH = "css/tailwind_styles.css"
 
 ASGI_APPLICATION = "cl.asgi.application"
-
 
 ################
 # Misc. Django #
@@ -204,7 +226,7 @@ DATETIME_FORMAT = "N j, Y, P e"
 DATA_UPLOAD_MAX_NUMBER_FIELDS = 10240
 
 # Local time zone for this installation. Choices can be found here:
-# http://en.wikipedia.org/wiki/List_of_tz_zones_by_name
+# https://en.wikipedia.org/wiki/List_of_tz_zones_by_name
 # although not all choices may be available on all operating systems.
 # If running in a Windows environment this must be set to the same as your
 # system time zone.
@@ -231,9 +253,12 @@ MESSAGE_TAGS = {
 
 DEFAULT_AUTO_FIELD = "django.db.models.AutoField"
 
+
 SILENCED_SYSTEM_CHECKS = [
     # Allow index names >30 characters, because we aren’t using Oracle
     "models.E034",
     # Don't warn about HSTS being used
     "security.W004",
 ]
+
+PROMETHEUS_METRIC_NAMESPACE = "cl_django"

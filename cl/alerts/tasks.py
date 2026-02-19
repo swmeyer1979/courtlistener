@@ -2,51 +2,56 @@ import copy
 from dataclasses import dataclass
 from datetime import datetime
 from importlib import import_module
-from typing import Dict, List, Tuple, Union, cast
+from urllib.parse import urlencode
 
 from celery import Task
 from django.conf import settings
 from django.contrib.auth.models import User
+from django.contrib.contenttypes.models import ContentType
 from django.core.mail import EmailMultiAlternatives, get_connection, send_mail
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from django.template import loader
+from django.urls import reverse
 from django.utils.timezone import now
-from elasticsearch.exceptions import (
-    ConnectionError,
-    NotFoundError,
-    RequestError,
-    TransportError,
-)
+from elasticsearch.exceptions import ConnectionError
+from waffle import switch_is_active
 
 from cl.alerts.models import Alert, DocketAlert, ScheduledAlertHit
 from cl.alerts.utils import (
-    alert_hits_limit_reached,
+    add_document_hit_to_alert_set,
+    build_alert_email_subject,
+    fetch_all_search_alerts_results,
+    has_document_alert_hit_been_triggered,
+    include_recap_document_hit,
     override_alert_query,
-    percolate_document,
-    user_has_donated_enough,
+    percolate_es_document,
+    prepare_percolator_content,
+    scheduled_alert_hits_limit_reached,
+    transform_percolator_child_document,
 )
 from cl.api.models import WebhookEventType
 from cl.api.tasks import (
     send_docket_alert_webhook_events,
-    send_es_search_alert_webhook,
+    send_search_alert_webhook_es,
 )
 from cl.celery_init import app
 from cl.custom_filters.templatetags.text_filters import best_case_name
 from cl.favorites.models import Note, UserTag
 from cl.lib.command_utils import logger
-from cl.lib.elasticsearch_utils import merge_highlights_into_result
-from cl.lib.redis_utils import create_redis_semaphore, delete_redis_semaphore
+from cl.lib.decorators import retry
+from cl.lib.redis_utils import (
+    create_redis_semaphore,
+    delete_redis_semaphore,
+    get_redis_interface,
+)
 from cl.lib.string_utils import trunc
 from cl.recap.constants import COURT_TIMEZONES
-from cl.search.constants import ALERTS_HL_TAG
-from cl.search.documents import ES_CHILD_ID, ESRECAPDocument, PositionDocument
-from cl.search.models import Docket, DocketEntry
+from cl.search.models import SEARCH_TYPES, Docket, DocketEntry, RECAPDocument
 from cl.search.types import (
-    AudioPercolator,
-    ESDocumentClassType,
-    PercolatorResponseType,
-    SaveDocumentResponseType,
+    ESDocumentNameType,
+    SaveESDocumentReturn,
     SearchAlertHitType,
+    SendAlertsResponse,
 )
 from cl.stats.utils import tally_stat
 from cl.users.models import UserProfile
@@ -221,11 +226,15 @@ def make_alert_messages(
         "docket": d,
         "docket_alert_secret_key": None,
         "timezone": COURT_TIMEZONES.get(d.court_id, "US/Eastern"),
+        "recap_alerts_banner": switch_is_active("recap-alerts-email-banner"),
     }
     messages = []
     for recipient in da_recipients:
         notes, tags = get_docket_notes_and_tags_by_user(
             d.pk, recipient.user_pk
+        )
+        unsubscribe_url = reverse(
+            "one_click_docket_alert_unsubscribe", args=[recipient.secret_key]
         )
         email_context["notes"] = notes
         email_context["tags"] = tags
@@ -242,7 +251,11 @@ def make_alert_messages(
             body=txt_template.render(email_context),
             from_email=settings.DEFAULT_ALERTS_EMAIL,
             to=[recipient.email_address],
-            headers={f"X-Entity-Ref-ID": f"docket.alert:{d.pk}"},
+            headers={
+                "X-Entity-Ref-ID": f"docket.alert:{d.pk}",
+                "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
+                "List-Unsubscribe": f"<https://www.courtlistener.com{unsubscribe_url}>",
+            },
         )
         html = html_template.render(email_context)
         msg.attach_alternative(html, "text/html")
@@ -347,7 +360,7 @@ def send_alert_and_webhook(
     connection.send_messages(messages)
 
     # Work completed. Tally, log, and clean up
-    tally_stat("alerts.docket.alerts.sent", inc=len(messages))
+    tally_stat("alerts.sent", inc=len(messages))
     DocketAlert.objects.filter(docket=d).update(date_last_hit=now())
 
     # Send docket entries to webhook
@@ -357,27 +370,20 @@ def send_alert_and_webhook(
 
 
 @app.task(ignore_result=True)
-def send_alerts_and_webhooks(
-    data: Dict[str, Union[List[Tuple], List[int]]]
-) -> List[int]:
+def send_alerts_and_webhooks(data: list[tuple[int, datetime]]) -> list[int]:
     """Send many docket alerts at one time without making numerous calls
     to the send_alert_and_webhook function.
 
-    :param data: A dict with up to two keys:
+    :param data: A list of tuples. Each tuple contains the docket ID, and
+        a time. The time indicates that alerts should be sent for
+        items *after* that point.
 
-      d_pks_to_alert: A list of tuples. Each tuple contains the docket ID, and
-                      a time. The time indicates that alerts should be sent for
-                      items *after* that point.
-        rds_for_solr: A list of RECAPDocument ids that need to be sent to Solr
-                      to be made searchable.
-    :returns: Simply passes through the rds_for_solr list, in case it is
-    consumed by the next task. If rds_for_solr is not provided, returns an
-    empty list.
+    :returns: An empty list
     """
-    for args in data["d_pks_to_alert"]:
+    for args in data:
         send_alert_and_webhook(*args)
 
-    return cast(List[int], data.get("rds_for_solr", []))
+    return []
 
 
 @app.task(ignore_result=True)
@@ -414,7 +420,7 @@ def send_unsubscription_confirmation(
         body=txt_template.render(email_context),
         from_email=settings.DEFAULT_ALERTS_EMAIL,
         to=[email_address],
-        headers={f"X-Entity-Ref-ID": f"docket.alert:{docket.pk}"},
+        headers={"X-Entity-Ref-ID": f"docket.alert:{docket.pk}"},
     )
     html = html_template.render(email_context)
     msg.attach_alternative(html, "text/html")
@@ -432,7 +438,7 @@ def send_recap_email_user_not_found(recap_email_recipients: list[str]) -> None:
 
     template = loader.get_template("recap_email_user_not_found.txt")
     send_mail(
-        subject=f"@recap.email user not found",
+        subject="@recap.email user not found",
         message=template.render(
             {"recap_email_recipients": recap_email_recipients}
         ),
@@ -445,7 +451,6 @@ def send_webhook_alert_hits(
     alert_user: UserProfile.user, hits: list[SearchAlertHitType]
 ) -> None:
     """Send webhook alerts for search hits.
-
     :param alert_user: The user profile object associated with the webhooks.
     :param hits: A list of tuples, each containing information about an alert,
     its associated search type, documents found, and the number of documents.
@@ -457,27 +462,29 @@ def send_webhook_alert_hits(
             event_type=WebhookEventType.SEARCH_ALERT, enabled=True
         )
         for user_webhook in user_webhooks:
-            send_es_search_alert_webhook.delay(
+            send_search_alert_webhook_es.delay(
                 documents,
                 user_webhook.pk,
-                alert,
+                alert.pk,
             )
 
 
 @app.task(ignore_result=True)
 def send_search_alert_emails(
-    email_alerts_to_send: list[tuple[int, list[SearchAlertHitType]]]
+    email_alerts_to_send: list[tuple[int, list[SearchAlertHitType]]],
+    scheduled_alert: bool = False,
 ) -> None:
     """Send search alert emails for multiple users.
 
     :param email_alerts_to_send: A list of two tuples containing the user to
     whom the alerts should be sent. A list of tuples containing the Search
     Alert, (Alert, search type, documents, and number of documents)
+    :param scheduled_alert: A boolean indicating weather this alert has been
+    scheduled
     :return: None
     """
 
     messages = []
-    subject = "New hits for your alerts"
     txt_template = loader.get_template("alert_email_es.txt")
     html_template = loader.get_template("alert_email_es.html")
 
@@ -486,15 +493,40 @@ def send_search_alert_emails(
         if not len(hits) > 0:
             continue
 
+        subject = build_alert_email_subject(hits)
         alert_user: UserProfile.user = User.objects.get(pk=user_id)
         context = {
             "hits": hits,
             "hits_limit": settings.SCHEDULED_ALERT_HITS_LIMIT,
+            "scheduled_alert": scheduled_alert,
+            "recap_alerts_banner": switch_is_active(
+                "recap-alerts-email-banner"
+            ),
         }
+        headers = {}
+        query_string = ""
+        if len(hits) == 1:
+            alert = hits[0][0]
+            unsubscribe_path = reverse(
+                "one_click_disable_alert", args=[alert.secret_key]
+            )
+            headers["List-Unsubscribe-Post"] = "List-Unsubscribe=One-Click"
+        else:
+            params = {"keys": [hit[0].secret_key for hit in hits]}
+            query_string = urlencode(params, doseq=True)
+            unsubscribe_path = reverse("disable_alert_list")
+        headers["List-Unsubscribe"] = (
+            f"<https://www.courtlistener.com{unsubscribe_path}{'?' if query_string else ''}{query_string}>"
+        )
+
         txt = txt_template.render(context)
         html = html_template.render(context)
         msg = EmailMultiAlternatives(
-            subject, txt, settings.DEFAULT_ALERTS_EMAIL, [alert_user.email]
+            subject,
+            txt,
+            settings.DEFAULT_ALERTS_EMAIL,
+            [alert_user.email],
+            headers=headers,
         )
         msg.attach_alternative(html, "text/html")
         messages.append(msg)
@@ -503,41 +535,147 @@ def send_search_alert_emails(
     connection.send_messages(messages)
 
 
+@retry(IntegrityError, tries=3, delay=0.5, backoff=1)
+def create_schedule_alerts_hits_in_bulk(
+    scheduled_hits: list[ScheduledAlertHit],
+) -> None:
+    """Create ScheduledAlertHit records in bulk.
+
+    Uses bulk_create to persist a list of ScheduledAlertHit instances in a
+    single database operation. Do retries upon IntegrityError.
+
+    :param scheduled_hits: A list of ScheduledAlertHit instances to be created.
+    :return: None
+    """
+    ScheduledAlertHit.objects.bulk_create(scheduled_hits)
+
+
 @app.task(ignore_result=True)
-def process_percolator_response(response: PercolatorResponseType) -> None:
+def percolator_response_processing(response: SendAlertsResponse) -> None:
     """Process the response from the percolator and handle alerts triggered by
      the percolator query.
 
-    :param response: A two tuple, a list of Alerts triggered and the document
-    data that triggered the alert.
+    :param response: A `SendAlertsResponse` object containing A list of hits
+    for main, docket only and recap-only alerts, the document data that
+    triggered the alerts and The related app label model.
     :return: None
     """
-
     if not response:
         return None
 
     scheduled_hits_to_create = []
-    email_alerts_to_send = []
-    rt_alerts_to_send = []
-    alerts_triggered, document_content = response
-    for hit in alerts_triggered:
+
+    main_alerts_triggered = response.main_alerts_triggered
+    rd_alerts_triggered = response.rd_alerts_triggered
+    d_alerts_triggered = response.d_alerts_triggered
+    document_content = response.document_content
+    app_label_model = response.app_label_model
+    app_label_str, model_str = app_label_model.split(".")
+    instance_content_type = ContentType.objects.get(
+        app_label=app_label_str, model=model_str.lower()
+    )
+    r = get_redis_interface("CACHE")
+    recap_document_hits = [hit.id for hit in rd_alerts_triggered]
+    docket_hits = [hit.id for hit in d_alerts_triggered]
+    alerts_triggered_ids = []
+    for hit in main_alerts_triggered:
         # Create a deep copy of the original 'document_content' to allow
         # independent highlighting for each alert triggered.
-        document_content_copy = copy.deepcopy(document_content)
 
+        document_content_copy = copy.deepcopy(document_content)
         alert_triggered = (
             Alert.objects.filter(pk=hit.meta.id).select_related("user").first()
         )
         if not alert_triggered:
             continue
 
+        alert_triggered_id = alert_triggered.pk
+        case_only_alert = (
+            True
+            if alert_triggered.alert_type == SEARCH_TYPES.DOCKETS
+            else False
+        )
+        if case_only_alert and has_document_alert_hit_been_triggered(
+            r, alert_triggered_id, "co", document_content_copy["docket_id"]
+        ):
+            # The RECAP case-only alert has already been triggered by this case.
+            # Ignore it.
+            continue
+
         alert_user: UserProfile.user = alert_triggered.user
         # Set highlight if available in response.
+        match app_label_model:
+            case "search.RECAPDocument":
+                # Filter out RECAPDocuments and set the document id to the
+                # Redis RECAPDocument alert hits set.
+                if not include_recap_document_hit(
+                    alert_triggered_id, recap_document_hits, docket_hits
+                ) or has_document_alert_hit_been_triggered(
+                    r, alert_triggered_id, "r", document_content_copy["id"]
+                ):
+                    continue
+                transform_percolator_child_document(
+                    document_content_copy, hit.meta
+                )
+                add_document_hit_to_alert_set(
+                    r, alert_triggered_id, "r", document_content_copy["id"]
+                )
+                object_id = document_content_copy["docket_id"]
+                # Mark case-only alert as triggered.
+                add_document_hit_to_alert_set(
+                    r, alert_triggered_id, "co", object_id
+                )
+                child_document = True
+            case "search.Docket":
+                # Filter out Dockets and set the document id to the
+                # Redis Docket alert hits set.
+                if has_document_alert_hit_been_triggered(
+                    r,
+                    alert_triggered_id,
+                    "d",
+                    document_content_copy["docket_id"],
+                ):
+                    continue
+                add_document_hit_to_alert_set(
+                    r,
+                    alert_triggered_id,
+                    "d",
+                    document_content_copy["docket_id"],
+                )
+                object_id = document_content_copy["docket_id"]
+                # Mark case-only alert as triggered.
+                add_document_hit_to_alert_set(
+                    r, alert_triggered_id, "co", object_id
+                )
+                child_document = False
+            case "audio.Audio":
+                object_id = document_content_copy["id"]
+                child_document = False
+            case "search.Opinion":
+                # Filter out Opinions and set the document id to the
+                # Redis Opinion alert hits set.
+                if has_document_alert_hit_been_triggered(
+                    r, alert_triggered_id, "o", document_content_copy["id"]
+                ):
+                    continue
+                transform_percolator_child_document(
+                    document_content_copy, hit.meta
+                )
+                add_document_hit_to_alert_set(
+                    r, alert_triggered_id, "o", document_content_copy["id"]
+                )
+                object_id = document_content_copy["cluster_id"]
+                child_document = True
+            case _:
+                raise NotImplementedError(
+                    "Percolator response processing not supported for: %s",
+                    app_label_model,
+                )
+
         if hasattr(hit.meta, "highlight"):
-            merge_highlights_into_result(
-                hit.meta.highlight.to_dict(),
-                document_content_copy,
-                ALERTS_HL_TAG,
+            document_content_copy["meta"] = {}
+            document_content_copy["meta"]["highlight"] = (
+                hit.meta.highlight.to_dict()
             )
 
         # Override order_by to show the latest items when clicking the
@@ -557,50 +695,49 @@ def process_percolator_response(response: PercolatorResponseType) -> None:
         # Send real time Webhooks for all users regardless of alert rate and
         # user's donations.
         send_webhook_alert_hits(alert_user, hits)
+        if (
+            alert_triggered.rate == Alert.REAL_TIME
+            and not alert_user.profile.is_eligible_for_rt_search_alerts
+        ):
+            # Omit scheduling an RT alert if the user is not a member.
+            continue
+        # Schedule RT, DAILY, WEEKLY and MONTHLY Alerts
+        if scheduled_alert_hits_limit_reached(
+            alert_triggered_id,
+            alert_triggered.user.pk,
+            instance_content_type,
+            object_id,
+            child_document,
+        ):
+            # Skip storing hits for this alert-user combination because
+            # the SCHEDULED_ALERT_HITS_LIMIT has been reached.
+            continue
 
-        # Send RT Alerts
-        if alert_triggered.rate == Alert.REAL_TIME:
-            user_donated_enough = user_has_donated_enough(
-                alert_user, alerts_count=1
+        scheduled_hits_to_create.append(
+            ScheduledAlertHit(
+                user=alert_triggered.user,
+                alert=alert_triggered,
+                document_content=document_content_copy,
+                content_type=instance_content_type,
+                object_id=object_id,
             )
-            if not user_donated_enough:
-                continue
-
-            # Append alert RT email to be sent.
-            email_alerts_to_send.append((alert_user.pk, hits))
-            rt_alerts_to_send.append(alert_triggered.pk)
-
-        else:
-            # Schedule DAILY, WEEKLY and MONTHLY Alerts
-            if alert_hits_limit_reached(
-                alert_triggered.pk, alert_triggered.user.pk
-            ):
-                # Skip storing hits for this alert-user combination because
-                # the SCHEDULED_ALERT_HITS_LIMIT has been reached.
-                continue
-            scheduled_hits_to_create.append(
-                ScheduledAlertHit(
-                    user=alert_triggered.user,
-                    alert=alert_triggered,
-                    document_content=document_content_copy,
-                )
-            )
-
-    # Create scheduled DAILY, WEEKLY and MONTHLY Alerts in bulk.
-    if scheduled_hits_to_create:
-        ScheduledAlertHit.objects.bulk_create(scheduled_hits_to_create)
-    # Sent all the related document RT emails.
-    if email_alerts_to_send:
-        send_search_alert_emails.delay(email_alerts_to_send)
-
-    # Update RT Alerts date_last_hit, increase stats and log RT alerts sent.
-    if rt_alerts_to_send:
-        Alert.objects.filter(pk__in=rt_alerts_to_send).update(
-            date_last_hit=now()
         )
-        alerts_sent = len(rt_alerts_to_send)
-        tally_stat(f"alerts.sent.{Alert.REAL_TIME}", inc=alerts_sent)
-        logger.info(f"Sent {alerts_sent} {Alert.REAL_TIME} email alerts.")
+        alerts_triggered_ids.append(alert_triggered_id)
+
+    # Filter out scheduled_hits_to_create by alerts that still exist in the
+    # database to prevent an IntegrityError caused by a race condition when
+    # an alert is deleted.
+    existing_ids = set(
+        Alert.objects.filter(pk__in=alerts_triggered_ids).values_list(
+            "pk", flat=True
+        )
+    )
+    scheduled_hits_to_create_filtered = [
+        hit for hit in scheduled_hits_to_create if hit.alert_id in existing_ids
+    ]
+    # Create scheduled RT, DAILY, WEEKLY and MONTHLY Alerts in bulk.
+    if scheduled_hits_to_create_filtered:
+        create_schedule_alerts_hits_in_bulk(scheduled_hits_to_create_filtered)
 
 
 @app.task(
@@ -609,9 +746,9 @@ def process_percolator_response(response: PercolatorResponseType) -> None:
     max_retries=3,
     interval_start=5,
 )
-def send_or_schedule_alerts(
-    self: Task, response: SaveDocumentResponseType, document_index: str
-) -> PercolatorResponseType | None:
+def send_or_schedule_search_alerts(
+    self: Task, response: SaveESDocumentReturn | None
+) -> SendAlertsResponse | None:
     """Send real-time alerts based on the Elasticsearch search response.
 
     Or schedule other rates alerts to send them later.
@@ -620,60 +757,99 @@ def send_or_schedule_alerts(
     is real-time, and if the user has donated enough. If so it sends an email
     alert and triggers webhooks.
     The process begins with an initial percolator query and continues to fetch
-    additional results in chunks determined by settings.PERCOLATOR_PAGE_SIZE,
+    additional results in chunks determined by settings.ELASTICSEARCH_PAGINATION_BATCH_SIZE,
     until all results are retrieved or no more results are available.
 
     :param self: The celery task
-    :param response: A two tuple, the document ID to be percolated in
-    ES index and the document data that triggered the alert.
-    :param document_index: The ES document index where the document lives.
-    :return: A two tuple, a list of Alerts triggered and the document data that
-    triggered the alert.
+    :param response: An optional `SaveESDocumentReturn` object containing the
+    ID of the document saved in the ES index, the content of the document and
+    the app label associated with the document.
+    :return: A SendAlertsResponse dataclass containing the main alerts
+    triggered, the recap documents alerts triggered, the docket alerts
+    triggered, the document content that triggered the alert, and the related
+    app label model or None.
     """
 
     if not response:
         self.request.chain = None
         return None
 
-    document_id, document_content = response
-    # Perform an initial percolator query and process its response.
-    alerts_triggered = []
-    percolator_response = percolate_document(document_id, document_index)
-    if not percolator_response:
+    if (
+        not settings.PERCOLATOR_RECAP_SEARCH_ALERTS_ENABLED
+        and response.app_label in ["search.RECAPDocument", "search.Docket"]
+    ) or (
+        not settings.PERCOLATOR_OPINIONS_SEARCH_ALERTS_ENABLED
+        and response.app_label in ["search.Opinion"]
+    ):
+        # Disable percolation for RECAP Or Opinions search alerts until
+        # PERCOLATOR_RECAP_SEARCH_ALERTS_ENABLED or PERCOLATOR_OPINIONS_SEARCH_ALERTS_ENABLED
+        # is set to True. Useful to prevent conflicts in tests.
         self.request.chain = None
         return None
 
-    alerts_triggered.extend(percolator_response.hits)
+    app_label = response.app_label
+    document_id = response.document_id
+    document_content = response.document_content
 
-    # Check if the query contains more documents than PERCOLATOR_PAGE_SIZE.
+    # Perform an initial percolator query and process its response.
+    try:
+        percolator_index, es_document_index, documents_to_percolate = (
+            prepare_percolator_content(app_label, document_id)
+        )
+    except RECAPDocument.DoesNotExist as exc:
+        if (
+            self.request.retries
+            >= settings.PERCOLATOR_MISSING_DOCUMENT_MAX_RETRIES
+        ):
+            logger.warning(
+                "RECAPDocument %s missing during alert trigger.", document_id
+            )
+            self.request.chain = None
+            return None
+        raise self.retry(
+            exc=exc,
+            countdown=0.5,
+            max_retries=settings.PERCOLATOR_MISSING_DOCUMENT_MAX_RETRIES,
+        )
+
+    if documents_to_percolate:
+        # If documents_to_percolate is returned by prepare_percolator_content,
+        # use the main document as the content to render in alerts.
+        document_content, _, _ = documents_to_percolate
+    percolator_responses = percolate_es_document(
+        document_id,
+        percolator_index,
+        es_document_index,
+        documents_to_percolate,
+        app_label,
+    )
+    if not percolator_responses.main_response:
+        self.request.chain = None
+        return None
+
+    # Check if the query contains more documents than ELASTICSEARCH_PAGINATION_BATCH_SIZE.
     # If so, return additional results until there are not more.
     # Remember, percolator results are alerts, not documents, so what you're
     # paginating are user alerts that the document matched, not documents that
     # an alert matched. 🙃.
-    batch_size = settings.PERCOLATOR_PAGE_SIZE
-    total_hits = percolator_response.hits.total.value
-    results_returned = len(percolator_response.hits.hits)
-    if total_hits > batch_size:
-        documents_retrieved = results_returned
-        search_after = percolator_response.hits[-1].meta.sort
-        while True:
-            percolator_response = percolate_document(
-                document_id, document_index, search_after=search_after
-            )
-            if not percolator_response:
-                break
+    main_alerts_triggered, rd_alerts_triggered, d_alerts_triggered = (
+        fetch_all_search_alerts_results(
+            percolator_responses,
+            document_id,
+            percolator_index,
+            es_document_index,
+            documents_to_percolate,
+            app_label,
+        )
+    )
 
-            alerts_triggered.extend(percolator_response.hits)
-            results_returned = len(percolator_response.hits.hits)
-            documents_retrieved += results_returned
-            # Check if all results have been retrieved. If so break the loop
-            # Otherwise, increase search_after.
-            if documents_retrieved >= total_hits or results_returned == 0:
-                break
-            else:
-                search_after = percolator_response.hits[-1].meta.sort
-
-    return alerts_triggered, document_content
+    return SendAlertsResponse(
+        main_alerts_triggered=main_alerts_triggered,
+        rd_alerts_triggered=rd_alerts_triggered,
+        d_alerts_triggered=d_alerts_triggered,
+        document_content=document_content,
+        app_label_model=app_label,
+    )
 
 
 # New task
@@ -688,7 +864,8 @@ def send_or_schedule_alerts(
 def es_save_alert_document(
     self: Task,
     alert_id: int,
-    es_document_name: str,
+    es_document_name: ESDocumentNameType,
+    custom_index_name: str | None = None,
 ) -> None:
     """Helper method to prepare and index an Alert object into Elasticsearch.
 
@@ -697,17 +874,40 @@ def es_save_alert_document(
     :param es_document_name: The Elasticsearch document percolator name used
     for indexing.
     the Alert instance.
+    :param custom_index_name: Optional custom index name to use.
     :return: Bool, True if document was properly indexed, otherwise None.
     """
 
     es_document = getattr(es_document_module, es_document_name)
     document = es_document()
-    alert = Alert.objects.get(pk=alert_id)
-    doc = document.prepare(alert)
-    if not doc["percolator_query"]:
+    try:
+        alert = Alert.objects.get(pk=alert_id)
+    except Alert.DoesNotExist:
+        # The alert was removed from the DB before the task ran, likely by a user
+        # managing their alerts via the Alerts API.
+        # We can ignore this alert since it no longer exists.
+        logger.warning(
+            "Alert %s no longer exists when processing the indexing task; "
+            "it may have been deleted by the user.",
+            alert_id,
+        )
         return None
-    doc_indexed = es_document(meta={"id": alert.pk}, **doc).save(
+    alert_doc = {
+        "timestamp": document.prepare_timestamp(alert),
+        "rate": alert.rate,
+        "date_created": alert.date_created,
+        "id": alert.pk,
+        "percolator_query": document.prepare_percolator_query(alert),
+    }
+    if not alert_doc["percolator_query"]:
+        logger.warning("Skipping invalid query for Alert ID: %s", alert.pk)
+        return None
+
+    meta: dict[str, int | str] = {"id": alert.pk}
+    if custom_index_name:
+        meta["index"] = custom_index_name
+    doc_indexed = es_document(meta=meta, **alert_doc).save(
         skip_empty=True, refresh=settings.ELASTICSEARCH_DSL_AUTO_REFRESH
     )
-    if not doc_indexed in ["created", "updated"]:
-        logger.warning(f"Error indexing Alert ID: {alert.pk}")
+    if doc_indexed not in ["created", "updated"]:
+        logger.warning("Error indexing Alert ID %s:", alert.pk)

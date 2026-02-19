@@ -27,30 +27,6 @@ class UrlHash(models.Model):
         verbose_name_plural = "URL Hashes"
 
 
-class ErrorLog(models.Model):
-    """A class to hold scraper errors. Items are added by the scraper and
-    removed by the scraper's status monitor.
-    """
-
-    court = models.ForeignKey(
-        Court,
-        verbose_name="the court where the error occurred",
-        on_delete=models.CASCADE,
-    )
-    log_time = models.DateTimeField(
-        "the exact date and time of the error", auto_now_add=True
-    )
-    log_level = models.CharField(
-        "the loglevel of the error encountered", max_length=15, editable=False
-    )
-    message = models.TextField(
-        "the message produced in the log", blank=True, editable=False
-    )
-
-    def __str__(self) -> str:
-        return f"{self.log_time} - {self.log_level}@{self.court.pk} {self.message}"
-
-
 class PACERFreeDocumentLog(models.Model):
     SCRAPE_SUCCESSFUL = 1
     SCRAPE_IN_PROGRESS = 2
@@ -125,9 +101,4 @@ class PACERMobilePageData(AbstractDateTimeModel):
     )
 
     def __str__(self) -> str:
-        return "<%s: Docket %s crawled at %s with %s results>" % (
-            self.pk,
-            self.docket_id,
-            self.date_last_mobile_crawl,
-            self.count_last_mobile_crawl,
-        )
+        return f"<{self.pk}: Docket {self.docket_id} crawled at {self.date_last_mobile_crawl} with {self.count_last_mobile_crawl} results>"

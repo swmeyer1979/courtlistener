@@ -13,6 +13,22 @@ function recapIsInstalled(event) {
   );
 }
 
+function getCookie(name) {
+  var cookieValue = null;
+  if (document.cookie && document.cookie != '') {
+    var cookies = document.cookie.split(';');
+    for (var i = 0; i < cookies.length; i++) {
+      var cookie = jQuery.trim(cookies[i]);
+      // Does this cookie string begin with the name we want?
+      if (cookie.substring(0, name.length + 1) == (name + '=')) {
+        cookieValue = decodeURIComponent(cookie.substring(name.length + 1));
+        break;
+      }
+    }
+  }
+  return cookieValue;
+}
+
 $(document).ready(function () {
   // 'use strict'; // uncomment later on after full cleanup
   var citedGreaterThan = $('#id_cited_gt');
@@ -87,6 +103,8 @@ $(document).ready(function () {
         .val(el.val())
         .appendTo('#search-form');
     });
+    installProgressBar();
+    disableAllSubmitButtons();
     document.location = '/?' + $('#search-form').serialize();
   }
 
@@ -161,21 +179,6 @@ $(document).ready(function () {
     $('#modal-court-picker .tab-pane.active input').prop('checked', false);
   });
 
-
-  ////////////
-  // Alerts //
-  ////////////
-  $('#id_rate').on("change", function () {
-    if ($(this).val() === 'rt' && totalDonatedLastYear < priceRtAlerts) {
-      $('#donate-for-rt').removeClass('hidden');
-      $('#alertSave').prop("disabled", true);
-    } else {
-      // Reset the button, if needed.
-      $('#donate-for-rt').addClass('hidden');
-      $('#alertSave').prop("disabled", false);
-    }
-  });
-
   ///////////////////////////
   // TOC Collapse Controls //
   ///////////////////////////
@@ -223,37 +226,26 @@ $(document).ready(function () {
   //////////////////////////
   // Popup Cookie Handling//
   //////////////////////////
-  $('.alert-dismissible button').on("click", function () {
-    let that = $(this);
-    let duration = parseInt(that.data('duration'), 10);
-    let cookie_name = that.data('cookie-name');
-    let date = new Date();
-    date.setTime(date.getTime() + (duration * 24 * 60 * 60 * 1000));
-    let expires = "; expires=" + date.toGMTString();
-    document.cookie = cookie_name + "=" + 'true' + expires + "; samesite=lax; path=/";
-    that.closest('.alert-dismissible').addClass('hidden');
-  });
+  function popupCookieHandling(buttonSelector, containerSelector) {
+    $(buttonSelector).on('click', function () {
+      let that = $(this);
+      let duration = parseInt(that.data('duration'), 10);
+      let cookie_name = that.data('cookie-name');
+      let date = new Date();
+      date.setTime(date.getTime() + (duration * 24 * 60 * 60 * 1000));
+      let expires = '; expires=' + date.toGMTString();
+      document.cookie = cookie_name + '=' + 'true' + expires + '; samesite=lax; path=/';
+      that.closest(containerSelector).addClass('hidden');
+    });
+  }
+  popupCookieHandling('.alert-dismissible button', '.alert-dismissible')
+  popupCookieHandling('[data-dismissible-alert] button', '[data-dismissible-alert]')
 
   ///////////////////////
   // Utility Functions //
   ///////////////////////
   // Make sure that a CSRF Header is sent with every ajax request.
   // https://docs.djangoproject.com/en/dev/ref/csrf/#ajax
-  function getCookie(name) {
-    var cookieValue = null;
-    if (document.cookie && document.cookie != '') {
-      var cookies = document.cookie.split(';');
-      for (var i = 0; i < cookies.length; i++) {
-        var cookie = jQuery.trim(cookies[i]);
-        // Does this cookie string begin with the name we want?
-        if (cookie.substring(0, name.length + 1) == (name + '=')) {
-          cookieValue = decodeURIComponent(cookie.substring(name.length + 1));
-          break;
-        }
-      }
-    }
-    return cookieValue;
-  }
   var csrfToken = getCookie('csrftoken');
 
   function csrfSafeMethod(method) {
@@ -304,10 +296,7 @@ $(document).ready(function () {
   if (modal_exist) {
     $('#open-modal-on-load').modal();
   }
-
 });
-
-
 
 // Debounce - rate limit a function
 // https://davidwalsh.name/javascript-debounce-function
@@ -366,3 +355,4 @@ if (form && button) {
     button.disabled = true;
   });
 }
+

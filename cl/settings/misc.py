@@ -3,8 +3,6 @@ from datetime import date
 
 import environ
 
-from .django import INSTALL_ROOT
-
 env = environ.FileAwareEnv()
 DEVELOPMENT = env.bool("DEVELOPMENT", default=True)
 
@@ -48,8 +46,29 @@ GOOGLE_AUTH = {
 ##############
 # Super Misc #
 ##############
-FUNDRAISING_MODE = env("FUNDRAISING_MODE", default=False)
 
 # Key for Follow the Money API
 FTM_KEY = env("FTM_KEY", default="")
 FTM_LAST_UPDATED = env("FTM_LAST_UPDATED", default=date.today())
+
+# Pay and Pray quota
+ALLOWED_PRAYER_COUNT = env.int("ALLOWED_PRAYER_COUNT", default=5)
+
+
+# CAP
+CAP_R2_ENDPOINT_URL = env("CAP_R2_ENDPOINT_URL", default="")
+CAP_R2_ACCESS_KEY_ID = env("CAP_R2_ACCESS_KEY_ID", default="")
+CAP_R2_SECRET_ACCESS_KEY = env("CAP_R2_SECRET_ACCESS_KEY", default="")
+CAP_R2_BUCKET_NAME = env("CAP_R2_BUCKET_NAME", default="cap-static")
+
+# Webhooks
+WEBHOOK_V1_DEPRECATION_DATE = env(
+    "WEBHOOK_V1_DEPRECATION_DATE", default="2024-11-18"
+)
+
+# OCR extraction
+# Minimum number of characters between common headers to consider that the page
+# does not need OCR.
+CHARS_THRESHOLD_OCR_PER_PAGE = env.int(
+    "CHARS_THRESHOLD_OCR_PER_PAGE", default=200
+)

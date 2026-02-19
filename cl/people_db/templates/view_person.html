@@ -27,12 +27,12 @@ $(document).ready(function(){
 </script>
 <script type="application/ld+json">
 {
-  "@context": "http://schema.org",
+  "@context": "https://schema.org",
   "@type": "Person",
   "honorificPrefix": "Judge",
   "familyName": "{{ person.name_last }}",
   "givenName": "{{ person.name_first }}",
-  "gender": "{% if person.gender == 'm' %}http://schema.org/Male{% else %}http://schema.org/Female{% endif %}",
+  "gender": "{% if person.gender == 'm' %}https://schema.org/Male{% else %}https://schema.org/Female{% endif %}",
   "nationality": {
     "@type": "Country",
     "name": "United States of America"
@@ -113,8 +113,9 @@ $(document).ready(function(){
           {% if perms.people_db.change_person %}
             <p class="float-right">
               <a href="{% url 'admin:people_db_person_change' person.id %}"
-                 class="btn btn-primary btn-xs">Edit&nbsp;Person&nbsp;<i
-                   class="fa fa-pencil"></i>
+                 class="btn btn-primary btn-xs">Edit&nbsp;Person&nbsp;
+                 (<span id="event_count"><i class="fa fa-spinner fa-spin"></i></span> views)&nbsp;
+                 <i class="fa fa-pencil"></i>
               </a>
             </p>
           {% endif %}
@@ -124,15 +125,15 @@ $(document).ready(function(){
             {% filter lower %}
             {% if person.name_middle %}
               {% if person.name_suffix %}
-                <a href="http://www.fjc.gov/history/judges/{{ person.name_last }}-{{ person.name_first }}-{{ person.name_middle }}-{{ person.name_suffix|cut:"." }}">{{ person.fjc_id }}</a>
+                <a href="https://www.fjc.gov/history/judges/{{ person.name_last }}-{{ person.name_first }}-{{ person.name_middle }}-{{ person.name_suffix|cut:"." }}">{{ person.fjc_id }}</a>
               {% else %}
-                <a href="http://www.fjc.gov/history/judges/{{ person.name_last }}-{{ person.name_first }}-{{ person.name_middle }}">{{ person.fjc_id }}</a>
+                <a href="https://www.fjc.gov/history/judges/{{ person.name_last }}-{{ person.name_first }}-{{ person.name_middle }}">{{ person.fjc_id }}</a>
               {% endif %}
             {% else %}
               {% if person.name_suffix %}
-                <a href="http://www.fjc.gov/history/judges/{{ person.name_last }}-{{ person.name_first }}-{{ person.name_suffix|cut:"." }}">{{ person.fjc_id }}</a>
+                <a href="https://www.fjc.gov/history/judges/{{ person.name_last }}-{{ person.name_first }}-{{ person.name_suffix|cut:"." }}">{{ person.fjc_id }}</a>
               {% else %}
-                <a href="http://www.fjc.gov/history/judges/{{ person.name_last }}-{{ person.name_first }}">{{ person.fjc_id }}</a>
+                <a href="https://www.fjc.gov/history/judges/{{ person.name_last }}-{{ person.name_first }}">{{ person.fjc_id }}</a>
               {% endif %}
             {% endif %}
             {% endfilter %}
@@ -576,12 +577,12 @@ $(document).ready(function(){
     </div>
     {% endif %}
 
-    {% if authored_opinions.result.numFound > 0 %}
+    {% if authored_opinions %}
     <div class="row v-offset-below-3">
       <div class="col-xs-12">
         <h3 id="authored-opinions">
           <i class="fa-file-text-o fa gray"></i>
-          Opinions Authored by {{ person.name_last }} ({{ authored_opinions.result.numFound|intcomma }})
+          Case Law Authored by {{ person.name_last }} ({{ authored_opinions.hits.total.value|intcomma }})
           {% if not person.date_dod and not person.dod_state and not person.dod_city %}
             <a href="/feed/search/?type=o&q=author_id%3A{{ person.pk }}+OR+panel_ids%3A{{ person.pk }}">
               <i class="gray fa fa-rss"
@@ -589,7 +590,7 @@ $(document).ready(function(){
             </a>
           {% endif %}
         </h3>
-        <p class="gray">Includes opinions for which {{ person.name_full }} was on the panel, ordered by <a href="https://free.law/2013/11/12/citegeist/">CiteGeist</a> relevance.</p>
+        <p class="gray">Includes case law for which {{ person.name_full }} was on the panel, ordered by CiteGeist&trade; relevance.</p>
         <hr class="top">
 
         {% for o in authored_opinions %}
@@ -643,21 +644,21 @@ $(document).ready(function(){
         </div>
         {% endfor %}
         <p>
-            <a href="/?type=o&q=author_id%3A{{ person.pk }}+OR+panel_ids%3A{{ person.pk }}&stat_Precedential=on&stat_Non-Precedential=on&stat_Errata=on&stat_Separate%20Opinion=on&stat_In-chambers=on&stat_Relating-to%20orders=on&stat_Unknown%20Status=on"
+            <a href="/?type=o&q=author_id%3A{{ person.pk }}+OR+panel_ids%3A{{ person.pk }}&stat_Published=on&stat_Unpublished=on&stat_Errata=on&stat_Separate=on&stat_In-chambers=on&stat_Relating-to=on&stat_Unknown=on"
                rel="nofollow"
                class="btn btn-primary"
-            >Search for All Opinions Authored by {{ person.name_last }} in CourtListener</a>
+            >Search for All Case Law Authored by {{ person.name_last }} in CourtListener</a>
         </p>
       </div>
     </div>
     {% endif %}
 
-  {% if recap_cases_assigned|length > 0 %}
+  {% if recap_cases_assigned %}
     <div class="row v-offset-below-3">
       <div class="col-xs-12">
         <h3 id="assigned-cases">
           <i class="fa-gavel fa gray"></i>
-          Cases Assigned or Referred to {{ person.name_last }} ({{ recap_cases_assigned|length|intcomma }})
+          Cases Assigned or Referred to {{ person.name_last }} ({{ recap_cases_assigned.hits.total.value|intcomma }})
         </h3>
         <hr class="top">
 
@@ -665,31 +666,29 @@ $(document).ready(function(){
         <div class="row">
           <div class="col-xs-12">
           <article class="v-offset-below-2">
-          {% with doc0=result.doclist.docs.0 %}
-            <h4 class="bottom">
-              <a href="{{ doc0.docket_absolute_url }}">
-                {{ doc0.caseName|safe|v_wrapper }}
-                ({% if doc0.court_id != 'scotus' %}{{ doc0.court_citation_string|nbsp|safe }}&nbsp;{% endif %}{{ doc0.dateFiled|date:"Y" }})
-              </a>
-            </h4>
+          <h4 class="bottom">
+            <a href="{{ result.docket_absolute_url }}">
+              {{ result.caseName|safe|v_wrapper }}
+              ({% if result.court_id != 'scotus' %}{{ result.court_citation_string|nbsp|safe }}&nbsp;{% endif %}{{ result.dateFiled|date:"Y" }})
+            </a>
+          </h4>
+          <div class="inline nowrap">
+            <span class="meta-data-header">Date Filed:</span>
+            <time class="meta-data-value"
+                datetime="{{ result.dateFiled|date:'Y-m-d' }}">
+              {% if result.dateFiled %}
+                {{ result.dateFiled|date:"F jS, Y" }}
+              {% else %}
+                Unknown Date
+              {% endif %}
+            </time>
+          </div>
+          {% if result.docketNumber %}
             <div class="inline nowrap">
-              <span class="meta-data-header">Date Filed:</span>
-              <time class="meta-data-value"
-                  datetime="{{ doc0.dateFiled|date:'Y-m-d' }}">
-                {% if doc0.dateFiled %}
-                  {{ doc0.dateFiled|date:"F jS, Y" }}
-                {% else %}
-                  Unknown Date
-                {% endif %}
-              </time>
+              <span class="meta-data-header">Docket Number:</span>
+              <span class="meta-data-value select-all">{{ result.docketNumber|safe }}</span>
             </div>
-            {% if doc0.docketNumber %}
-              <div class="inline nowrap">
-                <span class="meta-data-header">Docket Number:</span>
-                <span class="meta-data-value select-all">{{ doc0.docketNumber|safe }}</span>
-              </div>
             {% endif %}
-          {% endwith %}
           </article>
         </div>
         </div>
@@ -704,12 +703,12 @@ $(document).ready(function(){
     </div>
     {% endif %}
 
-    {% if oral_arguments_heard.result.numFound > 0 %}
+    {% if oral_arguments_heard %}
     <div class="row v-offset-below-3">
       <div class="col-xs-12">
         <h3 id="oral-arguments-heard">
           <i class="fa-volume-up fa gray"></i>
-          Most Recent Oral Arguments Heard by {{ person.name_last }} ({{ oral_arguments_heard.result.numFound|intcomma }})
+          Most Recent Oral Arguments Heard by {{ person.name_last }} ({{ oral_arguments_heard.hits.total.value|intcomma }})
           {% if not person.date_dod and not person.dod_state and not person.dod_city %}
             <a href="/feed/search/?type=oa&q=panel_ids%3A{{ person.pk }}">
               <i class="gray fa fa-podcast"
@@ -765,7 +764,7 @@ $(document).ready(function(){
       <div class="col-xs-12">
         <p class="text-right">Something isn't right? <a href="{% url "contact" %}">Get in touch with a correction</a>.
         </p>
-        <p class="text-right">Curious about our sources? <a href="https://free.law/projects/judge-db/">Learn more</a>.
+        <p class="text-right">Curious about our sources? <a href="https://free.law/datasets#judges-db">Learn more</a>.
         </p>
       </div>
     </div>

@@ -1,33 +1,33 @@
-import json
 import logging
 from collections import OrderedDict
 from datetime import timedelta
 from email.utils import parseaddr
-from json import JSONDecodeError
 
 from django.conf import settings
 from django.contrib import messages
 from django.contrib.auth import logout, update_session_auth_hash
+from django.contrib.auth import views as auth_views
 from django.contrib.auth.decorators import login_required
 from django.contrib.auth.models import User
 from django.contrib.auth.views import PasswordResetView
+from django.core.exceptions import SuspiciousOperation, ValidationError
 from django.core.mail import send_mail
-from django.core.paginator import EmptyPage, PageNotAnInteger, Paginator
-from django.db.models import Count, F
+from django.core.validators import validate_email
+from django.db import IntegrityError
+from django.db.models import F
 from django.http import (
     HttpRequest,
     HttpResponse,
     HttpResponseRedirect,
     QueryDict,
 )
-from django.shortcuts import get_object_or_404
+from django.shortcuts import get_object_or_404, redirect
 from django.template.defaultfilters import urlencode
 from django.template.response import TemplateResponse
 from django.urls import reverse
 from django.utils.decorators import method_decorator
 from django.utils.timezone import now
 from django.views.decorators.cache import never_cache
-from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.debug import (
     sensitive_post_parameters,
     sensitive_variables,
@@ -45,9 +45,8 @@ from cl.lib.ratelimiter import (
     ratelimiter_unsafe_2000_per_h,
 )
 from cl.lib.types import AuthenticatedHttpRequest, EmailType
-from cl.lib.url_utils import get_redirect_or_login_url
+from cl.lib.url_utils import get_redirect_or_abort
 from cl.search.models import SEARCH_TYPES
-from cl.stats.utils import tally_stat
 from cl.users.forms import (
     AccountDeleteForm,
     CustomPasswordChangeForm,
@@ -59,16 +58,28 @@ from cl.users.forms import (
     UserForm,
 )
 from cl.users.models import UserProfile
-from cl.users.tasks import update_moosend_subscription
+from cl.users.tasks import create_neon_account, update_neon_account
 from cl.users.utils import (
     convert_to_stub_account,
     delete_user_assets,
     emails,
     message_dict,
 )
-from cl.visualizations.models import SCOTUSMap
 
 logger = logging.getLogger(__name__)
+
+
+@login_required
+@never_cache
+def view_alerts(request: HttpRequest) -> HttpResponse:
+    if (
+        not request.user.alerts.exists()
+        and request.user.docket_alerts.filter(
+            alert_type=DocketAlert.SUBSCRIPTION
+        ).exists()
+    ):
+        return redirect("profile_docket_alerts")
+    return redirect("profile_search_alerts")
 
 
 @login_required
@@ -93,19 +104,26 @@ def view_search_alerts(request: HttpRequest) -> HttpResponse:
 
 @login_required
 @never_cache
-def view_docket_alerts(request: HttpRequest) -> HttpResponse:
-    order_by = request.GET.get("order_by", "date_created")
-    if order_by.startswith("-"):
+def view_docket_alerts(request: AuthenticatedHttpRequest) -> HttpResponse:
+    order_by_param = request.GET.get("order_by", "")
+    if order_by_param.startswith("-"):
         direction = "-"
-        order_by = order_by.lstrip("-")
+        order_name = order_by_param.lstrip("-")
     else:
         direction = ""
+        order_name = order_by_param
     name_map = {
         "name": "docket__case_name",
         "court": "docket__court__short_name",
         "hit": "date_last_hit",
+        "date_filed": "docket__date_filed",
+        "docket_number": "docket__docket_number",
     }
-    order_by = name_map.get(order_by, "date_created")
+    if not (order_by := name_map.get(order_name)):
+        # Set default order
+        direction = "-"
+        order_name = "hit"
+        order_by = name_map[order_name]
     docket_alerts = request.user.docket_alerts.filter(
         alert_type=DocketAlert.SUBSCRIPTION
     )
@@ -121,6 +139,16 @@ def view_docket_alerts(request: HttpRequest) -> HttpResponse:
     else:
         docket_alerts = docket_alerts.order_by(f"{direction}{order_by}")
 
+    sorting_fields = {
+        col: {
+            "url_param": f"{'-' if order_name == col and direction == '' else ''}{col}",
+            "direction": "down"
+            if (order_name == col and direction == "-")
+            else "up",
+        }
+        for col in name_map
+    }
+
     return TemplateResponse(
         request,
         "profile/alerts.html",
@@ -129,6 +157,7 @@ def view_docket_alerts(request: HttpRequest) -> HttpResponse:
             "page": "docket_alerts",
             "private": True,
             "page_title": "Docket Alerts",
+            "sorting_fields": sorting_fields,
         },
     )
 
@@ -155,31 +184,29 @@ def view_notes(request: AuthenticatedHttpRequest) -> HttpResponse:
     docket_search_url = (
         "/?type=r&q=xxx AND docket_id:("
         + " OR ".join(
-            [str(a.instance.docket_id.pk) for a in note_forms["Dockets"]]
+            str(a.instance.docket_id.pk) for a in note_forms["Dockets"]
         )
         + ")"
     )
     oral_search_url = (
         "/?type=oa&q=xxx AND id:("
         + " OR ".join(
-            [str(a.instance.audio_id.pk) for a in note_forms["Oral Arguments"]]
+            str(a.instance.audio_id.pk) for a in note_forms["Oral Arguments"]
         )
         + ")"
     )
     recap_search_url = (
         "/?type=r&q=xxx AND docket_entry_id:("
         + " OR ".join(
-            [
-                str(a.instance.recap_doc_id.pk)
-                for a in note_forms["RECAP Documents"]
-            ]
+            str(a.instance.recap_doc_id.pk)
+            for a in note_forms["RECAP Documents"]
         )
         + ")"
     )
     opinion_search_url = (
         "/?q=xxx AND cluster_id:("
         + " OR ".join(
-            [str(a.instance.cluster_id.pk) for a in note_forms["Opinions"]]
+            str(a.instance.cluster_id.pk) for a in note_forms["Opinions"]
         )
         + ")&stat_Precedential=on&stat_Non-Precedential=on&stat_Errata=on&stat_Separate%20Opinion=on&stat_In-chambers=on&stat_Relating-to%20orders=on&stat_Unknown%20Status=on"
     )
@@ -204,67 +231,7 @@ def view_donations(request: AuthenticatedHttpRequest) -> HttpResponse:
     return TemplateResponse(
         request,
         "profile/donations.html",
-        {"page": "profile_donations", "private": True},
-    )
-
-
-@login_required
-@never_cache
-def view_visualizations(request: AuthenticatedHttpRequest) -> HttpResponse:
-    visualizations = (
-        SCOTUSMap.objects.filter(user=request.user, deleted=False)
-        .annotate(Count("clusters"))
-        .order_by("-date_created")
-    )
-    paginator = Paginator(visualizations, 20, orphans=2)
-    page = request.GET.get("page", 1)
-    try:
-        paged_vizes = paginator.page(page)
-    except PageNotAnInteger:
-        paged_vizes = paginator.page(1)
-    except EmptyPage:
-        paged_vizes = paginator.page(paginator.num_pages)
-    return TemplateResponse(
-        request,
-        "profile/visualizations.html",
-        {
-            "results": paged_vizes,
-            "page": "visualizations_active",
-            "private": True,
-        },
-    )
-
-
-@login_required
-@never_cache
-def view_deleted_visualizations(
-    request: AuthenticatedHttpRequest,
-) -> HttpResponse:
-    thirty_days_ago = now() - timedelta(days=30)
-    visualizations = (
-        SCOTUSMap.objects.filter(
-            user=request.user, deleted=True, date_deleted__gte=thirty_days_ago
-        )
-        .annotate(Count("clusters"))
-        .order_by("-date_created")
-    )
-    paginator = Paginator(visualizations, 20, orphans=2)
-    page = request.GET.get("page", 1)
-    try:
-        paged_vizes = paginator.page(page)
-    except PageNotAnInteger:
-        paged_vizes = paginator.page(1)
-    except EmptyPage:
-        paged_vizes = paginator.page(paginator.num_pages)
-
-    return TemplateResponse(
-        request,
-        "profile/visualizations_deleted.html",
-        {
-            "results": paged_vizes,
-            "page": "visualizations_trash",
-            "private": True,
-        },
+        {"page": "profile_your_support", "private": True},
     )
 
 
@@ -312,7 +279,6 @@ def view_api_usage(request: AuthenticatedHttpRequest) -> HttpResponse:
 @never_cache
 def view_settings(request: AuthenticatedHttpRequest) -> HttpResponse:
     old_email = request.user.email  # this line has to be at the top to work.
-    old_wants_newsletter = request.user.profile.wants_newsletter
     user = request.user
     up = user.profile
     user_form = UserForm(request.POST or None, instance=user)
@@ -327,10 +293,6 @@ def view_settings(request: AuthenticatedHttpRequest) -> HttpResponse:
             up.activation_key = sha1_activation_key(user.username)
             up.key_expires = now() + timedelta(5)
             up.email_confirmed = False
-
-            # Unsubscribe the old address in moosend (we'll
-            # resubscribe it when they confirm it later).
-            update_moosend_subscription.delay(old_email, "unsubscribe")
 
             # Send an email to the new and old addresses. New for verification;
             # old for notification of the change.
@@ -356,19 +318,15 @@ def view_settings(request: AuthenticatedHttpRequest) -> HttpResponse:
             msg = message_dict["settings_changed_successfully"]
             messages.add_message(request, msg["level"], msg["message"])
 
-        new_wants_newsletter = profile_cd["wants_newsletter"]
-        if old_wants_newsletter != new_wants_newsletter:
-            if new_wants_newsletter is True and not changed_email:
-                # They just subscribed. If they didn't *also* update their
-                # email address, subscribe them.
-                update_moosend_subscription.delay(new_email, "subscribe")
-            elif new_wants_newsletter is False:
-                # They just unsubscribed
-                update_moosend_subscription.delay(new_email, "unsubscribe")
-
         # New email address and changes above are saved here.
         profile_form.save()
         user_form.save()
+
+        if not settings.DEVELOPMENT:
+            if up.neon_account_id:
+                update_neon_account.delay(user.pk)
+            else:
+                create_neon_account.delay(user.pk)
 
         return HttpResponseRedirect(reverse("view_settings"))
 
@@ -381,6 +339,16 @@ def view_settings(request: AuthenticatedHttpRequest) -> HttpResponse:
             "page": "profile_settings",
             "private": True,
         },
+    )
+
+
+@login_required
+def view_user_id(request: AuthenticatedHttpRequest) -> HttpResponse:
+    user = request.user
+    return TemplateResponse(
+        request,
+        "profile/cl_id.html",
+        {"user_id": user.pk, "private": True},
     )
 
 
@@ -404,9 +372,6 @@ def delete_account(request: AuthenticatedHttpRequest) -> HttpResponse:
             )
             delete_user_assets(request.user)
             user = convert_to_stub_account(request.user)
-            update_moosend_subscription.delay(
-                request.user.email, "unsubscribe"
-            )
             update_session_auth_hash(request, user)
             logout(request)
             return HttpResponseRedirect(reverse("delete_profile_done"))
@@ -470,7 +435,7 @@ async def take_out_done(request: HttpRequest) -> HttpResponse:
 @never_cache
 def register(request: HttpRequest) -> HttpResponse:
     """allow only an anonymous user to register"""
-    redirect_to = get_redirect_or_login_url(request, "next")
+    redirect_to = get_redirect_or_abort(request, "next")
     if request.user.is_anonymous:
         if request.method == "POST":
             try:
@@ -490,33 +455,66 @@ def register(request: HttpRequest) -> HttpResponse:
             consent_form = OptInConsentForm(request.POST)
             if form.is_valid() and consent_form.is_valid():
                 cd = form.cleaned_data
-                if not stub_account:
-                    # make a new user that is active, but has not confirmed
-                    # their email address
-                    user = User.objects.create_user(
-                        cd["username"], cd["email"], cd["password1"]
-                    )
-                    up = UserProfile(user=user)
-                else:
-                    # Upgrade the stub account to make it a regular account.
-                    user = stub_account
-                    user.set_password(cd["password1"])
-                    user.username = cd["username"]
-                    user.is_active = True
-                    up = stub_account.profile
-                    up.stub_account = False
+                try:
+                    if not stub_account:
+                        # make a new user that is active, but has not confirmed
+                        # their email address
+                        user = User.objects.create_user(
+                            cd["username"], cd["email"], cd["password1"]
+                        )
+                        up = UserProfile(user=user)
+                    else:
+                        # Upgrade the stub account to make it a regular account.
+                        user = stub_account
+                        user.set_password(cd["password1"])
+                        user.username = cd["username"]
+                        user.is_active = True
+                        up = stub_account.profile
+                        up.stub_account = False
 
-                if cd["first_name"]:
-                    user.first_name = cd["first_name"]
-                if cd["last_name"]:
-                    user.last_name = cd["last_name"]
-                user.save()
+                    if cd["first_name"]:
+                        user.first_name = cd["first_name"]
+                    if cd["last_name"]:
+                        user.last_name = cd["last_name"]
+                    user.save()
 
-                # Build and assign the activation key
-                up.activation_key = sha1_activation_key(user.username)
-                up.key_expires = now() + timedelta(days=5)
-                up.save()
+                    # Build and assign the activation key
+                    up.activation_key = sha1_activation_key(user.username)
+                    up.key_expires = now() + timedelta(days=5)
+                    up.save()
 
+                except IntegrityError as e:
+                    # Redirect to success if user already exists
+                    try:
+                        user = User.objects.get(username=cd["username"])
+                        get_str = f"?next={urlencode(redirect_to)}&email={urlencode(user.email)}"
+                        return HttpResponseRedirect(
+                            reverse("register_success") + get_str
+                        )
+
+                    # Else, display generic error message and rerender form
+                    except User.DoesNotExist:
+                        logger.error(
+                            "Unexpected IntegrityError during registration: user does not exist after IntegrityError. Original error: %s",
+                            str(e),
+                            exc_info=True,
+                        )
+
+                        form.add_error(
+                            "username",
+                            "An error occurred during registration. Please try again.",
+                        )
+                        return TemplateResponse(
+                            request,
+                            "register/register.html",
+                            {
+                                "form": form,
+                                "consent_form": consent_form,
+                                "private": False,
+                            },
+                        )
+
+                # Only reached if user creation succeeded
                 email: EmailType = emails["confirm_your_new_account"]
                 send_mail(
                     email["subject"],
@@ -535,11 +533,7 @@ def register(request: HttpRequest) -> HttpResponse:
                     email["from_email"],
                     email["to"],
                 )
-                tally_stat("user.created")
-                get_str = "?next=%s&email=%s" % (
-                    urlencode(redirect_to),
-                    urlencode(user.email),
-                )
+                get_str = f"?next={urlencode(redirect_to)}&email={urlencode(user.email)}"
                 return HttpResponseRedirect(
                     reverse("register_success") + get_str
                 )
@@ -561,8 +555,14 @@ def register(request: HttpRequest) -> HttpResponse:
 def register_success(request: HttpRequest) -> HttpResponse:
     """Tell the user they have been registered and allow them to continue where
     they left off."""
-    redirect_to = get_redirect_or_login_url(request, "next")
+    redirect_to = get_redirect_or_abort(request, "next")
     email = request.GET.get("email", "")
+    if email:
+        try:
+            validate_email(email)
+        except ValidationError:
+            raise SuspiciousOperation("Invalid Email address")
+
     default_from = parseaddr(settings.DEFAULT_FROM_EMAIL)[1]
     return TemplateResponse(
         request,
@@ -582,8 +582,7 @@ def confirm_email(request, activation_key):
     """Confirms email addresses for a user and sends an email to the admins.
 
     Checks if a hash in a confirmation link is valid, and if so sets the user's
-    email address as valid. If they are subscribed to the newsletter, ensures
-    that moosend is updated.
+    email address as valid.
     """
     ups = UserProfile.objects.filter(activation_key=activation_key)
     if not len(ups):
@@ -618,10 +617,13 @@ def confirm_email(request, activation_key):
 
     # Tests pass; Save the profile
     for up in ups:
-        if up.wants_newsletter:
-            update_moosend_subscription.delay(up.user.email, "subscribe")
         up.email_confirmed = True
         up.save()
+        if not settings.DEVELOPMENT:
+            if up.neon_account_id:
+                update_neon_account.delay(up.user.pk)
+            else:
+                create_neon_account.delay(up.user.pk)
 
     return TemplateResponse(
         request, "register/confirm.html", {"success": True, "private": True}
@@ -718,40 +720,6 @@ def password_change(request: AuthenticatedHttpRequest) -> HttpResponse:
         "profile/password_form.html",
         {"form": form, "page": "profile_password", "private": False},
     )
-
-
-@csrf_exempt  # nosemgrep
-def moosend_webhook(request: HttpRequest) -> HttpResponse:
-    logger.info("Got moosend webhook with %s method.", request.method)
-
-    if request.method == "POST":
-        # The body is returned as a byte string
-        body = request.body.decode("utf-8")
-        json_body = json.loads(body)
-        webhook_event = json_body.get("Event")
-        if webhook_event:
-            webhook_event_name = webhook_event.get("EventName")
-            webhook_contact_context = webhook_event.get("ContactContext")
-            wants_newsletter = None
-            email = None
-            if webhook_contact_context:
-                email = webhook_contact_context.get("EmailAddress")
-            if webhook_event_name == "SUBSCRIBED":
-                wants_newsletter = True
-            elif webhook_event_name == "UNSUBSCRIBED":
-                wants_newsletter = False
-            if wants_newsletter is not None and email is not None:
-                profiles = UserProfile.objects.filter(user__email=email)
-                logger.info(
-                    "Updating %s profiles for email %s",
-                    profiles.count(),
-                    email,
-                )
-                profiles.update(wants_newsletter=wants_newsletter)
-
-    # Moosend does a GET when you create/edit the automation workflow,
-    # so we need to return a 200 even for GETs.
-    return HttpResponse("<h1>200: OK</h1>")
 
 
 @login_required
@@ -877,3 +845,24 @@ class RateLimitedPasswordResetView(PasswordResetView):
     template_name = "register/password_reset_form.html"
     email_template_name = "register/password_reset_email.html"
     form_class = CustomPasswordResetForm
+
+
+class SafeRedirectLoginView(auth_views.LoginView):
+    """
+    Custom LoginView that validates and sanitizes the redirect URL after a
+    successful login.
+
+    This view inherits from Django's built-in LoginView but adds an extra layer
+    of security by ensuring the redirect URL submitted by the login form is safe
+    It prevents potential open redirect vulnerabilities.
+    """
+
+    def get_redirect_url(self):
+        """
+        Return the user-originating redirect URL if it's safe. otherwise falls
+        back to the default.
+
+        This method ensures users cannot be redirected to malicious URLs after
+        logging in, even if they attempt to provide one.
+        """
+        return get_redirect_or_abort(self.request, self.redirect_field_name)

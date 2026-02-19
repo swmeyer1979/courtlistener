@@ -1,6 +1,4 @@
-# Run using `docker-compose up`
-version: "3.7"
-
+# Run using `docker compose up`
 services:
   cl-postgresql:
     volumes:

@@ -1,7 +1,7 @@
-import contextlib
 import os
 import re
-from typing import Optional
+from collections.abc import Callable
+from pathlib import Path
 
 from django.core.exceptions import ValidationError
 from django.utils.text import get_valid_filename, slugify
@@ -11,8 +11,9 @@ from cl.custom_filters.templatetags.text_filters import oxford_join
 from cl.lib.recap_utils import get_bucket_name
 from cl.lib.string_utils import normalize_dashes, trunc
 
-dist_d_num_regex = r"(?:\d:)?(\d\d)-..-(\d+)"
+dist_d_num_regex = r"(?:\d:)?(\d\d)-[a-zA-Z]{1,5}-(\d+)"
 appellate_bankr_d_num_regex = r"(\d\d)-(\d+)"
+scotus_d_a_num_regex = r"(\d{2})a(\d{1,5})"
 
 
 def is_docket_number(value: str) -> bool:
@@ -48,7 +49,7 @@ def clean_docket_number(docket_number: str | None) -> str:
     # Normalize to lowercase
     docket_number = docket_number.lower()
     # Match all the valid district docket numbers in a string.
-    district_m = re.findall(r"\b(?:\d:)?\d\d-..-\d+", docket_number)
+    district_m = re.findall(r"\b(?:\d:)?\d\d-[a-zA-Z]{1,5}-\d+", docket_number)
     if len(district_m) == 1:
         return district_m[0]
 
@@ -58,10 +59,23 @@ def clean_docket_number(docket_number: str | None) -> str:
     if len(bankr_m) == 1:
         return bankr_m[0]
 
+    # Match SCOTUS docket numbers.
+    scotus_a_m = re.findall(r"\b\d{2}a\d{1,5}\b", docket_number)
+    if len(scotus_a_m) == 1:
+        return scotus_a_m[0]
+
     return ""
 
 
-def make_docket_number_core(docket_number: Optional[str]) -> str:
+def make_appellate_bankr_number_core(cleaned_docket_number: str) -> str | None:
+    bankr_m = re.search(appellate_bankr_d_num_regex, cleaned_docket_number)
+    if bankr_m:
+        # Pad to six characters because some courts have a LOT of bankruptcies
+        return f"{bankr_m.group(1)}{int(bankr_m.group(2)):06d}"
+    return None
+
+
+def make_docket_number_core(docket_number: str | None) -> str:
     """Make a core docket number from an existing docket number.
 
     Converts docket numbers like:
@@ -91,10 +105,32 @@ def make_docket_number_core(docket_number: Optional[str]) -> str:
     if district_m:
         return f"{district_m.group(1)}{int(district_m.group(2)):05d}"
 
-    bankr_m = re.search(appellate_bankr_d_num_regex, cleaned_docket_number)
-    if bankr_m:
-        # Pad to six characters because some courts have a LOT of bankruptcies
-        return f"{bankr_m.group(1)}{int(bankr_m.group(2)):06d}"
+    if bankr_n_core := make_appellate_bankr_number_core(cleaned_docket_number):
+        return bankr_n_core
+
+    return ""
+
+
+def make_scotus_docket_number_core(docket_number: str | None) -> str:
+    """Normalize SCOTUS docket numbers like 16A985.
+
+    :param docket_number: The docket number to condense.
+    :return: empty string if no change possible, or the condensed version if it
+    worked. Note that all values returned are strings. We cannot return an int
+    because that'd strip leading zeroes, which we need.
+    """
+    if not docket_number:
+        return ""
+
+    cleaned_docket_number = clean_docket_number(docket_number)
+
+    if bankr_n_core := make_appellate_bankr_number_core(cleaned_docket_number):
+        return bankr_n_core
+
+    scouts_a_m = re.search(scotus_d_a_num_regex, cleaned_docket_number)
+    if scouts_a_m:
+        year, serial = scouts_a_m.groups()
+        return f"{year}A{int(serial):05d}"
 
     return ""
 
@@ -106,7 +142,7 @@ def make_path(root: str, filename: str) -> str:
     """
     d = now()
     return os.path.join(
-        root, f"{d.year}", "%02d" % d.month, "%02d" % d.day, filename
+        root, f"{d.year}", f"{d.month:02d}", f"{d.day:02d}", filename
     )
 
 
@@ -146,26 +182,37 @@ def base_recap_path(instance, filename, base_dir):
 
 def make_pdf_path(instance, filename, thumbs=False):
     from cl.lasc.models import LASCPDF
-    from cl.search.models import ClaimHistory, RECAPDocument
+    from cl.search.models import (
+        ClaimHistory,
+        RECAPDocument,
+        ScotusDocketMetadata,
+        TexasDocument,
+    )
 
-    if type(instance) == RECAPDocument:
+    if isinstance(instance, RECAPDocument):
         root = "recap"
         court_id = instance.docket_entry.docket.court_id
         pacer_case_id = instance.docket_entry.docket.pacer_case_id
-    elif type(instance) == ClaimHistory:
+    elif isinstance(instance, ClaimHistory):
         root = "claim"
         court_id = instance.claim.docket.court_id
         pacer_case_id = instance.pacer_case_id
-    elif type(instance) == LASCPDF:
+    elif isinstance(instance, LASCPDF):
         slug = slugify(trunc(filename, 40))
         root = f"/us/state/ca/lasc/{instance.docket_number}/"
-        file_name = "gov.ca.lasc.%s.%s.%s.pdf" % (
-            instance.docket_number,
-            instance.document_id,
-            slug,
-        )
+        file_name = f"gov.ca.lasc.{instance.docket_number}.{instance.document_id}.{slug}.pdf"
 
         return os.path.join(root, file_name)
+    elif isinstance(instance, ScotusDocketMetadata):
+        slug = slugify(Path(filename).stem)
+        file_name = f"gov.scotus.{slug}.pdf"
+        return str(Path("scotus") / "qp" / file_name)
+    elif isinstance(instance, TexasDocument):
+        slug = slugify(Path(filename).stem)
+        court_id = instance.docket_entry.docket.court_id
+        root = Path(f"us/state/tx/{court_id}")
+        file_name = f"gov.tx.{court_id}.{slug}.pdf"
+        return str(root / file_name)
     else:
         raise ValueError(
             f"Unknown model type in make_pdf_path function: {type(instance)}"
@@ -207,20 +254,16 @@ def make_upload_path(instance, filename):
         d = instance.file_with_date
     except AttributeError:
         from cl.audio.models import Audio
-        from cl.search.models import Opinion
+        from cl.search.models import Opinion, OpinionCluster
 
-        if type(instance) == Audio:
+        if isinstance(instance, Audio):
             d = instance.docket.date_argued
-        elif type(instance) == Opinion:
+        elif isinstance(instance, Opinion):
             d = instance.cluster.date_filed
+        elif isinstance(instance, OpinionCluster):
+            d = instance.date_filed
 
-    return "%s/%s/%02d/%02d/%s" % (
-        filename.split(".")[-1],
-        d.year,
-        d.month,
-        d.day,
-        get_valid_filename(filename),
-    )
+    return f"{filename.split('.')[-1]}/{d.year}/{d.month:02d}/{d.day:02d}/{get_valid_filename(filename)}"
 
 
 def validate_partial_date(instance, fields):
@@ -241,8 +284,8 @@ def validate_partial_date(instance, fields):
             raise ValidationError(
                 {
                     f"date_{field}": "Date and granularity must both be complete "
-                    "or blank. Hint: The values are: date: %s, "
-                    "granularity: %s" % (d, granularity)
+                    f"or blank. Hint: The values are: date: {d}, "
+                    f"granularity: {granularity}"
                 }
             )
 
@@ -274,14 +317,8 @@ def validate_is_not_alias(instance, fields):
         if referenced_object is not None and referenced_object.is_alias:
             raise ValidationError(
                 {
-                    field: 'Cannot set "%s" field to an alias of a "%s". Hint: '
-                    '"%s" is an alias of "%s"'
-                    % (
-                        field,
-                        type(referenced_object).__name__,
-                        referenced_object,
-                        referenced_object.is_alias_of,
-                    )
+                    field: f'Cannot set "{field}" field to an alias of a "{type(referenced_object).__name__}". Hint: '
+                    f'"{referenced_object}" is an alias of "{referenced_object.is_alias_of}"'
                 }
             )
 
@@ -312,12 +349,12 @@ def validate_nomination_fields_ok(instance):
         if selection_type_group == "Election" and instance.date_nominated:
             raise ValidationError(
                 "Cannot have a nomination date for a position with how_selected of "
-                "%s" % instance.get_how_selected_display()
+                f"{instance.get_how_selected_display()}"
             )
         if selection_type_group == "Appointment" and instance.date_elected:
             raise ValidationError(
                 "Cannot have an election date for a position with how_selected of "
-                "%s" % instance.get_how_selected_display()
+                f"{instance.get_how_selected_display()}"
             )
 
 
@@ -334,16 +371,15 @@ def validate_supervisor(instance):
             raise ValidationError(
                 {
                     "supervisor": "The supervisor field can only be set to a "
-                    "judge, but '%s' does not appear to have ever "
-                    "been a judge." % sup.name_full
+                    f"judge, but '{sup.name_full}' does not appear to have ever "
+                    "been a judge."
                 }
             )
 
     if sup and not instance.is_clerkship:
         raise ValidationError(
-            "You have configured a supervisor for this field ('%s'), but it "
-            "the position_type is not a clerkship. Instead it's: '%s'"
-            % (sup.name_full, instance.position_type)
+            f"You have configured a supervisor for this field ('{sup.name_full}'), but it "
+            f"the position_type is not a clerkship. Instead it's: '{instance.position_type}'"
         )
 
 
@@ -357,8 +393,9 @@ def validate_all_or_none(instance, fields):
     none_complete = completed_fields == 0
     if not any([all_complete, none_complete]):
         raise ValidationError(
-            "%s of the following fields are complete, but either all of them need to be, or none of them need to be: %s"
-            % (completed_fields, ", ".join(fields))
+            "{} of the following fields are complete, but either all of them need to be, or none of them need to be: {}".format(
+                completed_fields, ", ".join(fields)
+            )
         )
 
 
@@ -367,8 +404,8 @@ def validate_exactly_n(instance, n, fields):
     completed_fields = sum(1 for f in fields if getattr(instance, f))
     if completed_fields != n:
         raise ValidationError(
-            "Exactly %s of the following fields can be completed (currently "
-            "%s are): %s" % (n, completed_fields, ", ".join(fields))
+            "Exactly {} of the following fields can be completed (currently "
+            "{} are): {}".format(n, completed_fields, ", ".join(fields))
         )
 
 
@@ -377,8 +414,8 @@ def validate_at_most_n(instance, n, fields):
     completed_fields = sum(1 for f in fields if getattr(instance, f))
     if completed_fields > n:
         raise ValidationError(
-            "Exactly %s of the following fields can be completed (currently "
-            "%s are): %s" % (n, completed_fields, ", ".join(fields))
+            "Exactly {} of the following fields can be completed (currently "
+            "{} are): {}".format(n, completed_fields, ", ".join(fields))
         )
 
 
@@ -399,7 +436,7 @@ def make_choices_group_lookup(c):
     """
     d = {}
     for choice, value in c:
-        if isinstance(value, (list, tuple)):
+        if isinstance(value, (list | tuple)):
             for t in value:
                 d[t[0]] = choice
         else:
@@ -425,7 +462,7 @@ def flatten_choices(self):
     """
     flat = []
     for choice, value in self.choices:
-        if isinstance(value, (list, tuple)):
+        if isinstance(value, (list | tuple)):
             flat.extend(value)
         else:
             flat.append((choice, value))
@@ -461,29 +498,116 @@ def disable_auto_now_fields(*models):
                 field.auto_now_add = False
 
 
-@contextlib.contextmanager
-def suppress_autotime(model, fields):
-    """Disable auto_now and auto_now_add fields
+def linkify_orig_docket_number(agency: str, og_docket_number: str) -> str:
+    """Make an originating docket number for an appellate case into a link (MVP version)
 
-    :param model: The model you wish to modify or an instance of it. All objects
-    of this type will be modified until the end of the managed context.
-    :param fields: The fields you wish to disable for the model.
+    **NOTE: These links are presented to users and should be subject to strict security checks.**
+
+    For example, each regex should be carefully written so it accepts only the narrowest of
+    matches. The risk is that:
+
+      - Mallory uploads a bad document via the RECAP APIs (these are open APIs).
+      - The code here parses that upload in a way to create a redirect on the federalregister.gov
+        website.
+      - federalregister.gov has an open redirect vulnerability (these are common).
+      - The user clicks a link on our site that goes to federalregister.gov, which redirects the
+        user to evilsite.com (b/c evilsite.com got through our checks here).
+      - The user is tricked on that site into doing something bad.
+
+    This is all quite unlikely, but we can ensure it doesn't happen by being strict about
+    the inputs our regular expressions capture.
+
+    :param agency: The administrative agency the case originated from
+    :param og_docket_number: The docket number where the case was originally heard.
+    :returns: A linkified version of the docket number for the user to click on, or the original if no link can be made.
     """
-    _original_values = {}
-    for field in model._meta.local_fields:
-        if field.name in fields:
-            _original_values[field.name] = {
-                "auto_now": field.auto_now,
-                "auto_now_add": field.auto_now_add,
-            }
-            field.auto_now = False
-            field.auto_now_add = False
-    try:
-        yield
-    finally:
-        for field in model._meta.local_fields:
-            if field.name in fields:
-                field.auto_now = _original_values[field.name]["auto_now"]
-                field.auto_now_add = _original_values[field.name][
-                    "auto_now_add"
-                ]
+    # Simple pattern for Federal Register citations
+    fr_match = re.search(
+        r"(\d{1,3})\s*(?:FR|Fed\.?\s*Reg\.?)\s*(\d{1,6}(?:,\d{3})*)",
+        og_docket_number,
+    )
+
+    if fr_match:
+        volume, page = fr_match.groups()
+        return f"https://www.federalregister.gov/citation/{volume}-FR-{page}"
+
+    # NLRB pattern
+    if agency == "National Labor Relations Board":
+        match = re.match(
+            r"^(?:NLRB-)?(\d{1,2})-?([A-Z]{2})-?(\d{1,6})$", og_docket_number
+        )
+        if match:
+            region, case_type, number = match.groups()
+            formatted_number = (
+                f"{region.zfill(2)}-{case_type}-{number.zfill(6)}"
+            )
+            return f"https://www.nlrb.gov/case/{formatted_number}"
+
+    # US Tax Court pattern
+    if any(x in agency for x in ("Tax", "Internal Revenue")):
+        match = re.match(
+            r"^(?:USTC-)?(\d{1,5})-(\d{2})([A-Z])?$", og_docket_number
+        )
+        if match:
+            number, year, letter_suffix = match.groups()
+            formatted_number = f"{number.zfill(5)}-{year}"
+            if letter_suffix:
+                formatted_number += letter_suffix
+            return (
+                f"https://dawson.ustaxcourt.gov/case-detail/{formatted_number}"
+            )
+
+    # EPA non-Federal Register pattern
+    if "Environmental Protection" in agency:
+        match = re.match(
+            r"^EPA-(HQ|R\d{2})-[A-Z]{2,5}-\d{4}-\d{4}$", og_docket_number
+        )
+        if match:
+            return f"https://www.regulations.gov/docket/{match.group(0)}"
+
+    """Add other agencies as feasible. Note that the Federal Register link should cover multiple agencies.
+    """
+    # If no match is found, return empty str
+    return ""
+
+
+class CSVExportMixin:
+    def get_csv_columns(self, get_column_name: bool = False) -> list[str]:
+        """Get list of column names required in a csv file.
+        If get column name is True. It will add class name to attribute
+
+        :param: get_column_name: bool. Whether add class name to attr name
+
+        :return: list of attrs of class to get into csv file"""
+        raise NotImplementedError(
+            "Subclass must implement get_csv_columns method"
+        )
+
+    def get_column_function(self) -> dict[str, Callable[[str], str]]:
+        """Get dict of attrs: function to apply on field value if it needs
+        to be pre-processed before being add to csv
+
+        returns: dict -- > {attr1: function}"""
+        raise NotImplementedError(
+            "Subclass must implement get_column_fuction method"
+        )
+
+    def to_csv_row(self) -> list[str]:
+        """Get fields in model based on attrs column names.
+        Apply function to attr value if required.
+        Return list of modified values for csv row"""
+        row = []
+        functions = self.get_column_function()
+        columns = self.get_csv_columns(get_column_name=False)
+        for field in columns:
+            attr = getattr(self, field)
+            if not attr:
+                attr = ""
+            function = functions.get(field)
+            if function:
+                attr = function(field)
+            row.append(attr)
+        return row
+
+    def add_class_name(self, attribute_name: str) -> str:
+        return f"{self.__class__.__name__.lower()}_{attribute_name}"

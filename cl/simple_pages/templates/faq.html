@@ -40,21 +40,11 @@
       <a href="#learn-more">Where can I learn more about PACER and RECAP?</a><br>
     </p>
 
-    <h3 class="bottom">Supreme Court Citation Networks</h3>
-    <p>
-      <a href="#circles-change-size">Why do the case circles change size?</a><br>
-      <a href="#what-cases-mean">How can I find out what the cases in my network mean?</a><br>
-      <a href="#default-two-degree">Why did my network default to 2-degrees?</a><br>
-      <a href="#case-missing">Why is a case missing in my network?</a><br>
-      <a href="#embed-network">How do I embed a network in my blog?</a><br>
-      <a href="#dod">What do you mean by "Degree of Dissent"?</a>
-    </p>
-
     <h3 class="bottom">Coverage and Content</h3>
     <p>
       <a href="#what-coverage-exists">What is your coverage of legal materials and how comprehensive is
           it?</a><br>
-      <a href="#why-many-copies">Why do some opinions show up more than once in search results?</a><br>
+      <a href="#why-many-copies">Why do some case law records show up more than once in search results?</a><br>
       <a href="#why-my-case">Why is my case appearing on this site?</a><br>
       <a href="#non-precedential">Why does this site contain documents that say "Not for Publication",
           "Unpublished" etc?</a><br>
@@ -100,12 +90,12 @@
     <h3 id="who-and-what">What Is This Site? Who Runs It?</h3>
     <p>CourtListener is a legal research website and data provider currently containing:</p>
     <ul>
-      <li><a href="{% url "coverage" %}">{{ total_opinion_count|intcomma }}</a> legal opinions from federal, state, and specialty courts.</li>
-      <li>{{ total_recap_count|intcomma }} documents from the Federal PACER system.</li>
-      <li>{{ total_oa_minutes|intcomma }} minutes of oral argument recordings.</li>
+      <li>More than <a href="{% url "coverage_opinions" %}">10 million</a> legal opinions from federal, state, and specialty courts.</li>
+      <li>Approximately {{ total_recap_count|intword }} documents from the Federal PACER system.</li>
+      <li>{{ total_oa_minutes|floatformat:0|intcomma }} minutes of oral argument recordings.</li>
       <li>A database of {{ total_judge_count|intcomma }} judges.</li>
     </ul>
-    <p>CourtListener is operated by the non-profit <a href="https://free.law">Free Law Project</a>. Free Law Project seeks to provide free access to primary legal materials, develop legal research tools, and support academic research on legal corpora. CourtListener embodies all of these efforts, as the primary free repository of all the court opinions we have collected, as the platform on which we attempt to deploy legal research tools, and as the source of bulk downloads that enable academic researchers to study our collection.
+    <p>CourtListener is operated by the non-profit <a href="https://free.law">Free Law Project</a>. Free Law Project seeks to provide free access to primary legal materials, develop legal research tools, and support academic research on legal corpora. CourtListener embodies all of these efforts, as a repository of <a href="{% url "advanced_o" %}">case law</a>, <a href="{% url "advanced_r" %}">federal filings</a>, <a href="{% url "advanced_oa" %}">oral argument recordings</a>, and <a href="{% url "financial_disclosures_home" %}">financial disclosures</a>; as the platform on which we deploy legal research tools; and as the source of <a href="{% url "bulk_data_index" %}">bulk downloads</a> and <a href="{% url "api_index" %}">APIs</a> researchers use to study our collection.
     </p>
 
 
@@ -117,9 +107,9 @@
 
 
     <h3 id="submit-documents">Can I send you documents from my case?</h3>
-    <p>In general, no, we can't accept documents from you about your case. As you might expect, people occasionally create fraudulent documents and that's a risk we cannot take. If your case in a <a href="{% url "coverage" %}#scraped-jurisdictions">jurisdiction that we cover</a>, we will eventually receive the opinion directly from the court itself.
+    <p>In general, no, we can't accept documents from you about your case. As you might expect, people occasionally create fraudulent documents and that's a risk we cannot take. If your case in a <a href="{% url "coverage" %}">jurisdiction that we cover</a>, we will eventually receive the records directly from the court itself.
     </p>
-    <p>The exception to this is that if your documents are on PACER, it's possible for you to use our <a href="https://free.law/recap/">RECAP Project</a> to get us copies of the documents. To do so, simply install either our Firefox, Chrome or Safari extension, and then purchase the documents from PACER.
+    <p>The exception to this is that if your documents are on PACER, it is possible for you to use our <a href="https://free.law/recap/">RECAP Project</a> to get us copies of the documents. To do so, install either our Firefox, Chrome, Edge, or Safari extension, and then purchase the documents from PACER.
     </p>
 
 
@@ -131,7 +121,7 @@
     <p>We can be contacted via the address on our <a href="{% url "contact" %}">contact form</a>, or via email at
         <a href="mailto:info@free.law">info@free.law</a>. If you require a secure channel when
         contacting us, please use the PGP key listed
-        <a href="http://pgp.mit.edu/pks/lookup?op=get&search=0xDE79459CD047ACFE">here</a>.
+        <a href="https://pgp.mit.edu/pks/lookup?op=get&search=0xDE79459CD047ACFE">here</a>.
     </p>
 
 
@@ -141,31 +131,30 @@
     <p>While Free Law Project seeks to put the entirety of United States case law online, for the
         public, for free, we have not reached that goal yet. So, we hope you find what you are looking
         for here, but if not, you should absolutely use other sites too! Other no-cost sites include
-        <a href="http://scholar.google.com/">Google Scholar</a> and <a href="http://www.justia.com/">
-            Justia</a>. There are many fee-based sites too, such as <a href="http://fastcase.com/">Fastcase</a>.
+        <a href="https://scholar.google.com/">Google Scholar</a> and <a href="https://www.justia.com/">
+            Justia</a>. There are many fee-based sites too, such as <a href="https://fastcase.com/">Fastcase</a>.
 
     <h3 id="how-different">What Makes This Site Different from Other Sites that
         Put Legal Documents online?</h3>
-    <p>Our site has a citator that shows you which subsequent opinions have cited to the opinion you
+    <p>Our site has a citator that shows you which subsequent opnions have cited to the opinion you
         are viewing, an important tool in researching whether a given precedent is still good law. Many free
         sites lack such a tool. We also think our search filters, advanced search options, and relevancy
         search enhancements that we call
         <a href="https://free.law/2013/11/12/citegeist/">
-            CiteGeist</a>, produce search results that are particularly impressive.</p>
+            CiteGeist&trade;</a>, produce search results that are particularly impressive.</p>
 
-    <p>Unlike many sites that may be several days or weeks behind, we strive to collect new opinions from
-        the courts in near real time. For <a href="{% url "coverage" %}#scraped-jurisdictions">the courts we cover</a>, new
-        opinions should typically appear within 30 minutes of being posted on the court's website.</p>
+    <p>Unlike many sites that may be several days or weeks behind, we strive to collect new case law from the courts in near real time. For <a href="{% url "coverage_opinions" %}">the courts we cover</a>, new case law should typically appear within 30 minutes of being posted on the court's website.
+    </p>
 
     <p>But the most important distinguishing factor about this site is that it is <a
             href="https://en.wikipedia.org/wiki/Open_source">open source</a> and <a
             href="https://en.wikipedia.org/wiki/Open_access">open access</a>.
         Anyone can download all the source code we use to operate this site and run their own site that does exactly
-        the same thing. And since our bulk downloads provide access to our entire collection of opinions, we hope
+        the same thing. And since our bulk downloads provide access to our entire collection of case law, we hope
         we've given our effort its own life that can continue no matter what. Many <a
                 href="https://en.wikipedia.org/wiki/AltLaw">people</a> <a
-                href="http://library2.lawschool.cornell.edu/insiteasp/public/display_browse.asp?style=st_browse&id=1542&prevpage=1Legal">have</a> <a
-                href="http://library2.lawschool.cornell.edu/insiteasp/public/display_browse.asp?style=st_browse&id=1207&prevpage=2Court">tried</a>
+                href="https://library2.lawschool.cornell.edu/insiteasp/public/display_browse.asp?style=st_browse&id=1542&prevpage=1Legal">have</a> <a
+                href="https://library2.lawschool.cornell.edu/insiteasp/public/display_browse.asp?style=st_browse&id=1207&prevpage=2Court">tried</a>
         to provide free access to U.S. case law, but when their efforts finally end, their collection and software
         typically disappears too and the next effort has to start over from the beginning. We hope instead to be the
         last people who ever have to attempt to collect the entirety of United States case law. Everyone who comes after
@@ -174,7 +163,7 @@
 
     <h3 id="explain-alerts">What Are Alerts and How Do They Work?</h3>
     <p>You can sign up to receive free daily, weekly or monthly email alerts for
-        any search query that interests you. When a new opinion matches your
+        any search query that interests you. When new case law matches your
         search, you'll get an email alert at about 5:30 Pacific time. If you
         have donated at least $10 in the last year, you can also set up real
         time alerts to get notified even more quickly.</p>
@@ -183,7 +172,7 @@
     </p>
 
     <h3 id="explain-citations">How Do You Identify Citations?</h3>
-    <p>It's not easy. Currently we only detect citaitons to court opinions. Citations to statutes, law
+    <p>It's not easy. Currently we only detect citations to court opinions. Citations to statutes, law
         review articles, or other resources are currently ignored. When a new document is added, we search
         the document text for standard case law citation formats and if we can match what we find with one (and
         only one) document in our collection, then we create a hyperlink from the original document's citation
@@ -195,10 +184,10 @@
     <h3 id="oral-args">How Do You Get the Oral Arguments That You Have?</h3>
     <p>We get oral arguments by looking at court websites on approximately an
         hourly basis. We currently only check the sites listed on our <a
-            href="{% url "coverage" %}#scraped-jurisdictions">coverage page</a>. Once we
+            href="{% url "coverage_oa" %}">coverage page</a>. Once we
         have downloaded an oral argument, we convert it to an MP3, downsample
-        the audio for faster downloading, and add album art for your MP3
-        player. When the file is ready, it is added to the site and it becomes
+        the audio for faster downloading, and add album art for your audio
+        player. When the file is ready, it is added to the site, and it becomes
         available in search results, podcasts and bulk data.</p>
 
 
@@ -229,45 +218,10 @@
     </p>
 
 
-    <h2 id="supreme-court-networks">Supreme Court Citation Networks</h2>
-    <h3 id="circles-change-size">Why do the case circles change size?</h3>
-    <p>Circles change size based on the number of citations to it by other cases in the network. The more cases that cite to <i>Case A</i>, the larger it will be. The only exception to this rule is the rightmost case on network (with the most recent date). For visual clarity, this anchor case is always represented with a large circle.</p>
-
-    <h3 id="what-cases-mean">How can I find out what the cases in my network mean?</h3>
-    <p>This tool will not read the cases for you but it will make your reading more efficient. You can read opinion text directly by clicking on opinions in the visualization. You can see all the Supreme Court Database information for a case. Information will open in a separate window and includes issue area, legal provision involved, and detailed voting information. By using SCDB information and skimming opinion text, you can figure out what is going on in the case fairly quickly. Some networks also have helpful user descriptions. </p>
-
-    <h3 id="default-two-degree">Why did my network default to 2-degrees?</h3>
-    <p>We do not generate 3-degree networks when it will contain more than 70 cases. We have found networks larger than 70 are too unwieldy and so default those networks to 2-degrees.</p>
-
-    <h3 id="case-missing">Why is a case missing from my network?</h3>
-    <p>When the Supreme Court cites to recently decided cases, the citation form is non-standard such as citing to <i>Slip. Op</i> or <i>555 S.Ct ___</i>. This currently confounds our automatic citation parser. It's a problem we're working on.</p>
-
-    <h3 id="embed-network">How do I embed a network in my blog?</h3>
-    <p>On the network display page, the "Embed" box is on the right side of the page. Click in the box and copy the HTML code. You can then put this code in your WordPress blog (or Liguides site, or etc) just as you would embed a video from YouTube.</p>
-
-    <h3 id="dod">What do you mean by "Degree of Dissent"?</h3>
-    <p>We use <em>Degree of Dissent</em> (DoD) in our <a
-            href="{% url "mapper_homepage" %}">visualizations of Supreme Court
-        networks</a> to indicate the average level of disagreement in the cases
-        shown. For example, in a network that shows two cases, each with
-        unanimous 9-0 votes, there would be no dissent, and so the score would
-        be 0. By contrast, if a network had only two cases, each with 5-4
-        decisions, the DoD would be 1.0, indicating a highly
-        dissenting network. Mathematically, the DoD for a given case is calculated by multiplying the number of dissents by 0.25. This means that a 9-0 case will have the same DoD as a 8-0 case (0.0) and a 6-3 will have the same DoD as 5-3 case.
-    </p>
-    <p>In some cases you may see that the DoD is not using all of the cases in a network, stating something like: "Degree of Dissent: 0.73 for 16 cases of 17." This occurs because some cases do not have vote information in the Supreme Court Database (Spaeth).
-    </p>
-
-
     <h2 id="coverage-and-content">Coverage and Content</h2>
     <h3 id="what-coverage-exists">What Is Your Coverage of Legal Materials and
         How Comprehensive Is It?</h3>
-    <p>See our <a href="{% url "coverage" %}">coverage</a> page for all the details. We are
-        constantly working to fill gaps in our coverage, but until we have the entirety of United States case law,
-        you should consult additional sources for any important legal research task.</p>
-    <p>When we think we are closer to having everything, we intend to conduct an "audit" of our documents to
-        confirm that we have every opinion that appears in the bound volumes of case law. Once that audit is complete,
-        we will be able to post even more details about our coverage.</p>
+    <p>There's no simple answer to this question. To learn about our approach, please see <a href="https://free.law/2024/03/26/all-the-case-law/">our blog post</a> about this topic or see our <a href="{% url "coverage_opinions" %}">coverage</a> page for all the details.</p>
 
     <h3 id="why-many-copies">Why Do Some Opinions Show Up More Than Once In
         Search Results?</h3>
@@ -275,7 +229,7 @@
         efficient and effective method of finding new opinions as they are posted, but in some cases, a court will post
         several edits to an opinion. Sometimes these edits are for seemingly minor typos, but other times they can be
         the result of something more interesting, like <a
-                href="http://talkingpointsmemo.com/dc/antonin-scalia-error-supreme-court-dissent-epa">a judicial
+                href="https://talkingpointsmemo.com/dc/antonin-scalia-error-supreme-court-dissent-epa">a judicial
             blunder</a>. When this happens, we maintain an archive of all of the versions of that opinion.
     </p>
     <p>We've discussed this topic in more depth <a
@@ -319,12 +273,12 @@
         using, and which many already have. We encourage all jurisdictions to adopt this system.
     </p>
     <p>Neutral citations have been officially recommended by the <a
-            href="http://www.aallnet.org/Documents/Leadership-Governance/Committees/taskforce.html">American Association
+            href="https://www.aallnet.org/Documents/Leadership-Governance/Committees/taskforce.html">American Association
         of Law Libraries since 1995</a> and by the <a
-            href="http://www.abanet.org/tech/ltrc/research/citation/report.html">American Bar Association since
+            href="https://www.abanet.org/tech/ltrc/research/citation/report.html">American Bar Association since
         1996</a>. You can read more about neutral citations on the <a
-            href="http://onward.justia.com/2010/12/17/public-domain-legal-citations/">Justia blog</a> or at <a
-            href="http://universalcitation.org/">the website where they are being promoted</a>.
+            href="https://onward.justia.com/2010/12/17/public-domain-legal-citations/">Justia blog</a> or at <a
+            href="https://universalcitation.org/">the website where they are being promoted</a>.
     </p>
 
     <h3 id="why-bulk">Why Do You Provide Bulk Data Files?</h3>
@@ -355,7 +309,7 @@
     <p>As a start-up non-profit, we always need many varieties of help. Our biggest goals revolve around new features for the site. We also need the help of designers, lawyers, legal researchers and non-profit fundraisers. If you think you can help, please <a href="{% url "contact" %}">get in touch</a>. We would love to hear from you.
     </p>
     <p>Another simple way to help is to <a
-            href="{% url "donate" %}?referrer=faq">support our efforts
+            href="https://donate.free.law/forms/membership">support our efforts
         financially</a>.
     </p>
 
@@ -364,7 +318,7 @@
     </p>
 
     <h3 id="can-i-contribute">Can I Contribute to the Project Somehow?</h3>
-    <p>Yes! Absolutely. Read our <a href="{% url "contribute" %}">page about getting
+    <p>Yes! Absolutely. Read our <a href="https://free.law/volunteer">page about getting
         involved</a> or simply <a
             href="mailto:volunteer@free.law">send us an email</a>
         with how you think you might be able to help.
@@ -373,10 +327,10 @@
     <h2 id="past-and-future">Past and Future</h2>
     <h3 id="orgin-story">What's the History of CourtListener?</h3>
     <p>CourtListener was Michael Lissner's capstone project while a student at
-        the <a href="http://ischool.berkeley.edu">University of California,
+        the <a href="https://ischool.berkeley.edu">University of California,
             Berkeley, School of Information</a>, where he was advised by
         Brian Carver. The site <a
-                href="http://michaeljaylissner.com/blog/announcing-courtlistener">was
+                href="https://michaeljaylissner.com/blog/announcing-courtlistener">was
             launched in 2010</a> as a simple alert service for the Federal
         Appeals Courts. At that time, it had about 130,000 opinions, a
         different search engine, and an extremely sparse interface.
@@ -389,7 +343,7 @@
     </p>
 
     <h3 id="future">What Plans or Features Are In the Works?</h3>
-    <p>All of the planning for CourtListener is done on Github and via our Slack room. If you want to get involved, a good way is to send us your résumé by email. In your email, it helps to say what kinds of expertise you have and what kind of help you think you can provide.
+    <p>All of the planning for CourtListener is done on GitHub and via our Slack room. If you want to get involved, a good way is to send us your résumé by email. In your email, it helps to say what kinds of expertise you have and what kind of help you think you can provide.
     </p>
 
 

@@ -3,10 +3,11 @@
 
 # Except a few things...
 !cl
-!poetry.lock
 !pyproject.toml
+!uv.lock
 !docker
 !manage.py
+!scripts
 
 # But no matter what, ignore these things.
 cl/assets/static

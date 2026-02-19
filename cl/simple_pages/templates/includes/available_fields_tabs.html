@@ -1,7 +1,9 @@
-{% load extras %}
+{% load extras waffle_tags %}
 <ul class="nav nav-tabs" role="tablist">
   <li role="presentation" class="active"><a href="#list-fields-opinions" aria-controls="list-fields-opinions" role="tab" data-toggle="tab">Opinions</a></li>
-  <li role="presentation"><a href="#list-fields-parentheticals" aria-controls="list-fields-parentheticals" role="tab" data-toggle="tab">Parentheticals</a></li>
+  {% flag "parenthetical-search" %}
+    <li role="presentation"><a href="#list-fields-parentheticals" aria-controls="list-fields-parentheticals" role="tab" data-toggle="tab">Parentheticals</a></li>
+  {% endflag %}
   <li role="presentation"><a href="#list-fields-recap_archive" aria-controls="list-fields-recap" role="tab" data-toggle="tab">RECAP</a></li>
   <li role="presentation"><a href="#list-fields-oral_arguments" aria-controls="list-fields-oral-arguments" role="tab" data-toggle="tab">Oral Arguments</a></li>
   <li role="presentation"><a href="#list-fields-judges" aria-controls="list-fields-judges" role="tab" data-toggle="tab">Judges</a></li>
@@ -29,6 +31,21 @@
               {% endfor %}
           </tbody>
         </table>
+        {% if type == "recap_archive" %}
+          <p>
+            <sup>*</sup> <code>party</code> and <code>attorney</code> values are associated with dockets, not filings. Therefore, avoid combining non-docket fields with <code>party</code> and <code>attorney</code> in the main query box, as such combinations won't yield any results. For example, a query like:
+          </p>
+          <ul>
+            <li><code>party:(Party Name) AND attorney:(Attorney) AND description:(some description)</code></li>
+          </ul>
+          <p>Will not return any results. To achieve the desired results, utilize filters available in the sidebar:</p>
+          <ul>
+            <li><code>Document Description: "some description"</code></li>
+            <li><code>Party Name: "The party name"</code></li>
+            <li><code>Attorney  Name: "The attorney name"</code></li>
+          </ul>
+          <p>This approach will retrieve filings that match the specified document description in dockets with the specified parties and attorneys.</p>
+        {% endif %}
       </div>
     </div>
   {% endfor %}

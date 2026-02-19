@@ -3,8 +3,9 @@ import pickle
 import re
 import socket
 from collections import OrderedDict
-from datetime import date, datetime, timezone
-from typing import Mapping, Optional, TypedDict
+from collections.abc import Mapping
+from datetime import UTC, date, datetime
+from typing import TypedDict
 
 import requests
 import usaddress
@@ -23,7 +24,7 @@ from juriscraper.pacer import (
 )
 from localflavor.us.us_states import STATES_NORMALIZED, USPS_CHOICES
 
-from cl.lib.redis_utils import make_redis_interface
+from cl.lib.redis_utils import get_redis_interface
 from cl.people_db.models import AttorneyOrganization, Role
 from cl.people_db.types import RoleType
 from cl.recap.models import UPLOAD_TYPE
@@ -84,12 +85,11 @@ def lookup_and_save(new, debug=False):
             d = ds[0]
         elif count > 1:
             # Too many dockets returned. Disambiguate.
-            logger.error("Got multiple results while attempting save.")
 
             def is_different(x):
                 return x.pacer_case_id and x.pacer_case_id != new.pacer_case_id
 
-            if all([is_different(d) for d in ds]):
+            if all(is_different(d) for d in ds):
                 # All the dockets found match on docket number, but have
                 # different pacer_case_ids. This means that the docket has
                 # multiple pacer_case_ids in PACER, and we should mirror that
@@ -102,26 +102,31 @@ def lookup_and_save(new, debug=False):
                 d = ds[0]
 
     # Add RECAP as a source if it's not already.
-    if d.source in [Docket.DEFAULT, Docket.SCRAPER]:
-        d.source = Docket.RECAP_AND_SCRAPER
-    elif d.source == Docket.COLUMBIA:
-        d.source = Docket.COLUMBIA_AND_RECAP
-    elif d.source == Docket.COLUMBIA_AND_SCRAPER:
-        d.source = Docket.COLUMBIA_AND_RECAP_AND_SCRAPER
+    d.add_recap_source()
+
+    if d.nature_of_suit and hasattr(new, "nature_of_suit"):
+        # Avoid updating the nature_of_suit if the docket already has a
+        # nature_of_suit set, since this value doesn't change. See issue #3878.
+        delattr(new, "nature_of_suit")
 
     for attr, v in new.__dict__.items():
         setattr(d, attr, v)
 
+    # `new` is an instance of PACERFreeDocumentRow
+    if new.docket_number:
+        d.docket_number_raw = new.docket_number
+
     if not debug:
         d.save()
         logger.info(
-            "Saved as Docket %s: https://www.courtlistener.com%s"
-            % (d.pk, d.get_absolute_url())
+            "Saved as Docket %s: https://www.courtlistener.com%s",
+            d.pk,
+            d.get_absolute_url(),
         )
     return d
 
 
-def get_first_missing_de_date(d):
+def get_first_missing_de_date(d: Docket):
     """When buying dockets use this function to figure out which docket entries
     we already have, starting at the first item. Since PACER only allows you to
     do a range of docket entries, this allows us to figure out a later starting
@@ -212,7 +217,7 @@ def process_docket_data(
     d: Docket,
     report_type: int,
     filepath: str | None = None,
-) -> Optional[int]:
+) -> int | None:
     """Process docket data file.
 
     :param d: A docket object to work on.
@@ -244,12 +249,12 @@ def process_docket_data(
         report = ClaimsRegister(court_id)
     else:
         raise NotImplementedError(
-            "The report type with id '%s' is not yet "
-            "supported. Perhaps you need to add it?" % report_type
+            f"The report type with id '{report_type}' is not yet "
+            "supported. Perhaps you need to add it?"
         )
 
     if filepath:
-        with open(filepath, "r") as f:
+        with open(filepath) as f:
             text = f.read()
     else:
         # This is an S3 path, so get it remotely.
@@ -372,7 +377,7 @@ def make_address_lookup_key(address_info):
     }
     for k, v in sorted_info.items():
         for bad, good in fixes.items():
-            v = re.sub(r"\b%s\b" % bad, good, v, flags=re.IGNORECASE)
+            v = re.sub(rf"\b{bad}\b", good, v, flags=re.IGNORECASE)
         sorted_info[k] = v
     key = "".join(sorted_info.values())
     return re.sub(r"[^a-z0-9]", "", key.lower())
@@ -397,7 +402,7 @@ def normalize_address_info(address_info):
             continue
 
         for bad, good in fixes.items():
-            a = re.sub(r"\b%s\b" % bad, good, a, flags=re.IGNORECASE)
+            a = re.sub(rf"\b{bad}\b", good, a, flags=re.IGNORECASE)
 
         address_info[address_part] = a
 
@@ -517,8 +522,8 @@ def normalize_attorney_contact(c, fallback_name=""):
         # See https://github.com/datamade/probableparsing/issues/2 for why we
         # catch the UnicodeEncodeError. Oy.
         logger.warning(
-            "Unable to parse address (RepeatedLabelError): %s"
-            % ", ".join(c.split("\n"))
+            "Unable to parse address (RepeatedLabelError): %s",
+            ", ".join(c.split("\n")),
         )
         return {}, atty_info
 
@@ -527,8 +532,8 @@ def normalize_attorney_contact(c, fallback_name=""):
 
     if any([address_type == "Ambiguous", "CountryName" in address_info]):
         logger.warning(
-            "Unable to parse address (Ambiguous address type): %s"
-            % ", ".join(c.split("\n"))
+            "Unable to parse address (Ambiguous address type): %s",
+            ", ".join(c.split("\n")),
         )
         return {}, atty_info
 
@@ -564,13 +569,13 @@ def check_pacer_court_connectivity(court_id: str) -> ConnectionType:
         status_code = r.status_code
         r.raise_for_status()
         connection_ok = True
-    except requests.exceptions.RequestException as e:
+    except requests.exceptions.RequestException:
         connection_ok = False
 
     blocked_dict: ConnectionType = {
         "connection_ok": connection_ok,
         "status_code": status_code,
-        "date_time": datetime.now(timezone.utc),
+        "date_time": datetime.now(UTC),
     }
     return blocked_dict
 
@@ -584,7 +589,7 @@ def get_or_cache_pacer_court_status(court_id: str, server_ip: str) -> bool:
     """
 
     court_status_key = f"status:pacer:court.{court_id}:ip.{server_ip}"
-    r = make_redis_interface("CACHE", decode_responses=False)
+    r = get_redis_interface("CACHE", decode_responses=False)
     pickle_status = r.get(court_status_key)
     if pickle_status:
         court_status = pickle.loads(pickle_status)
@@ -619,7 +624,7 @@ def log_pacer_court_connection(
     :param server_ip: The server IP address.
     :return: None
     """
-    r = make_redis_interface("STATS")
+    r = get_redis_interface("STATS")
     pipe = r.pipeline()
     d = connection_info["date_time"].date().isoformat()
     t = connection_info["date_time"].time().isoformat()

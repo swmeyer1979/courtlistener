@@ -1,20 +1,37 @@
+import logging
 import re
 from datetime import datetime
-from typing import Any, Dict, List, Tuple, TypeVar
+from typing import TypeVar
 
+import nh3
 import pghistory
 import pytz
 from asgiref.sync import sync_to_async
 from celery.canvas import chain
 from django.contrib.contenttypes.fields import GenericRelation
+from django.contrib.postgres.indexes import HashIndex
 from django.core.exceptions import ValidationError
-from django.db import models
-from django.db.models import Prefetch, Q, QuerySet
-from django.template import loader
-from django.urls import NoReverseMatch, reverse
+from django.db import IntegrityError, models, transaction
+from django.db.models import (
+    Case,
+    CharField,
+    CheckConstraint,
+    F,
+    Prefetch,
+    Q,
+    QuerySet,
+    Value,
+    When,
+)
+from django.db.models.aggregates import Count, Sum
+from django.db.models.functions import MD5, Coalesce, NullIf
+from django.urls import reverse
+from django.utils import timezone
 from django.utils.encoding import force_str
+from django.utils.functional import cached_property
 from django.utils.text import slugify
 from eyecite import get_citations
+from eyecite.tokenizers import HyperscanTokenizer
 from localflavor.us.models import USPostalCodeField, USZipCodeField
 from localflavor.us.us_states import OBSOLETE_STATES, USPS_CHOICES
 from model_utils import FieldTracker
@@ -22,22 +39,26 @@ from model_utils import FieldTracker
 from cl.citations.utils import get_citation_depth_between_clusters
 from cl.custom_filters.templatetags.text_filters import best_case_name
 from cl.lib import fields
-from cl.lib.date_time import midnight_pt
+from cl.lib.decorators import document_model
 from cl.lib.model_helpers import (
+    CSVExportMixin,
+    linkify_orig_docket_number,
     make_docket_number_core,
+    make_pdf_path,
     make_recap_path,
+    make_scotus_docket_number_core,
     make_upload_path,
 )
 from cl.lib.models import AbstractDateTimeModel, AbstractPDF, s3_warning_note
-from cl.lib.pghistory import AfterUpdateOrDeleteSnapshot
-from cl.lib.search_index_utils import (
-    InvalidDocumentError,
-    normalize_search_dicts,
-    null_map,
-)
 from cl.lib.storage import IncrementingAWSMediaStorage
-from cl.lib.string_utils import trunc
-from cl.lib.utils import deepgetattr
+from cl.lib.string_utils import get_token_count_from_string, trunc
+from cl.search.docket_sources import DocketSources
+from cl.search.state.texas.models import *
+from cl.users.models import User
+
+HYPERSCAN_TOKENIZER = HyperscanTokenizer(cache_dir=".hyperscan")
+
+logger = logging.getLogger(__name__)
 
 
 class PRECEDENTIAL_STATUS:
@@ -59,6 +80,16 @@ class PRECEDENTIAL_STATUS:
         (UNKNOWN, "Unknown Status"),
     )
 
+    @classmethod
+    def get_status_value(cls, name):
+        reverse_names = {value: key for key, value in cls.NAMES}
+        return reverse_names.get(name)
+
+    @classmethod
+    def get_status_value_reverse(cls, name):
+        reverse_names = {key: value for key, value in cls.NAMES}
+        return reverse_names.get(name)
+
 
 class SOURCES:
     COURT_WEBSITE = "C"
@@ -72,13 +103,6 @@ class SOURCES:
     INTERNET_ARCHIVE = "A"
     BRAD_HEATH_ARCHIVE = "H"
     COLUMBIA_ARCHIVE = "Z"
-    COLUMBIA_M_COURT = "ZC"
-    COLUMBIA_M_LAWBOX_COURT = "ZLC"
-    COLUMBIA_M_LAWBOX_RESOURCE = "ZLR"
-    COLUMBIA_M_LAWBOX_COURT_RESOURCE = "ZLCR"
-    COLUMBIA_M_RESOURCE = "ZR"
-    COLUMBIA_M_COURT_RESOURCE = "ZCR"
-    COLUMBIA_M_LAWBOX = "ZL"
     HARVARD_CASELAW = "U"
     COURT_M_HARVARD = "CU"
     DIRECT_COURT_INPUT = "D"
@@ -92,7 +116,28 @@ class SOURCES:
     LAWBOX_M_COURT_RESOURCE_M_HARVARD = "LCRU"
     MANUAL_INPUT_M_HARVARD = "MU"
     PUBLIC_RESOURCE_M_HARVARD = "RU"
+    COLUMBIA_M_INTERNET_ARCHIVE = "ZA"
+    COLUMBIA_M_DIRECT_COURT_INPUT = "ZD"
+    COLUMBIA_M_COURT = "ZC"
+    COLUMBIA_M_BRAD_HEATH_ARCHIVE = "ZH"
+    COLUMBIA_M_LAWBOX_COURT = "ZLC"
+    COLUMBIA_M_LAWBOX_RESOURCE = "ZLR"
+    COLUMBIA_M_LAWBOX_COURT_RESOURCE = "ZLCR"
+    COLUMBIA_M_RESOURCE = "ZR"
+    COLUMBIA_M_COURT_RESOURCE = "ZCR"
+    COLUMBIA_M_LAWBOX = "ZL"
+    COLUMBIA_M_MANUAL = "ZM"
+    COLUMBIA_M_ANON_2020 = "ZQ"
     COLUMBIA_ARCHIVE_M_HARVARD = "ZU"
+    COLUMBIA_M_LAWBOX_M_HARVARD = "ZLU"
+    COLUMBIA_M_DIRECT_COURT_INPUT_M_HARVARD = "ZDU"
+    COLUMBIA_M_LAWBOX_M_RESOURCE_M_HARVARD = "ZLRU"
+    COLUMBIA_M_LAWBOX_M_COURT_RESOURCE_M_HARVARD = "ZLCRU"
+    COLUMBIA_M_COURT_M_HARVARD = "ZCU"
+    COLUMBIA_M_MANUAL_INPUT_M_HARVARD = "ZMU"
+    COLUMBIA_M_PUBLIC_RESOURCE_M_HARVARD = "ZRU"
+    COLUMBIA_M_LAWBOX_M_COURT_M_HARVARD = "ZLCU"
+    RECAP = "G"
     NAMES = (
         (COURT_WEBSITE, "court website"),
         (PUBLIC_RESOURCE, "public.resource.org"),
@@ -105,7 +150,16 @@ class SOURCES:
         (INTERNET_ARCHIVE, "internet archive"),
         (BRAD_HEATH_ARCHIVE, "brad heath archive"),
         (COLUMBIA_ARCHIVE, "columbia archive"),
+        (COLUMBIA_M_INTERNET_ARCHIVE, "columbia merged with internet archive"),
+        (
+            COLUMBIA_M_DIRECT_COURT_INPUT,
+            "columbia merged with direct court input",
+        ),
         (COLUMBIA_M_COURT, "columbia merged with court"),
+        (
+            COLUMBIA_M_BRAD_HEATH_ARCHIVE,
+            "columbia merged with brad heath archive",
+        ),
         (COLUMBIA_M_LAWBOX_COURT, "columbia merged with lawbox and court"),
         (
             COLUMBIA_M_LAWBOX_RESOURCE,
@@ -121,6 +175,8 @@ class SOURCES:
             "columbia merged with court and resource.org",
         ),
         (COLUMBIA_M_LAWBOX, "columbia merged with lawbox"),
+        (COLUMBIA_M_MANUAL, "columbia merged with manual input"),
+        (COLUMBIA_M_ANON_2020, "columbia merged with 2020 anonymous database"),
         (
             HARVARD_CASELAW,
             "Harvard, Library Innovation Lab Case Law Access Project",
@@ -150,10 +206,73 @@ class SOURCES:
         (MANUAL_INPUT_M_HARVARD, "Manual input merged with Harvard"),
         (PUBLIC_RESOURCE_M_HARVARD, "public.resource.org merged with Harvard"),
         (COLUMBIA_ARCHIVE_M_HARVARD, "columbia archive merged with Harvard"),
+        (
+            COLUMBIA_M_LAWBOX_M_HARVARD,
+            "columbia archive merged with Lawbox and Harvard",
+        ),
+        (
+            COLUMBIA_M_DIRECT_COURT_INPUT_M_HARVARD,
+            "columbia archive merged with direct court input and Harvard",
+        ),
+        (
+            COLUMBIA_M_LAWBOX_M_RESOURCE_M_HARVARD,
+            "columbia archive merged with lawbox, public.resource.org and Harvard",
+        ),
+        (
+            COLUMBIA_M_LAWBOX_M_COURT_RESOURCE_M_HARVARD,
+            "columbia archive merged with lawbox, court website, public.resource.org and Harvard",
+        ),
+        (
+            COLUMBIA_M_COURT_M_HARVARD,
+            "columbia archive merged with court website and Harvard",
+        ),
+        (
+            COLUMBIA_M_MANUAL_INPUT_M_HARVARD,
+            "columbia archive merged with manual input and Harvard",
+        ),
+        (
+            COLUMBIA_M_PUBLIC_RESOURCE_M_HARVARD,
+            "columbia archive merged with public.resource.org and Harvard",
+        ),
+        (
+            COLUMBIA_M_LAWBOX_M_COURT_M_HARVARD,
+            "columbia archive merged with lawbox, court website and Harvard",
+        ),
+        (
+            RECAP,
+            "recap",
+        ),
     )
 
+    # use a frozenset since the order of characters is arbitrary
+    parts_to_source_mapper = {frozenset(name[0]): name[0] for name in NAMES}
 
-@pghistory.track(AfterUpdateOrDeleteSnapshot())
+    @classmethod
+    def merge_sources(cls, source1: str, source2: str) -> str:
+        """Merge source values
+
+        Use this to merge sources when merging clusters
+
+        :param source1: a source
+        :param source2: other source
+        :return: a source which merges the input sources
+        """
+        if source1 in source2:
+            return source2
+        if source2 in source1:
+            return source1
+
+        unique_parts = frozenset(source1 + source2)
+        if cls.parts_to_source_mapper.get(unique_parts):
+            return cls.parts_to_source_mapper.get(unique_parts)
+
+        # Unexpected case
+        if len(source1) > len(source2):
+            return source1
+        return source2
+
+
+@pghistory.track()
 class OriginatingCourtInformation(AbstractDateTimeModel):
     """Lower court metadata to associate with appellate cases.
 
@@ -185,6 +304,14 @@ class OriginatingCourtInformation(AbstractDateTimeModel):
     docket_number = models.TextField(
         help_text="The docket number in the lower court.", blank=True
     )
+    docket_number_raw = models.CharField(
+        help_text=(
+            "The raw docket number value as found on the source,"
+            "with no cleaning or transformations applied"
+        ),
+        blank=True,
+        default="",
+    )
     assigned_to = models.ForeignKey(
         "people_db.Person",
         help_text="The judge the case was assigned to.",
@@ -207,8 +334,7 @@ class OriginatingCourtInformation(AbstractDateTimeModel):
     )
     ordering_judge_str = models.TextField(
         help_text=(
-            "The judge that issued the final order in the case, as a "
-            "string."
+            "The judge that issued the final order in the case, as a string."
         ),
         blank=True,
     )
@@ -248,6 +374,18 @@ class OriginatingCourtInformation(AbstractDateTimeModel):
         blank=True,
         null=True,
     )
+    date_rehearing_denied = models.DateField(
+        help_text="The date the petition for rehearing was denied at the "
+        "lower court.",
+        blank=True,
+        null=True,
+    )
+
+    @property
+    def administrative_link(self):
+        return linkify_orig_docket_number(
+            self.docket.appeal_from_str, self.docket_number
+        )
 
     def get_absolute_url(self) -> str:
         return self.docket.get_absolute_url()
@@ -256,140 +394,21 @@ class OriginatingCourtInformation(AbstractDateTimeModel):
         verbose_name_plural = "Originating Court Information"
 
 
-@pghistory.track(AfterUpdateOrDeleteSnapshot(), exclude=["view_count"])
-class Docket(AbstractDateTimeModel):
+@pghistory.track(
+    pghistory.UpdateEvent(
+        condition=pghistory.AnyChange(exclude_auto=True), row=pghistory.Old
+    ),
+    pghistory.DeleteEvent(),
+    exclude=["view_count"],
+)
+class Docket(AbstractDateTimeModel, DocketSources):
     """A class to sit above OpinionClusters, Audio files, and Docket Entries,
     and link them together.
     """
 
-    # The source values are additive. That is, if you get content from a new
-    # source, you can add it to the previous one, and have a combined value.
-    # For example, if you start with a RECAP docket (1), then add scraped
-    # content (2), you can arrive at a combined docket (3) because 1 + 2 = 3.
-    # Put another way, this is a bitmask. We should eventually re-do it as a
-    # bitfield using, e.g. https://github.com/disqus/django-bitfield
-    DEFAULT = 0
-    RECAP = 1
-    SCRAPER = 2
-    RECAP_AND_SCRAPER = 3
-    COLUMBIA = 4
-    COLUMBIA_AND_RECAP = 5
-    COLUMBIA_AND_SCRAPER = 6
-    COLUMBIA_AND_RECAP_AND_SCRAPER = 7
-    IDB = 8
-    RECAP_AND_IDB = 9
-    SCRAPER_AND_IDB = 10
-    RECAP_AND_SCRAPER_AND_IDB = 11
-    COLUMBIA_AND_IDB = 12
-    COLUMBIA_AND_RECAP_AND_IDB = 13
-    COLUMBIA_AND_SCRAPER_AND_IDB = 14
-    COLUMBIA_AND_RECAP_AND_SCRAPER_AND_IDB = 15
-    HARVARD = 16
-    HARVARD_AND_RECAP = 17
-    SCRAPER_AND_HARVARD = 18
-    RECAP_AND_SCRAPER_AND_HARVARD = 19
-    HARVARD_AND_COLUMBIA = 20
-    COLUMBIA_AND_RECAP_AND_HARVARD = 21
-    COLUMBIA_AND_SCRAPER_AND_HARVARD = 22
-    COLUMBIA_AND_RECAP_AND_SCRAPER_AND_HARVARD = 23
-    IDB_AND_HARVARD = 24
-    RECAP_AND_IDB_AND_HARVARD = 25
-    SCRAPER_AND_IDB_AND_HARVARD = 26
-    RECAP_AND_SCRAPER_AND_IDB_AND_HARVARD = 27
-    COLUMBIA_AND_IDB_AND_HARVARD = 28
-    COLUMBIA_AND_RECAP_AND_IDB_AND_HARVARD = 29
-    COLUMBIA_AND_SCRAPER_AND_IDB_AND_HARVARD = 30
-    COLUMBIA_AND_RECAP_AND_SCRAPER_AND_IDB_AND_HARVARD = 31
-    DIRECT_INPUT = 32
-    DIRECT_INPUT_AND_HARVARD = 48
-    ANON_2020 = 64
-    ANON_2020_AND_SCRAPER = 66
-    ANON_2020_AND_HARVARD = 80
-    ANON_2020_AND_SCRAPER_AND_HARVARD = 82
-    SOURCE_CHOICES = (
-        (DEFAULT, "Default"),
-        (RECAP, "RECAP"),
-        (SCRAPER, "Scraper"),
-        (RECAP_AND_SCRAPER, "RECAP and Scraper"),
-        (COLUMBIA, "Columbia"),
-        (COLUMBIA_AND_SCRAPER, "Columbia and Scraper"),
-        (COLUMBIA_AND_RECAP, "Columbia and RECAP"),
-        (COLUMBIA_AND_RECAP_AND_SCRAPER, "Columbia, RECAP, and Scraper"),
-        (IDB, "Integrated Database"),
-        (RECAP_AND_IDB, "RECAP and IDB"),
-        (SCRAPER_AND_IDB, "Scraper and IDB"),
-        (RECAP_AND_SCRAPER_AND_IDB, "RECAP, Scraper, and IDB"),
-        (COLUMBIA_AND_IDB, "Columbia and IDB"),
-        (COLUMBIA_AND_RECAP_AND_IDB, "Columbia, RECAP, and IDB"),
-        (COLUMBIA_AND_SCRAPER_AND_IDB, "Columbia, Scraper, and IDB"),
-        (
-            COLUMBIA_AND_RECAP_AND_SCRAPER_AND_IDB,
-            "Columbia, RECAP, Scraper, and IDB",
-        ),
-        (HARVARD, "Harvard"),
-        (HARVARD_AND_RECAP, "Harvard and RECAP"),
-        (SCRAPER_AND_HARVARD, "Scraper and Harvard"),
-        (RECAP_AND_SCRAPER_AND_HARVARD, "RECAP, Scraper and Harvard"),
-        (HARVARD_AND_COLUMBIA, "Harvard and Columbia"),
-        (COLUMBIA_AND_RECAP_AND_HARVARD, "Columbia, RECAP, and Harvard"),
-        (COLUMBIA_AND_SCRAPER_AND_HARVARD, "Columbia, Scraper, and Harvard"),
-        (
-            COLUMBIA_AND_RECAP_AND_SCRAPER_AND_HARVARD,
-            "Columbia, RECAP, Scraper, and Harvard",
-        ),
-        (IDB_AND_HARVARD, "IDB and Harvard"),
-        (RECAP_AND_IDB_AND_HARVARD, "RECAP, IDB and Harvard"),
-        (SCRAPER_AND_IDB_AND_HARVARD, "Scraper, IDB and Harvard"),
-        (
-            RECAP_AND_SCRAPER_AND_IDB_AND_HARVARD,
-            "RECAP, Scraper, IDB and Harvard",
-        ),
-        (COLUMBIA_AND_IDB_AND_HARVARD, "Columbia, IDB, and Harvard"),
-        (
-            COLUMBIA_AND_RECAP_AND_IDB_AND_HARVARD,
-            "Columbia, Recap, IDB, and Harvard",
-        ),
-        (
-            COLUMBIA_AND_SCRAPER_AND_IDB_AND_HARVARD,
-            "Columbia, Scraper, IDB, and Harvard",
-        ),
-        (
-            COLUMBIA_AND_RECAP_AND_SCRAPER_AND_IDB_AND_HARVARD,
-            "Columbia, Recap, Scraper, IDB, and Harvard",
-        ),
-        (DIRECT_INPUT, "Direct court input"),
-        (DIRECT_INPUT_AND_HARVARD, "Direct court input and Harvard"),
-        (ANON_2020, "2020 anonymous database"),
-        (ANON_2020_AND_SCRAPER, "2020 anonymous database and Scraper"),
-        (ANON_2020_AND_HARVARD, "2020 anonymous database and Harvard"),
-        (
-            ANON_2020_AND_SCRAPER_AND_HARVARD,
-            "2020 anonymous database, Scraper, and Harvard",
-        ),
-    )
-    RECAP_SOURCES = [
-        RECAP,
-        RECAP_AND_SCRAPER,
-        COLUMBIA_AND_RECAP,
-        COLUMBIA_AND_RECAP_AND_SCRAPER,
-        RECAP_AND_IDB,
-        RECAP_AND_SCRAPER_AND_IDB,
-        COLUMBIA_AND_RECAP_AND_IDB,
-        COLUMBIA_AND_RECAP_AND_SCRAPER_AND_IDB,
-    ]
-    IDB_SOURCES = [
-        IDB,
-        RECAP_AND_IDB,
-        SCRAPER_AND_IDB,
-        RECAP_AND_SCRAPER_AND_IDB,
-        COLUMBIA_AND_IDB,
-        COLUMBIA_AND_RECAP_AND_IDB,
-        COLUMBIA_AND_SCRAPER_AND_IDB,
-        COLUMBIA_AND_RECAP_AND_SCRAPER_AND_IDB,
-    ]
-
     source = models.SmallIntegerField(
-        help_text="contains the source of the Docket.", choices=SOURCE_CHOICES
+        help_text="contains the source of the Docket.",
+        choices=DocketSources.SOURCE_CHOICES,
     )
     court = models.ForeignKey(
         "Court",
@@ -411,6 +430,17 @@ class Docket(AbstractDateTimeModel):
         on_delete=models.RESTRICT,
         blank=True,
         null=True,
+    )
+    parent_docket = models.ForeignKey(
+        "self",
+        help_text="In criminal cases (and some magistrate) PACER creates "
+        "a parent docket and one or more child dockets. Child dockets "
+        "contain docket information for each individual defendant "
+        "while parent dockets are a superset of all docket entries.",
+        on_delete=models.SET_NULL,
+        blank=True,
+        null=True,
+        related_name="child_dockets",
     )
     appeal_from_str = models.TextField(
         help_text=(
@@ -434,8 +464,7 @@ class Docket(AbstractDateTimeModel):
     idb_data = models.OneToOneField(
         "recap.FjcIntegratedDatabase",
         help_text=(
-            "Data from the FJC Integrated Database associated with this "
-            "case."
+            "Data from the FJC Integrated Database associated with this case."
         ),
         related_name="docket",
         on_delete=models.SET_NULL,
@@ -574,7 +603,6 @@ class Docket(AbstractDateTimeModel):
         "the correction field on the Opinion Cluster.",
         blank=True,
         null=True,
-        db_index=True,
     )
     docket_number_core = models.CharField(
         help_text=(
@@ -593,9 +621,55 @@ class Docket(AbstractDateTimeModel):
         blank=True,
         db_index=True,
     )
+    docket_number_raw = models.CharField(
+        help_text=(
+            "The raw docket number value as found on the source,"
+            "with no cleaning or transformations applied"
+        ),
+        blank=True,
+        default="",
+    )
+    federal_dn_office_code = models.CharField(
+        help_text="A one digit statistical code (either alphabetic or numeric) "
+        "of the office within the federal district. In this "
+        "example, 2:07-cv-34911-MJL, the 2 preceding "
+        "the : is the office code.",
+        max_length=3,
+        blank=True,
+    )
+    federal_dn_case_type = models.CharField(
+        help_text="Case type, e.g., civil (cv), magistrate (mj), criminal (cr), "
+        "petty offense (po), and miscellaneous (mc). These codes "
+        "can be upper case or lower case, and may vary in number of "
+        "characters.",
+        max_length=6,
+        blank=True,
+    )
+    federal_dn_judge_initials_assigned = models.CharField(
+        help_text="A typically three-letter upper cased abbreviation "
+        "of the judge's initials. In the example 2:07-cv-34911-MJL, "
+        "MJL is the judge's initials. Judge initials change if a "
+        "new judge takes over a case.",
+        max_length=5,
+        blank=True,
+    )
+    federal_dn_judge_initials_referred = models.CharField(
+        help_text="A typically three-letter upper cased abbreviation "
+        "of the judge's initials. In the example 2:07-cv-34911-MJL-GOG, "
+        "GOG is the magistrate judge initials.",
+        max_length=5,
+        blank=True,
+    )
+    federal_defendant_number = models.SmallIntegerField(
+        help_text="A unique number assigned to each defendant in a case, "
+        "typically found in pacer criminal cases as a -1, -2 after "
+        "the judge initials. Example: 1:14-cr-10363-RGS-1.",
+        null=True,
+        blank=True,
+    )
     # Nullable for unique constraint requirements.
     pacer_case_id = fields.CharNullField(
-        help_text="The cased ID provided by PACER.",
+        help_text="The case ID provided by PACER.",
         max_length=100,
         blank=True,
         null=True,
@@ -644,8 +718,8 @@ class Docket(AbstractDateTimeModel):
         blank=True,
     )
     filepath_local = models.FileField(
-        help_text=f"Path to RECAP's Docket XML page as provided by the "
-        f"original RECAP architecture. These fields are for backup purposes "
+        help_text="Path to RECAP's Docket XML page as provided by the "
+        "original RECAP architecture. These fields are for backup purposes "
         f"only. {s3_warning_note}",
         upload_to=make_recap_path,
         storage=IncrementingAWSMediaStorage(),
@@ -735,17 +809,36 @@ class Docket(AbstractDateTimeModel):
             "referred_to_id",
             "referred_to_str",
             "slug",
+            "pacer_case_id",
+            "source",
+        ]
+    )
+    es_o_field_tracker = FieldTracker(
+        fields=[
+            "court_id",
+            "docket_number",
+            "date_argued",
+            "date_reargued",
+            "date_reargument_denied",
         ]
     )
 
     class Meta:
-        unique_together = ("docket_number", "pacer_case_id", "court")
+        constraints = [
+            models.UniqueConstraint(
+                MD5("docket_number"),
+                "pacer_case_id",
+                "court_id",
+                name="unique_docket_per_court",
+            ),
+        ]
         indexes = [
             models.Index(fields=["court_id", "id"]),
             models.Index(
                 fields=["court_id", "docket_number_core", "pacer_case_id"],
                 name="district_court_docket_lookup_idx",
             ),
+            HashIndex("docket_number", name="hash_docket_number_lookup_idx"),
         ]
 
     def __str__(self) -> str:
@@ -757,11 +850,13 @@ class Docket(AbstractDateTimeModel):
     def save(self, update_fields=None, *args, **kwargs):
         self.slug = slugify(trunc(best_case_name(self), 75))
         if self.docket_number and not self.docket_number_core:
-            self.docket_number_core = make_docket_number_core(
-                self.docket_number
+            self.docket_number_core = (
+                make_scotus_docket_number_core(self.docket_number)
+                if self.court_id == "scotus"
+                else make_docket_number_core(self.docket_number)
             )
 
-        if self.source in self.RECAP_SOURCES:
+        if self.source in self.RECAP_SOURCES():
             for field in ["pacer_case_id", "docket_number"]:
                 if (
                     field == "pacer_case_id"
@@ -777,7 +872,15 @@ class Docket(AbstractDateTimeModel):
         if update_fields is not None:
             update_fields = {"slug", "docket_number_core"}.union(update_fields)
 
-        super(Docket, self).save(update_fields=update_fields, *args, **kwargs)
+        try:
+            # Without a transaction wrapper, a failure will invalidate outer transactions
+            with transaction.atomic():
+                super().save(update_fields=update_fields, *args, **kwargs)
+        except IntegrityError:
+            # Temporary patch while we solve #3359
+            # If the error is not related to `date_modified` it will raise again
+            self.date_modified = timezone.now()
+            super().save(update_fields=update_fields, *args, **kwargs)
 
     def get_absolute_url(self) -> str:
         return reverse("view_docket", args=[self.pk, self.slug])
@@ -785,40 +888,72 @@ class Docket(AbstractDateTimeModel):
     def add_recap_source(self):
         if self.source == self.DEFAULT:
             self.source = self.RECAP_AND_SCRAPER
-        elif self.source in [
-            self.SCRAPER,
-            self.COLUMBIA,
-            self.COLUMBIA_AND_SCRAPER,
-            self.IDB,
-            self.SCRAPER_AND_IDB,
-            self.COLUMBIA_AND_IDB,
-            self.COLUMBIA_AND_SCRAPER_AND_IDB,
-            self.HARVARD,
-        ]:
+        elif self.source in self.NON_RECAP_SOURCES():
             # Simply add the RECAP value to the other value.
             self.source = self.source + self.RECAP
 
+    def add_opinions_source(self, scraper_source: int):
+        match scraper_source:
+            case self.COLUMBIA:
+                non_source_list = self.NON_COLUMBIA_SOURCES()
+            case self.SCRAPER:
+                non_source_list = self.NON_SCRAPER_SOURCES()
+            case self.HARVARD:
+                non_source_list = self.NON_HARVARD_SOURCES()
+            case _:
+                return
+
+        if self.source in non_source_list:
+            # Simply add the new source value to the other value.
+            self.source = self.source + scraper_source
+
+    @property
+    def authorities(self):
+        """Returns a queryset that can be used for querying and caching
+        authorities.
+        """
+        return OpinionsCitedByRECAPDocument.objects.filter(
+            citing_document__docket_entry__docket_id=self.pk
+        )
+
+    async def ahas_authorities(self):
+        return await self.authorities.aexists()
+
+    @property
+    def authority_count(self):
+        return self.authorities.count()
+
+    @property
+    def authorities_with_data(self):
+        """Returns a queryset of this document's authorities for
+        eventual injection into a view template.
+
+        The returned queryset is sorted by the depth field.
+        """
+        return build_authorities_query(self.authorities)
+
+    @property
+    def authority_opinions(self):
+        """Return a queryset of Opinions cited by this docket's RDs.
+
+        This is similar to the authorities property, but instead of
+        listing OpinionsCitedByRECAPDocuments, it lists Opinions.
+
+        The returned queryset is annotated with the number of filings
+        and the total depth across references, and optimized by prefetching
+        related data.
+        """
+        opinions = Opinion.objects.filter(
+            citing_documents__citing_document__docket_entry__docket_id=self.pk
+        )
+        return build_authority_opinions_query(opinions)
+
     def add_idb_source(self):
-        if self.source == self.DEFAULT:
-            self.source = self.IDB
-        elif self.source in [
-            self.RECAP,
-            self.SCRAPER,
-            self.RECAP_AND_SCRAPER,
-            self.COLUMBIA,
-            self.COLUMBIA_AND_RECAP,
-            self.COLUMBIA_AND_SCRAPER,
-            self.COLUMBIA_AND_RECAP_AND_SCRAPER,
-        ]:
+        if self.source in self.NON_IDB_SOURCES():
             self.source = self.source + self.IDB
 
     def add_anon_2020_source(self) -> None:
-        if self.source not in [
-            self.ANON_2020,
-            self.ANON_2020_AND_HARVARD,
-            self.ANON_2020_AND_SCRAPER,
-            self.ANON_2020_AND_SCRAPER_AND_HARVARD,
-        ]:
+        if self.source in self.NON_ANON_2020_SOURCES():
             self.source = self.source + self.ANON_2020
 
     @property
@@ -837,30 +972,32 @@ class Docket(AbstractDateTimeModel):
             self.court.jurisdiction == Court.FEDERAL_APPELLATE
         ):
             return None
-        return "https://ecf.%s.uscourts.gov/cgi-bin/%s?%s" % (
-            self.pacer_court_id,
-            path,
-            self.pacer_case_id,
-        )
+        return f"https://ecf.{self.pacer_court_id}.uscourts.gov/cgi-bin/{path}?{self.pacer_case_id}"
 
     def pacer_appellate_url_with_caseId(self, path):
         return (
             f"https://ecf.{self.pacer_court_id}.uscourts.gov"
             f"{path}"
-            f"servlet=CaseSummary.jsp&"
+            "servlet=CaseSummary.jsp&"
             f"caseId={self.pacer_case_id}&"
-            f"incOrigDkt=Y&"
-            f"incDktEntries=Y"
+            "incOrigDkt=Y&"
+            "incDktEntries=Y"
         )
 
     def pacer_appellate_url_with_caseNum(self, path):
         return (
             f"https://ecf.{self.pacer_court_id}.uscourts.gov"
             f"{path}"
-            f"servlet=CaseSummary.jsp&"
+            "servlet=CaseSummary.jsp&"
             f"caseNum={self.docket_number}&"
-            f"incOrigDkt=Y&"
-            f"incDktEntries=Y"
+            "incOrigDkt=Y&"
+            "incDktEntries=Y"
+        )
+
+    def pacer_acms_url(self):
+        return (
+            f"https://{self.pacer_court_id}-showdoc.azurewebsites.us/"
+            f"{self.docket_number}"
         )
 
     @property
@@ -873,6 +1010,8 @@ class Docket(AbstractDateTimeModel):
 
             if not self.pacer_case_id:
                 return self.pacer_appellate_url_with_caseNum(path)
+            elif self.pacer_case_id.count("-") > 1:
+                return self.pacer_acms_url()
             else:
                 return self.pacer_appellate_url_with_caseId(path)
         else:
@@ -926,146 +1065,6 @@ class Docket(AbstractDateTimeModel):
     def pacer_view_doc_url(self):
         return self.pacer_district_url("qryDocument.pl")
 
-    @property
-    def prefetched_parties(self):
-        """Prefetch the attorneys and firms associated with a docket and put
-        those values into the `attys_in_docket` and `firms_in_docket`
-        attributes.
-
-        :return: A parties queryset with the correct values prefetched.
-        """
-        from cl.people_db.models import Attorney, AttorneyOrganization
-
-        return self.parties.prefetch_related(
-            Prefetch(
-                "attorneys",
-                queryset=Attorney.objects.filter(roles__docket=self)
-                .distinct()
-                .only("pk", "name"),
-                to_attr="attys_in_docket",
-            ),
-            Prefetch(
-                "attys_in_docket__organizations",
-                queryset=AttorneyOrganization.objects.filter(
-                    attorney_organization_associations__docket=self
-                )
-                .distinct()
-                .only("pk", "name"),
-                to_attr="firms_in_docket",
-            ),
-        )
-
-    def as_search_list(self):
-        """Create list of search dicts from a single docket. This should be
-        faster than creating a search dict per document on the docket.
-        """
-        search_list = []
-
-        # Docket
-        out = {
-            "docketNumber": self.docket_number,
-            "caseName": best_case_name(self),
-            "suitNature": self.nature_of_suit,
-            "cause": self.cause,
-            "juryDemand": self.jury_demand,
-            "jurisdictionType": self.jurisdiction_type,
-        }
-        if self.date_argued is not None:
-            out["dateArgued"] = midnight_pt(self.date_argued)
-        if self.date_filed is not None:
-            out["dateFiled"] = midnight_pt(self.date_filed)
-        if self.date_terminated is not None:
-            out["dateTerminated"] = midnight_pt(self.date_terminated)
-        try:
-            out["docket_absolute_url"] = self.get_absolute_url()
-        except NoReverseMatch:
-            raise InvalidDocumentError(
-                f"Unable to save to index due to missing absolute_url: {self.pk}"
-            )
-
-        # Judges
-        if self.assigned_to is not None:
-            out["assignedTo"] = self.assigned_to.name_full
-        elif self.assigned_to_str:
-            out["assignedTo"] = self.assigned_to_str
-        if self.referred_to is not None:
-            out["referredTo"] = self.referred_to.name_full
-        elif self.referred_to_str:
-            out["referredTo"] = self.referred_to_str
-
-        # Court
-        out.update(
-            {
-                "court": self.court.full_name,
-                "court_exact": self.court_id,  # For faceting
-                "court_citation_string": self.court.citation_string,
-            }
-        )
-
-        # Do RECAPDocument and Docket Entries in a nested loop
-        for de in self.docket_entries.all().iterator():
-            # Docket Entry
-            de_out = {
-                "description": de.description,
-            }
-            if de.entry_number is not None:
-                de_out["entry_number"] = de.entry_number
-            if de.date_filed is not None:
-                de_out["entry_date_filed"] = midnight_pt(de.date_filed)
-            rds = de.recap_documents.all()
-
-            if len(rds) == 0:
-                # Minute entry or other entry that lacks docs.
-                # For now, we punt.
-                # https://github.com/freelawproject/courtlistener/issues/784
-                continue
-
-            for rd in rds:
-                # IDs
-                rd_out = {
-                    "id": rd.pk,
-                    "docket_entry_id": de.pk,
-                    "docket_id": self.pk,
-                    "court_id": self.court.pk,
-                    "assigned_to_id": getattr(self.assigned_to, "pk", None),
-                    "referred_to_id": getattr(self.referred_to, "pk", None),
-                }
-
-                # RECAPDocument
-                rd_out.update(
-                    {
-                        "short_description": rd.description,
-                        "document_type": rd.get_document_type_display(),
-                        "document_number": rd.document_number or None,
-                        "attachment_number": rd.attachment_number,
-                        "is_available": rd.is_available,
-                        "page_count": rd.page_count,
-                    }
-                )
-                if rd.filepath_local:
-                    rd_out["filepath_local"] = rd.filepath_local.name
-                try:
-                    rd_out["absolute_url"] = rd.get_absolute_url()
-                except NoReverseMatch:
-                    raise InvalidDocumentError(
-                        "Unable to save to index due to missing absolute_url: "
-                        "%s" % self.pk
-                    )
-
-                text_template = loader.get_template("indexes/dockets_text.txt")
-                rd_out["text"] = text_template.render({"item": rd}).translate(
-                    null_map
-                )
-
-                # Ensure that loops to bleed into each other
-                out_copy = out.copy()
-                out_copy.update(rd_out)
-                out_copy.update(de_out)
-
-                search_list.append(normalize_search_dicts(out_copy))
-
-        return search_list
-
     def reprocess_recap_content(self, do_original_xml: bool = False) -> None:
         """Go over any associated RECAP files and reprocess them.
 
@@ -1075,7 +1074,7 @@ class Docket(AbstractDateTimeModel):
         :param do_original_xml: Whether to do the original XML file as received
         from Internet Archive.
         """
-        if self.source not in self.RECAP_SOURCES:
+        if self.source not in self.RECAP_SOURCES():
             return
 
         from cl.lib.pacer import process_docket_data
@@ -1093,7 +1092,9 @@ class Docket(AbstractDateTimeModel):
             )
 
 
-@pghistory.track(AfterUpdateOrDeleteSnapshot(), obj_field=None)
+@pghistory.track(
+    pghistory.InsertEvent(), pghistory.DeleteEvent(), obj_field=None
+)
 class DocketTags(Docket.tags.through):
     """A model class to track docket tags m2m relation"""
 
@@ -1101,7 +1102,9 @@ class DocketTags(Docket.tags.through):
         proxy = True
 
 
-@pghistory.track(AfterUpdateOrDeleteSnapshot(), obj_field=None)
+@pghistory.track(
+    pghistory.InsertEvent(), pghistory.DeleteEvent(), obj_field=None
+)
 class DocketPanel(Docket.panel.through):
     """A model class to track docket panel m2m relation"""
 
@@ -1109,8 +1112,8 @@ class DocketPanel(Docket.panel.through):
         proxy = True
 
 
-@pghistory.track(AfterUpdateOrDeleteSnapshot())
-class DocketEntry(AbstractDateTimeModel):
+@pghistory.track()
+class DocketEntry(AbstractDateTimeModel, CSVExportMixin):
     docket = models.ForeignKey(
         Docket,
         help_text=(
@@ -1205,7 +1208,15 @@ class DocketEntry(AbstractDateTimeModel):
     class Meta:
         verbose_name_plural = "Docket Entries"
         indexes = [
-            models.Index(fields=["recap_sequence_number", "entry_number"])
+            models.Index(
+                fields=["docket_id", "entry_number"],
+                name="entry_number_idx",
+                condition=Q(entry_number=1),
+            ),
+            models.Index(
+                fields=["recap_sequence_number", "entry_number"],
+                name="search_docketentry_recap_sequence_number_1c82e51988e2d89f_idx",
+            ),
         ]
         ordering = ("recap_sequence_number", "entry_number")
         permissions = (("has_recap_api_access", "Can work with RECAP API"),)
@@ -1226,8 +1237,31 @@ class DocketEntry(AbstractDateTimeModel):
             )
         return None
 
+    def get_csv_columns(self, get_column_name=False):
+        columns = [
+            "id",
+            "entry_number",
+            "date_filed",
+            "time_filed",
+            "pacer_sequence_number",
+            "recap_sequence_number",
+            "description",
+        ]
+        if get_column_name:
+            columns = [self.add_class_name(col) for col in columns]
+        return columns
 
-@pghistory.track(AfterUpdateOrDeleteSnapshot(), obj_field=None)
+    def get_column_function(self):
+        """Get dict of attrs: fucntion to apply on field value if it needs
+        to be pre-processed before being add to csv
+
+        returns: dict -- > {attr1: function}"""
+        return {}
+
+
+@pghistory.track(
+    pghistory.InsertEvent(), pghistory.DeleteEvent(), obj_field=None
+)
 class DocketEntryTags(DocketEntry.tags.through):
     """A model class to track docket entry tags m2m relation"""
 
@@ -1262,11 +1296,8 @@ class AbstractPacerDocument(models.Model):
         null=True,
     )
     pacer_doc_id = models.CharField(
-        help_text=(
-            "The ID of the document in PACER. This information is "
-            "provided by RECAP."
-        ),
-        max_length=32,  # Same as in RECAP
+        help_text="The ID of the document in PACER.",
+        max_length=64,  # Increased to support storing docketEntryId from ACMS.
         blank=True,
     )
     is_available = models.BooleanField(
@@ -1289,8 +1320,10 @@ class AbstractPacerDocument(models.Model):
         abstract = True
 
 
-@pghistory.track(AfterUpdateOrDeleteSnapshot())
-class RECAPDocument(AbstractPacerDocument, AbstractPDF, AbstractDateTimeModel):
+@pghistory.track()
+class RECAPDocument(
+    AbstractPacerDocument, AbstractPDF, AbstractDateTimeModel, CSVExportMixin
+):
     """The model for Docket Documents and Attachments."""
 
     PACER_DOCUMENT = 1
@@ -1326,6 +1359,11 @@ class RECAPDocument(AbstractPacerDocument, AbstractPDF, AbstractDateTimeModel):
         ),
         blank=True,
     )
+    acms_document_guid = models.CharField(
+        help_text="The GUID of the document in ACMS.",
+        max_length=64,
+        blank=True,
+    )
 
     es_rd_field_tracker = FieldTracker(
         fields=[
@@ -1355,22 +1393,23 @@ class RECAPDocument(AbstractPacerDocument, AbstractPDF, AbstractDateTimeModel):
                     "document_type",
                     "document_number",
                     "attachment_number",
-                ]
+                ],
+                name="search_recapdocument_document_type_303cccac79571217_idx",
             ),
             models.Index(
                 fields=["filepath_local"],
                 name="search_recapdocument_filepath_local_7dc6b0e53ccf753_uniq",
             ),
+            models.Index(
+                fields=["pacer_doc_id"],
+                name="pacer_doc_id_idx",
+                condition=~Q(pacer_doc_id=""),
+            ),
         ]
         permissions = (("has_recap_api_access", "Can work with RECAP API"),)
 
     def __str__(self) -> str:
-        return "%s: Docket_%s , document_number_%s , attachment_number_%s" % (
-            self.pk,
-            self.docket_entry.docket.docket_number,
-            self.document_number,
-            self.attachment_number,
-        )
+        return f"{self.pk}: Docket_{self.docket_entry.docket.docket_number} , document_number_{self.document_number} , attachment_number_{self.attachment_number}"
 
     def get_absolute_url(self) -> str:
         if not self.document_number:
@@ -1396,6 +1435,40 @@ class RECAPDocument(AbstractPacerDocument, AbstractPDF, AbstractDateTimeModel):
                 },
             )
 
+    def get_authorities_url(self) -> str:
+        if self.document_type == self.ATTACHMENT:
+            return reverse(
+                "view_attachment_authorities",
+                kwargs={
+                    "docket_id": self.docket_entry.docket.pk,
+                    "doc_num": self.document_number,
+                    "att_num": self.attachment_number,
+                    "slug": self.docket_entry.docket.slug,
+                },
+            )
+        else:
+            return reverse(
+                "view_document_authorities",
+                kwargs={
+                    "docket_id": self.docket_entry.docket.pk,
+                    "doc_num": self.document_number,
+                    "slug": self.docket_entry.docket.slug,
+                },
+            )
+
+    def is_acms_document(self) -> bool:
+        """
+        Checks if the document is from ACMS based on the presence of hyphens
+        in the pacer_doc_id.
+
+        ACMS documents are currently the only ones using hyphens in their
+        doc_id.
+
+        :return: True if the doc_id contains more than one hyphen, False
+            otherwise.
+        """
+        return self.pacer_doc_id.count("-") > 1
+
     @property
     def pacer_url(self) -> str | None:
         """Construct a doc1 URL for any item, if we can. Else, return None."""
@@ -1404,7 +1477,13 @@ class RECAPDocument(AbstractPacerDocument, AbstractPDF, AbstractDateTimeModel):
         court = self.docket_entry.docket.court
         court_id = map_cl_to_pacer_id(court.pk)
         if self.pacer_doc_id:
-            if court.jurisdiction == Court.FEDERAL_APPELLATE:
+            if self.is_acms_document():
+                return (
+                    f"https://{court_id}-showdoc.azurewebsites.us/docs/"
+                    f"{self.docket_entry.docket.pacer_case_id}/"
+                    f"{self.pacer_doc_id}"
+                )
+            elif court.jurisdiction == Court.FEDERAL_APPELLATE:
                 template = "https://ecf.%s.uscourts.gov/docs1/%s?caseId=%s"
             else:
                 template = "https://ecf.%s.uscourts.gov/doc1/%s?caseid=%s"
@@ -1449,6 +1528,19 @@ class RECAPDocument(AbstractPacerDocument, AbstractPDF, AbstractDateTimeModel):
             ]
         )
 
+    @property
+    def authority_count(self):
+        return self.cited_opinions.count()
+
+    @property
+    def authorities_with_data(self):
+        """Returns a queryset of this document's authorities for
+        eventual injection into a view template.
+
+        The returned queryset is sorted by the depth field.
+        """
+        return build_authorities_query(self.cited_opinions)
+
     def save(
         self,
         update_fields=None,
@@ -1457,11 +1549,7 @@ class RECAPDocument(AbstractPacerDocument, AbstractPDF, AbstractDateTimeModel):
         *args,
         **kwargs,
     ):
-        if self.document_type == self.ATTACHMENT:
-            if self.attachment_number is None:
-                raise ValidationError(
-                    "attachment_number cannot be null for an attachment."
-                )
+        self.clean()
 
         if self.pacer_doc_id is None:
             # Juriscraper returns these as null values. Instead we want blanks.
@@ -1485,11 +1573,10 @@ class RECAPDocument(AbstractPacerDocument, AbstractPDF, AbstractDateTimeModel):
                     raise ValidationError(
                         "Multiple duplicate values violate save constraint "
                         "and we are unable to fix it automatically for "
-                        "rd: %s" % self.pk
+                        f"rd: {self.pk}"
                     )
-                else:
-                    # Only one duplicate. Attempt auto-resolution.
-                    other = others[0]
+                # Only one duplicate. Attempt auto-resolution.
+                other = others[0]
                 if other.pacer_doc_id == self.pacer_doc_id:
                     # Delete "other"; the new one probably has better data.
                     # Lots of code could be written here to merge "other" into
@@ -1502,28 +1589,20 @@ class RECAPDocument(AbstractPacerDocument, AbstractPDF, AbstractDateTimeModel):
                     raise ValidationError(
                         "Duplicate values violate save constraint and we are "
                         "unable to fix it because the items have different "
-                        "pacer_doc_id values. The rds are %s and %s "
-                        % (self.pk, other.pk)
+                        f"pacer_doc_id values. The rds are {self.pk} and {other.pk} "
                     )
 
         if update_fields is not None:
             update_fields = {"pacer_doc_id"}.union(update_fields)
 
-        super(RECAPDocument, self).save(
-            update_fields=update_fields, *args, **kwargs
-        )
+        super().save(update_fields=update_fields, *args, **kwargs)
         tasks = []
         if do_extraction and self.needs_extraction:
             # Context extraction not done and is requested.
-            from cl.scrapers.tasks import extract_recap_pdf
+            from cl.scrapers.tasks import extract_pdf_document
 
-            tasks.append(extract_recap_pdf.si(self.pk))
-        if index:
-            from cl.search.tasks import add_items_to_solr
+            tasks.append(extract_pdf_document.si(self.pk))
 
-            tasks.append(
-                add_items_to_solr.si([self.pk], "search.RECAPDocument")
-            )
         if len(tasks) > 0:
             chain(*tasks)()
 
@@ -1543,125 +1622,77 @@ class RECAPDocument(AbstractPacerDocument, AbstractPDF, AbstractDateTimeModel):
             **kwargs,
         )
 
-    def delete(self, *args, **kwargs):
+    def clean(self):
         """
-        Note that this doesn't get called when an entire queryset
-        is deleted, but that should be OK.
+        Validate that:
+        - Attachments must have an attachment_number.
+        - Main PACER documents must not have an attachment_number.
         """
-        id_cache = self.pk
-        super(RECAPDocument, self).delete(*args, **kwargs)
-        from cl.search.tasks import delete_items
+        super().clean()
+        is_attachment = self.document_type == self.ATTACHMENT
+        has_attachment_number = self.attachment_number is not None
+        missing_attachment_number = is_attachment and not has_attachment_number
+        wrongly_added_att_num = not is_attachment and has_attachment_number
+        if missing_attachment_number or wrongly_added_att_num:
+            msg = (
+                "attachment_number cannot be null for an attachment."
+                if missing_attachment_number
+                else "attachment_number must be null for a main PACER document."
+            )
+            logger.error(msg)
+            raise ValidationError({"attachment_number": msg})
 
-        delete_items.delay([id_cache], "search.RECAPDocument")
+    def get_csv_columns(self, get_column_name=False):
+        columns = [
+            "id",
+            "document_type",
+            "description",
+            "acms_document_guid",
+            "date_upload",
+            "document_number",
+            "attachment_number",
+            "pacer_doc_id",
+            "is_free_on_pacer",
+            "is_available",
+            "is_sealed",
+            "sha1",
+            "page_count",
+            "file_size",
+            "filepath_local",
+            "filepath_ia",
+            "ocr_status",
+        ]
+        if get_column_name:
+            columns = [self.add_class_name(col) for col in columns]
+        return columns
 
-    def get_docket_metadata(self):
-        """The metadata for the item that comes from the Docket."""
-        docket = self.docket_entry.docket
-        # IDs
-        out = {
-            "docket_id": docket.pk,
-            "court_id": docket.court.pk,
-            "assigned_to_id": getattr(docket.assigned_to, "pk", None),
-            "referred_to_id": getattr(docket.referred_to, "pk", None),
+    def _get_readable_document_type(self, *args, **kwargs):
+        return self.get_document_type_display()
+
+    def _get_readable_ocr_status(self, *args, **kwargs):
+        return self.get_ocr_status_display()
+
+    def _get_full_filepath_local(self, *args, **kwargs):
+        if self.filepath_local:
+            return f"https://storage.courtlistener.com/{self.filepath_local}"
+        return ""
+
+    def get_column_function(self):
+        """Get dict of attrs: function to apply on field value if it needs
+        to be pre-processed before being add to csv
+        If not functions returns empty dict
+
+        returns: dict -- > {attr1: function}"""
+        return {
+            "document_type": self._get_readable_document_type,
+            "ocr_status": self._get_readable_ocr_status,
+            "filepath_local": self._get_full_filepath_local,
         }
 
-        # Docket
-        out.update(
-            {
-                "docketNumber": docket.docket_number,
-                "caseName": best_case_name(docket),
-                "suitNature": docket.nature_of_suit,
-                "cause": docket.cause,
-                "juryDemand": docket.jury_demand,
-                "jurisdictionType": docket.jurisdiction_type,
-            }
-        )
-        if docket.date_argued is not None:
-            out["dateArgued"] = midnight_pt(docket.date_argued)
-        if docket.date_filed is not None:
-            out["dateFiled"] = midnight_pt(docket.date_filed)
-        if docket.date_terminated is not None:
-            out["dateTerminated"] = midnight_pt(docket.date_terminated)
-        try:
-            out["docket_absolute_url"] = docket.get_absolute_url()
-        except NoReverseMatch:
-            raise InvalidDocumentError(
-                f"Unable to save to index due to missing absolute_url: {self.pk}"
-            )
 
-        # Judges
-        if docket.assigned_to is not None:
-            out["assignedTo"] = docket.assigned_to.name_full
-        elif docket.assigned_to_str:
-            out["assignedTo"] = docket.assigned_to_str
-        if docket.referred_to is not None:
-            out["referredTo"] = docket.referred_to.name_full
-        elif docket.referred_to_str:
-            out["referredTo"] = docket.referred_to_str
-
-        # Court
-        out.update(
-            {
-                "court": docket.court.full_name,
-                "court_exact": docket.court_id,  # For faceting
-                "court_citation_string": docket.court.citation_string,
-            }
-        )
-        return out
-
-    def as_search_dict(self, docket_metadata=None):
-        """Create a dict that can be ingested by Solr.
-
-        Search results are presented as Dockets, but they're indexed as
-        RECAPDocument's, which are then grouped back together in search results
-        to form Dockets.
-
-        Since it's common to update an entire docket, there's a shortcut,
-        get_docket_metadata that lets you query that information first and then
-        pass it in as an argument so that it doesn't have to be queried for
-        every RECAPDocument on the docket. This can provide big performance
-        boosts.
-        """
-        out = docket_metadata or self.get_docket_metadata()
-
-        # IDs
-        out.update({"id": self.pk, "docket_entry_id": self.docket_entry.pk})
-
-        # RECAPDocument
-        out.update(
-            {
-                "short_description": self.description,
-                "document_type": self.get_document_type_display(),
-                "document_number": self.document_number or None,
-                "attachment_number": self.attachment_number,
-                "is_available": self.is_available,
-                "page_count": self.page_count,
-            }
-        )
-        if self.filepath_local:
-            out["filepath_local"] = self.filepath_local.name
-
-        try:
-            out["absolute_url"] = self.get_absolute_url()
-        except NoReverseMatch:
-            raise InvalidDocumentError(
-                f"Unable to save to index due to missing absolute_url: {self.pk}"
-            )
-
-        # Docket Entry
-        out["description"] = self.docket_entry.description
-        if self.docket_entry.entry_number is not None:
-            out["entry_number"] = self.docket_entry.entry_number
-        if self.docket_entry.date_filed is not None:
-            out["entry_date_filed"] = midnight_pt(self.docket_entry.date_filed)
-
-        text_template = loader.get_template("indexes/dockets_text.txt")
-        out["text"] = text_template.render({"item": self}).translate(null_map)
-
-        return normalize_search_dicts(out)
-
-
-@pghistory.track(AfterUpdateOrDeleteSnapshot(), obj_field=None)
+@pghistory.track(
+    pghistory.InsertEvent(), pghistory.DeleteEvent(), obj_field=None
+)
 class RECAPDocumentTags(RECAPDocument.tags.through):
     """A model class to track recap document tags m2m relation"""
 
@@ -1669,7 +1700,7 @@ class RECAPDocumentTags(RECAPDocument.tags.through):
         proxy = True
 
 
-@pghistory.track(AfterUpdateOrDeleteSnapshot())
+@pghistory.track()
 class BankruptcyInformation(AbstractDateTimeModel):
     docket = models.OneToOneField(
         Docket,
@@ -1718,7 +1749,7 @@ class BankruptcyInformation(AbstractDateTimeModel):
         return f"Bankruptcy Info for docket {self.docket_id}"
 
 
-@pghistory.track(AfterUpdateOrDeleteSnapshot())
+@pghistory.track()
 class Claim(AbstractDateTimeModel):
     docket = models.ForeignKey(
         Docket,
@@ -1813,27 +1844,24 @@ class Claim(AbstractDateTimeModel):
     )
     description = models.TextField(
         help_text=(
-            "The description of the claim that appears on the claim "
-            "register."
+            "The description of the claim that appears on the claim register."
         ),
         blank=True,
     )
     remarks = models.TextField(
         help_text=(
-            "The remarks of the claim that appear on the claim " "register."
+            "The remarks of the claim that appear on the claim register."
         ),
         blank=True,
     )
 
     def __str__(self) -> str:
-        return "Claim #%s on docket %s with pk %s" % (
-            self.claim_number,
-            self.docket_id,
-            self.pk,
-        )
+        return f"Claim #{self.claim_number} on docket {self.docket_id} with pk {self.pk}"
 
 
-@pghistory.track(AfterUpdateOrDeleteSnapshot(), obj_field=None)
+@pghistory.track(
+    pghistory.InsertEvent(), pghistory.DeleteEvent(), obj_field=None
+)
 class ClaimTags(Claim.tags.through):
     """A model class to track claim tags m2m relation"""
 
@@ -1841,7 +1869,7 @@ class ClaimTags(Claim.tags.through):
         proxy = True
 
 
-@pghistory.track(AfterUpdateOrDeleteSnapshot())
+@pghistory.track()
 class ClaimHistory(AbstractPacerDocument, AbstractPDF, AbstractDateTimeModel):
     DOCKET_ENTRY = 1
     CLAIM_ENTRY = 2
@@ -1861,9 +1889,8 @@ class ClaimHistory(AbstractPacerDocument, AbstractPDF, AbstractDateTimeModel):
     claim_document_type = models.IntegerField(
         help_text=(
             "The type of document that is used in the history row for "
-            "the claim. One of: %s"
-        )
-        % ", ".join([f"{t[0]} ({t[1]})" for t in CLAIM_TYPES]),
+            "the claim. One of: {}"
+        ).format(", ".join([f"{t[0]} ({t[1]})" for t in CLAIM_TYPES])),
         choices=CLAIM_TYPES,
     )
     description = models.TextField(
@@ -1890,7 +1917,7 @@ class ClaimHistory(AbstractPacerDocument, AbstractPDF, AbstractDateTimeModel):
     )
     pacer_case_id = models.CharField(
         help_text=(
-            "The cased ID provided by PACER. Noted in this case on a "
+            "The case ID provided by PACER. Noted in this case on a "
             "per-document-level, since we've learned that some "
             "documents from other cases can appear in curious places."
         ),
@@ -1917,9 +1944,10 @@ class FederalCourtsQuerySet(models.QuerySet):
             )
             | Q(pk__in=["cit", "jpml", "uscfc", "cavc"]),
             end_date__isnull=True,
+            in_use=True,
         ).exclude(pk="scotus")
 
-    def district_pacer_courts(self) -> models.QuerySet:
+    def district_or_bankruptcy_pacer_courts(self) -> models.QuerySet:
         return self.filter(
             Q(
                 jurisdiction__in=[
@@ -1931,13 +1959,14 @@ class FederalCourtsQuerySet(models.QuerySet):
             end_date__isnull=True,
         )
 
-    def appellate_pacer_courts(self) -> models.QuerySet:
+    def appellate_courts(self) -> models.QuerySet:
         return self.filter(
-            Q(jurisdiction=Court.FEDERAL_APPELLATE) |
+            Q(jurisdiction=Court.FEDERAL_APPELLATE)
+            |
             # Court of Appeals for Veterans Claims uses appellate PACER
             Q(pk__in=["cavc"]),
             end_date__isnull=True,
-        ).exclude(pk="scotus")
+        )
 
     def bankruptcy_pacer_courts(self) -> models.QuerySet:
         return self.filter(
@@ -1963,10 +1992,15 @@ class FederalCourtsQuerySet(models.QuerySet):
         return self.filter(jurisdictions__in=Court.MILITARY_JURISDICTIONS)
 
 
-@pghistory.track(AfterUpdateOrDeleteSnapshot())
+@pghistory.track()
 class Court(models.Model):
     """A class to represent some information about each court, can be extended
-    as needed."""
+    as needed.
+
+    Note that a Courthouse object should be created alongside each new Court.
+    Even if this is not enforced by the data model, there is some logic tied
+    to that relation. Examples in `find_citations` and `coverage_utils`
+    """
 
     # Note that spaces cannot be used in the keys, or else the SearchForm won't
     # work
@@ -2170,8 +2204,9 @@ class Court(models.Model):
         null=True,
     )
     jurisdiction = models.CharField(
-        help_text="the jurisdiction of the court, one of: %s"
-        % ", ".join(["%s (%s)" % (t[0], t[1]) for t in JURISDICTIONS]),
+        help_text="the jurisdiction of the court, one of: {}".format(
+            ", ".join(f"{t[0]} ({t[1]})" for t in JURISDICTIONS)
+        ),
         max_length=3,
         choices=JURISDICTIONS,
     )
@@ -2197,7 +2232,9 @@ class Court(models.Model):
         ordering = ["position"]
 
 
-@pghistory.track(AfterUpdateOrDeleteSnapshot(), obj_field=None)
+@pghistory.track(
+    pghistory.InsertEvent(), pghistory.DeleteEvent(), obj_field=None
+)
 class CourtAppealsTo(Court.appeals_to.through):
     """A model class to track court appeals_to m2m relation"""
 
@@ -2205,7 +2242,7 @@ class CourtAppealsTo(Court.appeals_to.through):
         proxy = True
 
 
-@pghistory.track(AfterUpdateOrDeleteSnapshot())
+@pghistory.track()
 class Courthouse(models.Model):
     """A class to represent the physical location of a court."""
 
@@ -2290,6 +2327,7 @@ class ClusterCitationQuerySet(models.query.QuerySet):
                 c = get_citations(
                     citation_str,
                     remove_ambiguous=False,
+                    tokenizer=HYPERSCAN_TOKENIZER,
                 )[0]
             except IndexError:
                 raise ValueError(f"Unable to parse citation '{citation_str}'")
@@ -2307,7 +2345,7 @@ class ClusterCitationQuerySet(models.query.QuerySet):
         return clone
 
 
-@pghistory.track(AfterUpdateOrDeleteSnapshot())
+@pghistory.track()
 class OpinionCluster(AbstractDateTimeModel):
     """A class representing a cluster of court opinions."""
 
@@ -2407,8 +2445,9 @@ class OpinionCluster(AbstractDateTimeModel):
         null=True,
     )
     source = models.CharField(
-        help_text="the source of the cluster, one of: %s"
-        % ", ".join(["%s (%s)" % (t[0], t[1]) for t in SOURCES.NAMES]),
+        help_text="the source of the cluster, one of: {}".format(
+            ", ".join(f"{t[0]} ({t[1]})" for t in SOURCES.NAMES)
+        ),
         max_length=10,
         choices=SOURCES.NAMES,
         blank=True,
@@ -2433,7 +2472,7 @@ class OpinionCluster(AbstractDateTimeModel):
     )
     syllabus = models.TextField(
         help_text=(
-            "A summary of the issues presented in the case and the " "outcome."
+            "A summary of the issues presented in the case and the outcome."
         ),
         blank=True,
     )
@@ -2514,14 +2553,15 @@ class OpinionCluster(AbstractDateTimeModel):
     )
     citation_count = models.IntegerField(
         help_text=(
-            "The number of times this document is cited by other " "opinion"
+            "The number of times this document is cited by other opinion"
         ),
         default=0,
         db_index=True,
     )
     precedential_status = models.CharField(
-        help_text="The precedential status of document, one of: "
-        "%s" % ", ".join([t[0] for t in PRECEDENTIAL_STATUS.NAMES]),
+        help_text="The precedential status of document, one of: {}".format(
+            ", ".join([t[0] for t in PRECEDENTIAL_STATUS.NAMES])
+        ),
         max_length=50,
         blank=True,
         choices=PRECEDENTIAL_STATUS.NAMES,
@@ -2554,6 +2594,12 @@ class OpinionCluster(AbstractDateTimeModel):
         blank=True,
         db_index=True,
     )
+    filepath_pdf_harvard = models.FileField(
+        help_text="The case PDF from the Caselaw Access Project for this cluster",
+        upload_to=make_upload_path,
+        storage=IncrementingAWSMediaStorage(),
+        blank=True,
+    )
     arguments = models.TextField(
         help_text="The attorney(s) and legal arguments presented as HTML text. "
         "This is primarily seen in older opinions and can contain "
@@ -2580,6 +2626,74 @@ class OpinionCluster(AbstractDateTimeModel):
             "precedential_status",
         ]
     )
+    es_o_field_tracker = FieldTracker(
+        fields=[
+            "docket_id",
+            "case_name",
+            "case_name_short",
+            "case_name_full",
+            "date_filed",
+            "judges",
+            "attorneys",
+            "nature_of_suit",
+            "attorneys",
+            "precedential_status",
+            "procedural_history",
+            "posture",
+            "syllabus",
+            "scdb_id",
+            "citation_count",
+            "slug",
+            "source",
+        ]
+    )
+
+    async def acaption(self):
+        """Make a proper caption
+
+        This selects the best case name, then combines it with the best one or
+        two citations we have in our system. Finally, if it's not a SCOTUS
+        opinion, it adds the court abbreviation to the end. The result is
+        something like:
+
+            Plessy v. Ferguson, 410 U.S. 113
+
+        or
+
+            Lenore Foman v. Elvira A. Davis (1st Cir. 1961)
+
+        Note that nbsp; are used liberally to prevent the end from getting
+        broken up across lines.
+        """
+        caption = best_case_name(self)
+        citation_list = [citation async for citation in self.citations.all()]
+        citations = sorted(citation_list, key=sort_cites)
+        if not citations:
+            docket = await Docket.objects.aget(id=self.docket_id)
+            if docket.docket_number:
+                caption += f", {docket.docket_number}"
+        else:
+            if citations[0].type == Citation.NEUTRAL:
+                caption += f", {citations[0]}"
+                # neutral cites lack the parentheses, so we're done here.
+                return caption
+            elif (
+                len(citations) >= 2
+                and citations[0].type == Citation.WEST
+                and citations[1].type == Citation.LEXIS
+            ):
+                caption += f", {citations[0]}, {citations[1]}"
+            else:
+                caption += f", {citations[0]}"
+
+        docket = await sync_to_async(lambda: self.docket)()
+        court = await sync_to_async(lambda: docket.court)()
+        if docket.court_id != "scotus":
+            court = re.sub(" ", "&nbsp;", court.citation_string)
+            # Strftime fails before 1900. Do it this way instead.
+            year = self.date_filed.isoformat().split("-")[0]
+            caption += f"&nbsp;({court}&nbsp;{year})"
+        return caption
 
     @property
     def caption(self):
@@ -2626,9 +2740,39 @@ class OpinionCluster(AbstractDateTimeModel):
         return caption
 
     @property
+    def display_citation(self):
+        """Find favorite citation to display
+
+        Identify the proper or favorite citation(s) to display on the front end
+        but don't wrap it together with a title
+        :return: The citation if applicable
+        """
+        citation_list = [citation for citation in self.citations.all()]
+        citations = sorted(citation_list, key=sort_cites)
+        if not citations:
+            citation = ""
+        elif citations[0].type == Citation.NEUTRAL:
+            citation = citations[0]
+        elif (
+            len(citations) >= 2
+            and citations[0].type == Citation.WEST
+            and citations[1].type == Citation.LEXIS
+        ):
+            citation = f"{citations[0]}, {citations[1]}"
+        else:
+            citation = citations[0]
+        return citation
+
+    @property
     def citation_string(self):
         """Make a citation string, joined by commas"""
         citations = sorted(self.citations.all(), key=sort_cites)
+        return ", ".join(str(c) for c in citations)
+
+    async def acitation_string(self):
+        """Make a citation string, joined by commas"""
+        result = [citation async for citation in self.citations.all()]
+        citations = sorted(result, key=sort_cites)
         return ", ".join(str(c) for c in citations)
 
     @property
@@ -2643,15 +2787,53 @@ class OpinionCluster(AbstractDateTimeModel):
         #    list.
         #  - QuerySets are lazy by default, so we need to call list() on the
         #    queryset object to evaluate it here and now.
-        return OpinionCluster.objects.filter(
-            sub_opinions__in=sum(
-                [
-                    list(sub_opinion.opinions_cited.all().only("pk"))
-                    for sub_opinion in self.sub_opinions.all()
-                ],
-                [],
+        #  - We explicitly exclude self (self.pk) from the results to avoid
+        #    a cluster being listed as its own authority.
+        return (
+            OpinionCluster.objects.filter(
+                sub_opinions__in=sum(
+                    [
+                        list(sub_opinion.opinions_cited.all().only("pk"))
+                        for sub_opinion in self.sub_opinions.all()
+                    ],
+                    [],
+                )
             )
-        ).order_by("-citation_count", "-date_filed")
+            .exclude(pk=self.pk)
+            .order_by("-citation_count", "-date_filed")
+        )
+
+    async def aauthorities(self):
+        """Returns a queryset that can be used for querying and caching
+        authorities.
+        """
+        # All clusters that have sub_opinions cited by the sub_opinions of
+        # the current cluster, ordered by citation count, descending.
+        # Note that:
+        #  - sum()'ing an empty list with a nested one, flattens the nested
+        #    list.
+        #  - QuerySets are lazy by default, so we need to call list() on the
+        #    queryset object to evaluate it here and now.
+        #  - We explicitly exclude self (self.pk) from the results to avoid
+        #    a cluster being listed as its own authority.
+        return (
+            OpinionCluster.objects.filter(
+                sub_opinions__in=sum(
+                    [
+                        [
+                            i
+                            async for i in sub_opinion.opinions_cited.all().only(
+                                "pk"
+                            )
+                        ]
+                        async for sub_opinion in self.sub_opinions.all()
+                    ],
+                    [],
+                )
+            )
+            .exclude(pk=self.pk)
+            .order_by("-citation_count", "-date_filed")
+        )
 
     @property
     def parentheticals(self):
@@ -2671,6 +2853,10 @@ class OpinionCluster(AbstractDateTimeModel):
     def authority_count(self):
         return self.authorities.count()
 
+    async def aauthority_count(self):
+        authorities = await self.aauthorities()
+        return await authorities.acount()
+
     @property
     def has_private_authority(self):
         if not hasattr(self, "_has_private_authority"):
@@ -2683,18 +2869,37 @@ class OpinionCluster(AbstractDateTimeModel):
             self._has_private_authority = private
         return self._has_private_authority
 
-    @property
-    def authorities_with_data(self):
+    async def ahas_private_authority(self):
+        if not hasattr(self, "_has_private_authority"):
+            # Calculate it, then cache it.
+            private = False
+            async for authority in await self.aauthorities():
+                if authority.blocked:
+                    private = True
+                    break
+            self._has_private_authority = private
+        return self._has_private_authority
+
+    async def aauthorities_with_data(self):
         """Returns a list of this cluster's authorities with an extra field
         appended related to citation counts, for eventual injection into a
         view template.
         The returned list is sorted by that citation count field.
         """
-        authorities_with_data = list(self.authorities)
-        for authority in authorities_with_data:
-            authority.citation_depth = get_citation_depth_between_clusters(
-                citing_cluster_pk=self.pk, cited_cluster_pk=authority.pk
+        authorities_with_data = []
+        authorities_base = await self.aauthorities()
+        authorities_qs = (
+            authorities_base.prefetch_related("citations")
+            .select_related("docket__court")
+            .order_by("-citation_count", "-date_filed")
+        )
+        async for authority in authorities_qs:
+            authority.citation_depth = (
+                await get_citation_depth_between_clusters(
+                    citing_cluster_pk=self.pk, cited_cluster_pk=authority.pk
+                )
             )
+            authorities_with_data.append(authority)
 
         authorities_with_data.sort(
             key=lambda x: x.citation_depth, reverse=True
@@ -2715,146 +2920,48 @@ class OpinionCluster(AbstractDateTimeModel):
     def get_absolute_url(self) -> str:
         return reverse("view_case", args=[self.pk, self.slug])
 
+    @cached_property
+    def ordered_opinions(self):
+        # Fetch all sub-opinions ordered by ordering_key
+        sub_opinions = self.sub_opinions.all().order_by("ordering_key")
+        if self.sub_opinions.filter(main_version__isnull=False).exists():
+            sub_opinions = sub_opinions.filter(main_version__isnull=True)
+
+        # Check if there is more than one sub-opinion
+        if sub_opinions.count() > 1:
+            # Return only sub-opinions with an ordering key
+            return sub_opinions.exclude(ordering_key__isnull=True)
+
+        # If there's only one or no sub-opinions, return the main opinion
+        return sub_opinions
+
     def save(
         self,
         update_fields=None,
-        index=True,
-        force_commit=False,
         *args,
         **kwargs,
     ):
         self.slug = slugify(trunc(best_case_name(self), 75))
         if update_fields is not None:
             update_fields = {"slug"}.union(update_fields)
-        super(OpinionCluster, self).save(
-            update_fields=update_fields, *args, **kwargs
+        super().save(update_fields=update_fields, *args, **kwargs)
+
+    async def asave(
+        self,
+        update_fields=None,
+        *args,
+        **kwargs,
+    ):
+        return await sync_to_async(self.save)(
+            update_fields=update_fields,
+            *args,
+            **kwargs,
         )
-        if index:
-            from cl.search.tasks import add_items_to_solr
-
-            add_items_to_solr.delay(
-                [self.pk], "search.OpinionCluster", force_commit
-            )
-
-    def delete(self, *args, **kwargs):
-        """
-        Note that this doesn't get called when an entire queryset
-        is deleted, but that should be OK.
-        """
-        id_cache = self.pk
-        super(OpinionCluster, self).delete(*args, **kwargs)
-        from cl.search.tasks import delete_items
-
-        delete_items.delay([id_cache], "search.Opinion")
-
-    def as_search_list(self):
-        # IDs
-        out = {}
-
-        # Court
-        court = {
-            "court_id": self.docket.court.pk,
-            "court": self.docket.court.full_name,
-            "court_citation_string": self.docket.court.citation_string,
-            "court_exact": self.docket.court_id,
-        }
-        out.update(court)
-
-        # Docket
-        docket = {
-            "docket_id": self.docket_id,
-            "docketNumber": self.docket.docket_number,
-        }
-        if self.docket.date_argued is not None:
-            docket["dateArgued"] = midnight_pt(self.docket.date_argued)
-        if self.docket.date_reargued is not None:
-            docket["dateReargued"] = midnight_pt(self.docket.date_reargued)
-        if self.docket.date_reargument_denied is not None:
-            docket["dateReargumentDenied"] = midnight_pt(
-                self.docket.date_reargument_denied
-            )
-        out.update(docket)
-
-        # Cluster
-        out.update(
-            {
-                "cluster_id": self.pk,
-                "caseName": best_case_name(self),
-                "caseNameShort": self.case_name_short,
-                "panel_ids": [judge.pk for judge in self.panel.all()],
-                "non_participating_judge_ids": [
-                    judge.pk for judge in self.non_participating_judges.all()
-                ],
-                "judge": self.judges,
-                "citation": [str(cite) for cite in self.citations.all()],
-                "scdb_id": self.scdb_id,
-                "source": self.source,
-                "attorney": self.attorneys,
-                "suitNature": self.nature_of_suit,
-                "citeCount": self.citation_count,
-                "status": self.get_precedential_status_display(),
-                "status_exact": self.get_precedential_status_display(),
-                "sibling_ids": [
-                    sibling.pk for sibling in self.sub_opinions.all()
-                ],
-            }
-        )
-        try:
-            out["lexisCite"] = str(
-                self.citations.filter(type=Citation.LEXIS)[0]
-            )
-        except IndexError:
-            pass
-        try:
-            out["neutralCite"] = str(
-                self.citations.filter(type=Citation.NEUTRAL)[0]
-            )
-        except IndexError:
-            pass
-
-        if self.date_filed is not None:
-            out["dateFiled"] = midnight_pt(self.date_filed)
-        try:
-            out["absolute_url"] = self.get_absolute_url()
-        except NoReverseMatch:
-            raise InvalidDocumentError(
-                "Unable to save to index due to missing absolute_url "
-                "(court_id: %s, item.pk: %s). Might the court have in_use set "
-                "to False?" % (self.docket.court_id, self.pk)
-            )
-
-        # Opinion
-        search_list = []
-        text_template = loader.get_template("indexes/opinion_text.txt")
-        for opinion in self.sub_opinions.all():
-            # Always make a copy to get a fresh version above metadata. Failure
-            # to do this pushes metadata from previous iterations to objects
-            # where it doesn't belong.
-            out_copy = out.copy()
-            out_copy.update(
-                {
-                    "id": opinion.pk,
-                    "cites": [o.pk for o in opinion.opinions_cited.all()],
-                    "author_id": getattr(opinion.author, "pk", None),
-                    "joined_by_ids": [j.pk for j in opinion.joined_by.all()],
-                    "type": opinion.type,
-                    "download_url": opinion.download_url or None,
-                    "local_path": deepgetattr(self, "local_path.name", None),
-                    "text": text_template.render(
-                        {
-                            "item": opinion,
-                            "citation_string": self.citation_string,
-                        }
-                    ).translate(null_map),
-                }
-            )
-
-            search_list.append(normalize_search_dicts(out_copy))
-
-        return search_list
 
 
-@pghistory.track(AfterUpdateOrDeleteSnapshot(), obj_field=None)
+@pghistory.track(
+    pghistory.InsertEvent(), pghistory.DeleteEvent(), obj_field=None
+)
 class OpinionClusterPanel(OpinionCluster.panel.through):
     """A model class to track opinion cluster panel m2m relation"""
 
@@ -2862,7 +2969,9 @@ class OpinionClusterPanel(OpinionCluster.panel.through):
         proxy = True
 
 
-@pghistory.track(AfterUpdateOrDeleteSnapshot(), obj_field=None)
+@pghistory.track(
+    pghistory.InsertEvent(), pghistory.DeleteEvent(), obj_field=None
+)
 class OpinionClusterNonParticipatingJudges(
     OpinionCluster.non_participating_judges.through
 ):
@@ -2873,8 +2982,7 @@ class OpinionClusterNonParticipatingJudges(
         proxy = True
 
 
-@pghistory.track(AfterUpdateOrDeleteSnapshot())
-class Citation(models.Model):
+class BaseCitation(models.Model):
     """A simple class to hold citations."""
 
     FEDERAL = 1
@@ -2885,6 +2993,7 @@ class Citation(models.Model):
     LEXIS = 6
     WEST = 7
     NEUTRAL = 8
+    JOURNAL = 9
     CITATION_TYPES = (
         (FEDERAL, "A federal reporter citation (e.g. 5 F. 55)"),
         (
@@ -2906,14 +3015,14 @@ class Citation(models.Model):
         (LEXIS, "A citation in the Lexis system (e.g. 5 LEXIS 55)"),
         (WEST, "A citation in the WestLaw system (e.g. 5 WL 55)"),
         (NEUTRAL, "A vendor neutral citation (e.g. 2013 FL 1)"),
+        (
+            JOURNAL,
+            "A law journal citation within a scholarly or professional "
+            "legal periodical (e.g. 95 Yale L.J. 5; "
+            "72 Soc.Sec.Rep.Serv. 318)",
+        ),
     )
-    cluster = models.ForeignKey(
-        OpinionCluster,
-        help_text="The cluster that the citation applies to",
-        related_name="citations",
-        on_delete=models.CASCADE,
-    )
-    volume = models.SmallIntegerField(help_text="The volume of the reporter")
+    volume = models.TextField(help_text="The volume of the reporter")
     reporter = models.TextField(
         help_text="The abbreviation for the reporter",
         # To generate lists of volumes for a reporter we need everything in a
@@ -2933,9 +3042,24 @@ class Citation(models.Model):
         help_text="The type of citation that this is.", choices=CITATION_TYPES
     )
 
+    class Meta:
+        abstract = True
+
     def __str__(self) -> str:
         # Note this representation is used in the front end.
         return "{volume} {reporter} {page}".format(**self.__dict__)
+
+
+@pghistory.track()
+class Citation(BaseCitation, AbstractDateTimeModel):
+    """A citation to an OpinionCluster"""
+
+    cluster = models.ForeignKey(
+        OpinionCluster,
+        help_text="The cluster that the citation applies to",
+        related_name="citations",
+        on_delete=models.CASCADE,
+    )
 
     def get_absolute_url(self) -> str:
         return self.cluster.get_absolute_url()
@@ -2943,9 +3067,15 @@ class Citation(models.Model):
     class Meta:
         indexes = [
             # To look up individual citations
-            models.Index(fields=["volume", "reporter", "page"]),
+            models.Index(
+                fields=["volume", "reporter", "page"],
+                name="search_citation_volume_ae340b5b02e8912_idx",
+            ),
             # To generate reporter volume lists
-            models.Index(fields=["volume", "reporter"]),
+            models.Index(
+                fields=["volume", "reporter"],
+                name="search_citation_volume_251bc1d270a8abee_idx",
+            ),
         ]
         unique_together = (("cluster", "volume", "reporter", "page"),)
 
@@ -2994,7 +3124,67 @@ def sort_cites(c):
         return 8
 
 
-@pghistory.track(AfterUpdateOrDeleteSnapshot())
+OPINION_TEXT_SOURCE_FIELDS = [
+    "html_with_citations",
+    "xml_harvard",
+    "html_columbia",
+    "html_lawbox",
+    "html_anon_2020",
+    "html",
+]
+
+
+class OpinionQuerySet(models.QuerySet):
+    def with_best_text(self):
+        """Annotates an Opinion QuerySet with best_text and best_text_source.
+
+        To determine the best text, we get the first non-empty value from
+        various source fields, prioritizing HTML formats with citations
+        over plain text.
+
+        The best_text_source is a CharField that indicates
+        the name of the field from which the best_text was retrieved.
+
+        The supported source fields are:
+            - html_with_citations (preferred)
+            - xml_harvard
+            - html_columbia
+            - html_lawbox
+            - html_anon_2020
+            - html
+        """
+        source_fields = OPINION_TEXT_SOURCE_FIELDS
+        # To populate best_text we get the first non-empty value
+        # from the list of possible text sources:
+        coalesce_args = [
+            NullIf(F(field), Value("")) for field in source_fields
+        ]
+        # And we fall back to plain_text if all of the above are empty:
+        coalesce_args.append(F("plain_text"))
+
+        # We use When clauses to determine the name of the field that was used
+        # as the source for the best text:
+        when_clauses = [
+            When(
+                Q(**{f"{field}__isnull": False}) & ~Q(**{field: ""}),
+                then=Value(field),
+            )
+            for field in source_fields
+        ]
+
+        deferred_fields = source_fields + ["plain_text"]
+
+        return self.defer(*deferred_fields).annotate(
+            best_text=Coalesce(*coalesce_args, output_field=CharField()),
+            best_text_source=Case(
+                *when_clauses,
+                default=Value("plain_text"),
+                output_field=CharField(),
+            ),
+        )
+
+
+@pghistory.track(exclude=["html_with_citations"])
 class Opinion(AbstractDateTimeModel):
     COMBINED = "010combined"
     UNANIMOUS = "015unamimous"
@@ -3008,6 +3198,7 @@ class Opinion(AbstractDateTimeModel):
     REHEARING = "070rehearing"
     ON_THE_MERITS = "080onthemerits"
     ON_MOTION_TO_STRIKE = "090onmotiontostrike"
+    TRIAL_COURT = "100trialcourt"
     OPINION_TYPES = (
         (COMBINED, "Combined Opinion"),
         (UNANIMOUS, "Unanimous Opinion"),
@@ -3021,6 +3212,7 @@ class Opinion(AbstractDateTimeModel):
         (REHEARING, "Rehearing"),
         (ON_THE_MERITS, "On the Merits"),
         (ON_MOTION_TO_STRIKE, "On Motion to Strike Cost Bill"),
+        (TRIAL_COURT, "Trial Court Document"),
     )
     cluster = models.ForeignKey(
         OpinionCluster,
@@ -3061,14 +3253,13 @@ class Opinion(AbstractDateTimeModel):
         "people_db.Person",
         related_name="opinions_joined",
         help_text=(
-            "Other judges that joined the primary author " "in this opinion"
+            "Other judges that joined the primary author in this opinion"
         ),
         blank=True,
     )
     joined_by_str = models.TextField(
         help_text=(
-            "Other judges that joined the primary author "
-            "in this opinion str"
+            "Other judges that joined the primary author in this opinion str"
         ),
         blank=True,
     )
@@ -3101,7 +3292,7 @@ class Opinion(AbstractDateTimeModel):
     )
     local_path = models.FileField(
         help_text=(
-            f"The location in AWS S3 where the original opinion file is "
+            "The location in AWS S3 where the original opinion file is "
             f"stored. {s3_warning_note}"
         ),
         upload_to=make_upload_path,
@@ -3148,11 +3339,76 @@ class Opinion(AbstractDateTimeModel):
     es_pa_field_tracker = FieldTracker(
         fields=["extracted_by_ocr", "cluster_id", "author_id"]
     )
+    es_o_field_tracker = FieldTracker(
+        fields=[
+            "cluster_id",
+            "author_id",
+            "type",
+            "per_curiam",
+            "download_url",
+            "local_path",
+            "html_columbia",
+            "html_lawbox",
+            "xml_harvard",
+            "html_anon_2020",
+            "html",
+            "plain_text",
+            "html_with_citations",
+            "sha1",
+            "ordering_key",
+        ]
+    )
+    ordering_key = models.IntegerField(null=True, blank=True)
+    main_version = models.ForeignKey(
+        "self",
+        help_text="The id of another Opinion which is the updated or final version of this opinion",
+        null=True,
+        on_delete=models.SET_NULL,
+        related_name="versions",
+    )
+
+    objects = OpinionQuerySet.as_manager()
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["cluster_id", "ordering_key"],
+                name="unique_opinion_ordering_key",
+            )
+        ]
 
     @property
     def siblings(self) -> QuerySet:
         # These are other sub-opinions of the current cluster.
         return self.cluster.sub_opinions
+
+    @property
+    def clean_text(self) -> str:
+        """
+        Returns the cleaned opinion text by using the annotated `best_text`
+        if it exists; otherwise, it falls back to computing the value in Python.
+
+        The retrieved text is then cleaned using the `nh3.clean`. This cleaning
+        process removes all HTML tags while preserving the content.
+
+        The annotated field `best_text` is added when calling the QuerySet
+        using with_best_text like so:
+        Opinion.objects.filter(something_here=foo).with_best_text()
+        """
+        if hasattr(self, "best_text"):
+            return nh3.clean(self.best_text, tags=set())
+
+        for field in OPINION_TEXT_SOURCE_FIELDS:
+            value = getattr(self, field, None)
+            if value and value.strip():
+                return nh3.clean(value, tags=set())
+
+        return nh3.clean(self.plain_text, tags=set())
+
+    @property
+    def token_count(self) -> int:
+        """Returns the number of tokens in this opinion text."""
+        return get_token_count_from_string(self.clean_text)
 
     def __str__(self) -> str:
         try:
@@ -3166,123 +3422,23 @@ class Opinion(AbstractDateTimeModel):
     def clean(self) -> None:
         if self.type == "":
             raise ValidationError("'type' is a required field.")
+        if isinstance(self.ordering_key, int) and self.ordering_key < 1:
+            raise ValidationError(
+                {"ordering_key": "Ordering key cannot be zero or negative"}
+            )
 
     def save(
         self,
-        index: bool = True,
-        force_commit: bool = False,
-        *args: List,
-        **kwargs: Dict,
+        *args: list,
+        **kwargs: dict,
     ) -> None:
-        super(Opinion, self).save(*args, **kwargs)
-        if index:
-            from cl.search.tasks import add_items_to_solr
-
-            add_items_to_solr.delay([self.pk], "search.Opinion", force_commit)
-
-    def as_search_dict(self) -> Dict[str, Any]:
-        """Create a dict that can be ingested by Solr."""
-        # IDs
-        out = {
-            "id": self.pk,
-            "docket_id": self.cluster.docket.pk,
-            "cluster_id": self.cluster.pk,
-            "court_id": self.cluster.docket.court.pk,
-        }
-
-        # Opinion
-        out.update(
-            {
-                "cites": [opinion.pk for opinion in self.opinions_cited.all()],
-                "author_id": getattr(self.author, "pk", None),
-                # 'per_curiam': self.per_curiam,
-                "joined_by_ids": [judge.pk for judge in self.joined_by.all()],
-                "type": self.type,
-                "download_url": self.download_url or None,
-                "local_path": deepgetattr(self, "local_path.name", None),
-            }
-        )
-
-        # Cluster
-        out.update(
-            {
-                "caseName": best_case_name(self.cluster),
-                "caseNameShort": self.cluster.case_name_short,
-                "sibling_ids": [sibling.pk for sibling in self.siblings.all()],
-                "panel_ids": [judge.pk for judge in self.cluster.panel.all()],
-                "non_participating_judge_ids": [
-                    judge.pk
-                    for judge in self.cluster.non_participating_judges.all()
-                ],
-                "judge": self.cluster.judges,
-                "citation": [
-                    str(cite) for cite in self.cluster.citations.all()
-                ],
-                "scdb_id": self.cluster.scdb_id,
-                "source": self.cluster.source,
-                "attorney": self.cluster.attorneys,
-                "suitNature": self.cluster.nature_of_suit,
-                "citeCount": self.cluster.citation_count,
-                "status": self.cluster.get_precedential_status_display(),
-                "status_exact": self.cluster.get_precedential_status_display(),
-            }
-        )
-        try:
-            out["lexisCite"] = str(
-                self.cluster.citations.filter(type=Citation.LEXIS)[0]
-            )
-        except IndexError:
-            pass
-
-        try:
-            out["neutralCite"] = str(
-                self.cluster.citations.filter(type=Citation.NEUTRAL)[0]
-            )
-        except IndexError:
-            pass
-
-        if self.cluster.date_filed is not None:
-            out["dateFiled"] = midnight_pt(self.cluster.date_filed)
-        try:
-            out["absolute_url"] = self.cluster.get_absolute_url()
-        except NoReverseMatch:
-            raise InvalidDocumentError(
-                "Unable to save to index due to missing absolute_url "
-                "(court_id: %s, item.pk: %s). Might the court have in_use set "
-                "to False?" % (self.cluster.docket.court_id, self.pk)
-            )
-
-        # Docket
-        docket = {"docketNumber": self.cluster.docket.docket_number}
-        if self.cluster.docket.date_argued is not None:
-            docket["dateArgued"] = midnight_pt(self.cluster.docket.date_argued)
-        if self.cluster.docket.date_reargued is not None:
-            docket["dateReargued"] = midnight_pt(
-                self.cluster.docket.date_reargued
-            )
-        if self.cluster.docket.date_reargument_denied is not None:
-            docket["dateReargumentDenied"] = midnight_pt(
-                self.cluster.docket.date_reargument_denied
-            )
-        out.update(docket)
-
-        court = {
-            "court": self.cluster.docket.court.full_name,
-            "court_citation_string": self.cluster.docket.court.citation_string,
-            "court_exact": self.cluster.docket.court_id,  # For faceting
-        }
-        out.update(court)
-
-        # Load the document text using a template for cleanup and concatenation
-        text_template = loader.get_template("indexes/opinion_text.txt")
-        out["text"] = text_template.render(
-            {"item": self, "citation_string": self.cluster.citation_string}
-        ).translate(null_map)
-
-        return normalize_search_dicts(out)
+        self.clean()
+        super().save(*args, **kwargs)
 
 
-@pghistory.track(AfterUpdateOrDeleteSnapshot(), obj_field=None)
+@pghistory.track(
+    pghistory.InsertEvent(), pghistory.DeleteEvent(), obj_field=None
+)
 class OpinionJoinedBy(Opinion.joined_by.through):
     """A model class to track opinion joined_by m2m relation"""
 
@@ -3340,6 +3496,85 @@ class OpinionsCitedByRECAPDocument(models.Model):
         verbose_name_plural = "Opinions cited by RECAP document"
         unique_together = ("citing_document", "cited_opinion")
         indexes = [models.Index(fields=["depth"])]
+
+
+def build_authority_opinions_query(
+    base_queryset: QuerySet[Opinion],
+) -> QuerySet[Opinion]:
+    """Annotates a queryset of Opinions and optimizes related queries.
+
+    The annotated queryset includes the number of filings (total number of
+    RECAPDocuments that cite each opinion) and the total depth (total
+    number of references across documents).
+    """
+    return (
+        base_queryset.select_related("cluster__docket__court")
+        .prefetch_related(
+            "cluster__citations",
+            "citing_documents",
+            Prefetch(
+                "cluster__sub_opinions",
+                queryset=Opinion.objects.only("pk", "cluster_id"),
+            ),
+        )
+        .annotate(
+            num_filings=Count(
+                "citing_documents__citing_document", distinct=True
+            ),
+            total_depth=Sum("citing_documents__depth"),
+        )
+        .only(
+            "cluster__id",
+            "cluster__blocked",
+            "cluster__case_name",
+            "cluster__case_name_full",
+            "cluster__case_name_short",
+            "cluster__docket_id",
+            "cluster__docket__court__full_name",
+            "cluster__docket__docket_number",
+            "cluster__docket__court_id",
+            "cluster__docket__court__citation_string",
+            "cluster__slug",
+            "cluster__citation_count",
+            "cluster__docket_id",
+            "cluster__date_filed",
+        )
+        .order_by("-num_filings", "-total_depth")
+    )
+
+
+def build_authorities_query(
+    base_queryset: QuerySet[OpinionsCitedByRECAPDocument],
+) -> QuerySet[OpinionsCitedByRECAPDocument]:
+    """
+    Optimizes the authorities query by applying select_related, prefetch_related,
+    and selecting only the relevant fields to display the list of citations
+
+    Args:
+        base_queryset (QuerySet[OpinionsCitedByRECAPDocument]): The queryset to optimize
+    """
+    return (
+        base_queryset.select_related("cited_opinion__cluster__docket__court")
+        .prefetch_related(
+            "cited_opinion__cluster__citations",
+        )
+        .only(
+            "depth",
+            "citing_document_id",
+            "cited_opinion__cluster__slug",
+            "cited_opinion__cluster__case_name",
+            "cited_opinion__cluster__case_name_full",
+            "cited_opinion__cluster__case_name_short",
+            "cited_opinion__cluster__citation_count",
+            "cited_opinion__cluster__docket_id",
+            "cited_opinion__cluster__date_filed",
+            "cited_opinion__cluster__docket__docket_number",
+            "cited_opinion__cluster__docket__court_id",
+            "cited_opinion__cluster__docket__court__citation_string",
+            "cited_opinion__cluster__docket__court__full_name",
+        )
+        .order_by("-depth")
+    )
 
 
 class Parenthetical(models.Model):
@@ -3428,7 +3663,7 @@ class ParentheticalGroup(models.Model):
 TaggableType = TypeVar("TaggableType", Docket, DocketEntry, RECAPDocument)
 
 
-@pghistory.track(AfterUpdateOrDeleteSnapshot())
+@pghistory.track()
 class Tag(AbstractDateTimeModel):
     name = models.CharField(
         help_text="The name of the tag.",
@@ -3440,7 +3675,7 @@ class Tag(AbstractDateTimeModel):
     def __str__(self) -> str:
         return f"{self.pk}: {self.name}"
 
-    def tag_object(self, thing: TaggableType) -> Tuple["Tag", bool]:
+    def tag_object(self, thing: TaggableType) -> tuple["Tag", bool]:
         """Atomically add a tag to an item.
 
         Django has a system for adding to a m2m relationship like the ones
@@ -3461,19 +3696,19 @@ class Tag(AbstractDateTimeModel):
         wish to tag.
         :return: A tuple with the tag and whether a new item was created
         """
-        if type(thing) == Docket:
+        if isinstance(thing, Docket):
             return self.dockets.through.objects.get_or_create(
                 docket_id=thing.pk, tag_id=self.pk
             )
-        elif type(thing) == DocketEntry:
+        elif isinstance(thing, DocketEntry):
             return self.docket_entries.through.objects.get_or_create(
                 docketentry_id=thing.pk, tag_id=self.pk
             )
-        elif type(thing) == RECAPDocument:
+        elif isinstance(thing, RECAPDocument):
             return self.recap_documents.through.objects.get_or_create(
                 recapdocument_id=thing.pk, tag_id=self.pk
             )
-        elif type(thing) == Claim:
+        elif isinstance(thing, Claim):
             return self.claims.through.objects.get_or_create(
                 claim_id=thing.pk, tag_id=self.pk
             )
@@ -3521,6 +3756,7 @@ class SEARCH_TYPES:
     OPINION = "o"
     RECAP = "r"
     DOCKETS = "d"
+    RECAP_DOCUMENT = "rd"
     ORAL_ARGUMENT = "oa"
     PEOPLE = "p"
     PARENTHETICAL = "pa"
@@ -3528,8 +3764,378 @@ class SEARCH_TYPES:
         (OPINION, "Opinions"),
         (RECAP, "RECAP"),
         (DOCKETS, "RECAP Dockets"),
+        (RECAP_DOCUMENT, "RECAP Documents"),
         (ORAL_ARGUMENT, "Oral Arguments"),
         (PEOPLE, "People"),
         (PARENTHETICAL, "Parenthetical"),
     )
     ALL_TYPES = [OPINION, RECAP, ORAL_ARGUMENT, PEOPLE]
+    SUPPORTED_ALERT_TYPES = (
+        (OPINION, "Opinions"),
+        (RECAP, "RECAP"),
+        (DOCKETS, "RECAP Dockets"),
+        (ORAL_ARGUMENT, "Oral Arguments"),
+    )
+    RECAP_ALERT_TYPES = (
+        (RECAP, "RECAP"),
+        (DOCKETS, "RECAP Dockets"),
+    )
+
+
+class SearchQuery(models.Model):
+    WEBSITE = 1
+    API = 2
+    SOURCES = (
+        (WEBSITE, "Website"),
+        (API, "API request"),
+    )
+    ELASTICSEARCH = 1
+    SOLR = 2
+    ENGINES = (
+        (ELASTICSEARCH, "Elasticsearch"),
+        (SOLR, "Solr"),
+    )
+    KEYWORD = 1
+    SEMANTIC = 2
+    QUERY_MODES = (
+        (KEYWORD, "Keyword"),
+        (SEMANTIC, "Semantic"),
+    )
+    user = models.ForeignKey(
+        User,
+        help_text="The user who performed this search query.",
+        related_name="search_queries",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+    )
+    source = models.SmallIntegerField(
+        help_text="The interface used to perform the query.", choices=SOURCES
+    )
+    get_params = models.TextField(
+        help_text="The GET parameters of the search query."
+    )
+    query_time_ms = models.IntegerField(
+        help_text="The milliseconds to execute the query, as returned in "
+        "the ElasticSearch or Solr response.",
+        null=True,
+    )
+    hit_cache = models.BooleanField(
+        help_text="Whether the query hit the cache or not."
+    )
+    failed = models.BooleanField(
+        help_text="True if there was an error executing the query."
+    )
+    engine = models.SmallIntegerField(
+        help_text="The engine that executed the search", choices=ENGINES
+    )
+    query_mode = models.SmallIntegerField(
+        help_text="Whether the query used keyword or semantic search.",
+        choices=QUERY_MODES,
+        default=KEYWORD,
+    )
+    date_created = models.DateTimeField(
+        help_text="Datetime when the record was created.",
+        auto_now_add=True,
+    )
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["date_created"]),
+        ]
+        verbose_name_plural = "Search Queries"
+
+
+class ClusterRedirection(models.Model):
+    """Model to prevent dead /opinion/ links"""
+
+    VERSION = 1
+    DUPLICATE = 2
+    CONSOLIDATION = 3
+    SEALED = 4
+    REDIRECTION_REASON = (
+        (
+            VERSION,
+            "Cluster replaced by a newer version of the same opinion",
+        ),
+        (DUPLICATE, "Cluster removed as a duplicate"),
+        (
+            CONSOLIDATION,
+            "Spread opinions were consolidated in a single cluster (e.g., a dissent opinion added to a cluster containing the majority opinion)",
+        ),
+        (SEALED, "Cluster removed by court order"),
+    )
+    date_created = models.DateTimeField(
+        help_text="Datetime when the record was created.",
+        auto_now_add=True,
+    )
+    deleted_cluster_id = models.IntegerField(unique=True)
+    cluster = models.ForeignKey(
+        OpinionCluster,
+        help_text="The existing cluster the deleted clusters now point to",
+        related_name="merged_clusters",
+        # if a cluster with `merged_cluster` is to be deleted, it will raise
+        # an IntegrityError. User should assign a different cluster before
+        # deleting the current cluster
+        on_delete=models.DO_NOTHING,
+        # need null values for SEALED opinions
+        null=True,
+    )
+    reason = models.SmallIntegerField(
+        help_text="The reason why the old cluster was deleted",
+        choices=REDIRECTION_REASON,
+    )
+
+    @classmethod
+    def create_from_clusters(
+        cls,
+        cluster_to_keep: OpinionCluster,
+        cluster_to_delete: OpinionCluster,
+        reason: int,
+    ):
+        """Create a ClusterRedirection entry from two OpinionCluster objects
+
+        Accounts for redirections pointing to the cluster to delete
+        Deletion of the `cluster_to_delete` is left to the caller
+
+        :param cluster_to_keep: the redirection will point to this cluster
+        :param cluster_to_delete: this id will go into deleted_cluster_id
+        :param reason: one of ClusterRedirection.REDIRECTION_REASON
+        """
+        if reason not in [i[0] for i in cls.REDIRECTION_REASON]:
+            raise ValueError("Invalid value for `ClusterRedirection.reason`")
+
+        with transaction.atomic():
+            # the cluster to delete has ClusterRedirection entries pointing to
+            # it, make them point to the new cluster to keep
+            if cluster_to_delete.merged_clusters.exists():
+                cluster_to_delete.merged_clusters.update(
+                    cluster=cluster_to_keep
+                )
+
+            ClusterRedirection.objects.get_or_create(
+                deleted_cluster_id=cluster_to_delete.id,
+                cluster=cluster_to_keep,
+                reason=reason,
+            )
+
+
+@pghistory.track()
+class ScotusDocketMetadata(AbstractDateTimeModel):
+    """Supreme Court-specific metadata associated with a docket.
+
+    These fields capture information that only applies to SCOTUS cases, so we
+    keep them in a separate model instead of adding them directly to the Docket
+    namespace.
+    """
+
+    docket = models.OneToOneField(
+        "search.Docket",
+        help_text="The docket this SCOTUS metadata applies to.",
+        related_name="scotus_metadata",
+        on_delete=models.CASCADE,
+    )
+    capital_case = models.BooleanField(
+        help_text="Whether this SCOTUS case is a capital case.",
+        default=False,
+    )
+    date_discretionary_court_decision = models.DateField(
+        help_text="The date of the Court's discretionary decision.",
+        blank=True,
+        null=True,
+    )
+    linked_with = models.CharField(
+        help_text=(
+            "Field describing any other docket(s) this case is "
+            "linked with, as shown on the SCOTUS docket."
+        ),
+        max_length=1000,
+        blank=True,
+    )
+    questions_presented_url = models.CharField(
+        help_text="URL to the 'Questions Presented' page or document, if available.",
+        max_length=1000,
+        blank=True,
+    )
+    questions_presented_file = models.FileField(
+        help_text="A local copy of the 'Questions Presented' document."
+        "The path is AWS S3 where the file is saved.",
+        upload_to=make_pdf_path,
+        storage=IncrementingAWSMediaStorage(),
+        max_length=1000,
+        blank=True,
+    )
+
+    def __str__(self) -> str:
+        return f"SCOTUS metadata for docket {self.docket_id}"
+
+    class Meta:
+        verbose_name = "SCOTUS Docket Metadata"
+        verbose_name_plural = "SCOTUS Docket Metadata"
+
+
+@pghistory.track()
+@document_model
+class CaseTransfer(AbstractDateTimeModel):
+    """
+    Represents any transfer of a docket between two courts whether that be
+    an appeal, workload balancing, or docket merging.
+
+    The `x_court` and `x_docket_number` fields must always be set and at least
+    one of `origin_docket` or `destination_docket` must be set to ensure
+    that transfers are associated with dockets in the DB. The reason for
+    (effectively) duplicating the docket number via `x_docket` and
+    `x_docket_number` is to allow populating transfers even if only one end is
+    in the DB. This allows us to track transfers from untracked courts to
+    tracked courts (e.g. appeals from trial courts) and to populate transfers
+    during the initial docket merging step independently of the order dockets
+    are merged in.
+
+    The intended way to populate this table in a merger is to:
+
+    1. Lookup if a transfer with matching origin and destination courts and\
+       docket numbers exists;
+    2. If it does, update the missing foreign key on that entry;
+    3. Otherwise, create a new entry with only origin or destination docket\
+       field set depending on which you have.
+
+    :ivar origin_court: The court this transfer originates from.
+    :ivar origin_docket_number: The ID of the docket this transfer originates from.
+    :ivar origin_docket: The docket object this transfer originates from.
+    :ivar destination_court: The court the docket is being transferred to.
+    :ivar destination_docket_number: The ID of the case docket in the destination court.
+    :ivar destination_docket: The docket object in the destination court.
+    :ivar transfer_date: The date this transfer occurred.
+    :ivar transfer_type: The type of transfer (appeal, work sharing, etc.).
+    """
+
+    APPEAL = 0
+    WORKLOAD = 1
+    MERGE = 2
+    JURISDICTION = 3
+    transfer_type_choices = {
+        # Appeal from a lower court to a higher court.
+        APPEAL: "Appeal",
+        # Transfer between courts at the same level to balance workload
+        WORKLOAD: "Workload",
+        # Merging of two or more related cases
+        MERGE: "Merge",
+        # Transfer to move a case into a different jurisdiction for some reason
+        JURISDICTION: "Jurisdiction",
+    }
+    origin_court = models.ForeignKey(
+        "search.Court",
+        on_delete=models.CASCADE,
+        related_name="case_transfer_origin_court",
+    )
+    origin_docket_number = models.TextField()
+    origin_docket = models.ForeignKey(
+        "search.Docket",
+        on_delete=models.CASCADE,
+        related_name="case_transfer_origin_docket",
+        blank=True,
+        null=True,
+    )
+    destination_court = models.ForeignKey(
+        "search.Court",
+        on_delete=models.CASCADE,
+        related_name="case_transfer_destination_court",
+    )
+    destination_docket_number = models.TextField()
+    destination_docket = models.ForeignKey(
+        "search.Docket",
+        on_delete=models.CASCADE,
+        related_name="case_transfer_destination_docket",
+        blank=True,
+        null=True,
+    )
+    transfer_date = models.DateField()
+    transfer_type = models.SmallIntegerField(
+        choices=transfer_type_choices.items(),
+    )
+
+    class Meta:
+        constraints = [
+            CheckConstraint(
+                condition=Q(origin_docket__isnull=False)
+                | Q(destination_docket__isnull=False),
+                name="docket_at_least_one_fk_set",
+            )
+        ]
+
+
+@pghistory.track()
+@document_model
+class SCOTUSDocketEntry(AbstractDateTimeModel, CSVExportMixin):
+    """
+    Represents a docket entry in a SCOTUS docket.
+
+    :ivar docket: The Docket this entry is associated with.
+    :ivar entry_number: Entry number on the SCOTUS Docket page.
+    :ivar description: For appellate brief events, a short description of
+    the brief.
+    :ivar date_filed: The date that SCOTUS indicates this entry was filed.
+    :ivar sequence_number: CL-generated field to keep entries in the same
+    order they appear in SCOTUS. Concatenation of filing date (in ISO format)
+    and the index in the SCOTUS table.
+    """
+
+    docket = models.ForeignKey(
+        "search.Docket",
+        on_delete=models.CASCADE,
+    )
+    entry_number = models.IntegerField(
+        null=True,
+        blank=True,
+    )
+    description = models.TextField(blank=True)
+    date_filed = models.DateField(
+        null=True,
+        blank=True,
+    )
+    sequence_number = models.CharField(
+        max_length=16,
+    )
+
+    class Meta:
+        ordering = ["-sequence_number"]
+
+
+@pghistory.track()
+@document_model
+class SCOTUSDocument(AbstractDateTimeModel, AbstractPDF):
+    """
+    Represents an attachment to a SCOTUS docket entry.
+
+    :ivar docket_entry: The Docket this document is associated with.
+    :ivar description: The description of this file in SCOTUS.
+    :ivar document_number: The document number on the docket page in SCOTUS.
+    :ivar attachment_number: The attachment number on the docket page in SCOTUS.
+    :ivar url: The download URL that SCOTUS provided for this document.
+    """
+
+    docket_entry = models.ForeignKey(
+        SCOTUSDocketEntry, on_delete=models.CASCADE
+    )
+    description = models.TextField(blank=True)
+    document_number = models.IntegerField(
+        blank=True,
+        null=True,
+    )
+    attachment_number = models.SmallIntegerField(
+        blank=True,
+        null=True,
+    )
+    url = models.URLField(max_length=1000)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["document_number"]),
+            models.Index(fields=["filepath_local"]),
+        ]
+        unique_together = (
+            "docket_entry",
+            "document_number",
+            "attachment_number",
+        )
+        ordering = ("document_number", "attachment_number")

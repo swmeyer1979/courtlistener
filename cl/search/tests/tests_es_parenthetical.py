@@ -10,8 +10,8 @@ from lxml import html
 
 from cl.lib.elasticsearch_utils import (
     build_daterange_query,
-    build_es_filters,
     build_es_main_query,
+    build_es_plain_filters,
     build_fulltext_query,
     build_sort_results,
     build_term_query,
@@ -168,8 +168,7 @@ class ParentheticalESTest(ESIndexTestCase, TestCase):
 
     @classmethod
     def setUpClass(cls):
-        super(ParentheticalESTest, cls).setUpClass()
-        cls.rebuild_index("search.ParentheticalGroup")
+        super().setUpClass()
 
     def test_filter_search(self) -> None:
         """Test filtering and search at the same time"""
@@ -311,12 +310,7 @@ class ParentheticalESTest(ESIndexTestCase, TestCase):
             "type": "pa",
         }
         search_query = ParentheticalGroupDocument.search()
-        (
-            s,
-            total_query_results,
-            top_hits_limit,
-            total_child_results,
-        ) = build_es_main_query(search_query, cd)
+        s, *_ = build_es_main_query(search_query, cd)
         self.assertEqual(s.count(), 1)
 
     def test_cd_query_2(self) -> None:
@@ -328,7 +322,7 @@ class ParentheticalESTest(ESIndexTestCase, TestCase):
             "type": SEARCH_TYPES.PARENTHETICAL,
         }
 
-        filters = build_es_filters(cd)
+        filters = build_es_plain_filters(cd)
 
         if not filters:
             # Return all results
@@ -453,7 +447,7 @@ class ParentheticalESTest(ESIndexTestCase, TestCase):
             actual,
             expected,
             msg="Did not get expected number of results when filtering by "
-            "case name. Expected %s, but got %s." % (expected, actual),
+            f"case name. Expected {expected}, but got {actual}.",
         )
 
         r = await self.async_client.get(
@@ -470,7 +464,7 @@ class ParentheticalESTest(ESIndexTestCase, TestCase):
             actual,
             expected,
             msg="Did not get expected number of results when filtering by "
-            "case name. Expected %s, but got %s." % (expected, actual),
+            f"docket_number. Expected {expected}, but got {actual}.",
         )
         r = await self.async_client.get(
             reverse("show_results"),
@@ -486,7 +480,7 @@ class ParentheticalESTest(ESIndexTestCase, TestCase):
             actual,
             expected,
             msg="Did not get expected number of results when filtering by "
-            "case name. Expected %s, but got %s." % (expected, actual),
+            f"case name. Expected {expected}, but got {actual}.",
         )
         r = await self.async_client.get(
             reverse("show_results"),
@@ -502,7 +496,7 @@ class ParentheticalESTest(ESIndexTestCase, TestCase):
             actual,
             expected,
             msg="Did not get expected number of results when filtering by "
-            "case name. Expected %s, but got %s." % (expected, actual),
+            f"case name. Expected {expected}, but got {actual}.",
         )
         self.assertTrue(
             r.content.decode().index("Riley")
@@ -654,11 +648,11 @@ class ParentheticalESSignalProcessorTest(
         self.assertEqual(0.70, doc.representative_score)
 
         # Confirm related object fields using display value are properly indexed.
-        self.assertEqual("Non-Precedential", doc.status)
+        self.assertEqual("Unpublished", doc.status)
         self.cluster_1.precedential_status = PRECEDENTIAL_STATUS.PUBLISHED
         self.cluster_1.save()
         doc = ParentheticalGroupDocument.get(id=self.pg_test.pk)
-        self.assertEqual("Precedential", doc.status)
+        self.assertEqual("Published", doc.status)
         self.pg_test.delete()
 
     def test_keep_in_sync_related_pa_objects_on_m2m_change(self) -> None:
@@ -681,8 +675,8 @@ class ParentheticalESSignalProcessorTest(
         self.o.opinions_cited.remove(self.o_2)
 
         doc = ParentheticalGroupDocument.get(id=self.pg_test.pk)
-        self.assertEqual(None, doc.cites)
-        self.assertEqual(None, doc.panel_ids)
+        self.assertEqual([], doc.cites)
+        self.assertEqual([], doc.panel_ids)
         self.pg_test.delete()
 
     def test_keep_in_sync_related_pa_objects_on_reverse_relation(self) -> None:
@@ -712,7 +706,7 @@ class ParentheticalESSignalProcessorTest(
         citation_lexis.delete()
         citation_neutral.delete()
         doc = ParentheticalGroupDocument.get(id=self.pg_test.pk)
-        self.assertEqual(None, doc.citation)
+        self.assertEqual([], doc.citation)
         self.assertEqual(None, doc.lexisCite)
         self.assertEqual(None, doc.neutralCite)
         self.pg_test.delete()
@@ -733,7 +727,7 @@ class ParentheticalESSignalProcessorTest(
         with mock.patch(
             "cl.lib.es_signal_processor.es_save_document.si",
             side_effect=lambda *args, **kwargs: self.count_task_calls(
-                es_save_document, *args, **kwargs
+                es_save_document, True, *args, **kwargs
             ),
         ):
             cluster_1 = OpinionClusterFactory(
@@ -761,17 +755,18 @@ class ParentheticalESSignalProcessorTest(
             p5.group = pg_test
             p5.save()
 
-        # 1 es_save_document task calls for ParentheticalGroup creation.
+        # 5 es_save_document task calls for ParentheticalGroup creation.
+        # 2 Clusters, 2 Opinions and 1 ParentheticalGroup
         # Persons created by OpinionWithParentsFactory shouldn't call tasks
         # since they are not Judges.
-        self.reset_and_assert_task_count(expected=1)
+        self.reset_and_assert_task_count(expected=5)
         self.assertTrue(ParentheticalGroupDocument.exists(id=pg_test.pk))
 
         # Update a ParentheticalGroup without changes.
         with mock.patch(
-            "cl.lib.es_signal_processor.update_es_document.delay",
+            "cl.lib.es_signal_processor.update_es_document.si",
             side_effect=lambda *args, **kwargs: self.count_task_calls(
-                update_es_document, *args, **kwargs
+                update_es_document, True, *args, **kwargs
             ),
         ):
             pg_test.save()
@@ -780,9 +775,9 @@ class ParentheticalESSignalProcessorTest(
 
         # Update a ParentheticalGroup tracked field.
         with mock.patch(
-            "cl.lib.es_signal_processor.update_es_document.delay",
+            "cl.lib.es_signal_processor.update_es_document.si",
             side_effect=lambda *args, **kwargs: self.count_task_calls(
-                update_es_document, *args, **kwargs
+                update_es_document, True, *args, **kwargs
             ),
         ):
             p6 = ParentheticalFactory(
@@ -811,9 +806,9 @@ class ParentheticalESSignalProcessorTest(
         self.assertFalse(ParentheticalGroupDocument.exists(id=pg_test.pk))
         # ParentheticalGroup creation on update.
         with mock.patch(
-            "cl.lib.es_signal_processor.update_es_document.delay",
+            "cl.lib.es_signal_processor.update_es_document.si",
             side_effect=lambda *args, **kwargs: self.count_task_calls(
-                update_es_document, *args, **kwargs
+                update_es_document, True, *args, **kwargs
             ),
         ):
             pg_test.opinion = o

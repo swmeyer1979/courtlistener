@@ -3,7 +3,7 @@ import json
 import logging
 import os
 from glob import glob
-from typing import IO, Union
+from typing import IO
 
 from dateutil import parser
 from django.utils.encoding import force_bytes
@@ -15,7 +15,7 @@ from cl.scrapers.management.commands.cl_scrape_opinions import (
     make_objects,
     save_everything,
 )
-from cl.scrapers.tasks import extract_doc_content
+from cl.scrapers.tasks import extract_opinion_content
 from cl.search.models import SOURCES, Court, Docket, Opinion
 
 
@@ -66,7 +66,7 @@ def make_item(case):
 
 def import_tn_corpus(
     log: bool,
-    skip_until: Union[bool, str],
+    skip_until: bool | str,
     file: IO,
     ocr_available: bool,
 ) -> None:
@@ -115,31 +115,30 @@ def import_tn_corpus(
         if len(ops) > 0:
             op = ops[0]
             logging.warning(
-                "Document already in database. See: %s at %s"
-                % (op.get_absolute_url(), op.cluster.case_name)
+                "Document already in database. See: %s at %s",
+                op.get_absolute_url(),
+                op.cluster.case_name,
             )
 
-        docket, opinion, cluster, citations = make_objects(
+        # oci - originating_court_information is always `None`` for this import
+        docket, opinions, cluster, citations, oci = make_objects(
             make_item(case),
             courts[case["court"]],
-            sha1_hash,
-            pdf_data,
+            [(make_item(case), pdf_data, sha1_hash)],
         )
 
         save_everything(
             items={
                 "docket": docket,
-                "opinion": opinion,
+                "opinions": opinions,
                 "cluster": cluster,
                 "citations": citations,
-            },
-            index=False,
+            }
         )
 
-        extract_doc_content.delay(
-            opinion.pk,
+        extract_opinion_content.delay(
+            opinions[0].pk,
             ocr_available=ocr_available,
-            citation_jitter=True,
         )
         logging.info(
             "Successfully added Tennessee object cluster: %s", cluster.id
@@ -169,7 +168,7 @@ class Command(VerboseCommand):
         )
 
     def handle(self, *args, **options):
-        super(Command, self).handle(*args, **options)
+        super().handle(*args, **options)
         import_tn_corpus(
             options["log"],
             options["skip_until"],
